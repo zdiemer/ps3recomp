@@ -659,8 +659,6 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
-        static int logged = 0;
-        if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
          * protocol so it can be implemented. */
@@ -707,7 +705,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               ctx->gpr[3] = 0x80010002u; /* generic failure (net unavailable) */
               return;
           } } }
-        ctx->gpr[3] = 0;   /* CELL_OK-ish so the game keeps going */
+        ps3_hle_unresolved(nid, ctx);
         return;
     }
     g_last_hle_name = e->name;
