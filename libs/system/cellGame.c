@@ -464,8 +464,8 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
  * stalls, and the cellSaveDataAutoLoad2 (auto-save notice) dialog never appears.
  *
  * funcStat(cbResult, get, set): the title reads `get` (isNewData, free space, params)
- * and writes cbResult->result. We report existing data (isNewData=0) + ample space;
- * DeS's callback returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK. */
+ * and writes cbResult->result. New/existing status follows the host directory;
+ * installing data and persisting callback-provided parameters remain separate. */
 #define GAMEDATA_CB_BASE   0x02520000u   /* guest scratch (distinct from savedata's) */
 #define CELL_GAMEDATA_CBRESULT_OK_CANCEL  1
 #define CELL_GAMEDATA_CBRESULT_OK         0
@@ -490,19 +490,22 @@ static s32 gamedata_stat_callback(const char* tag, u32 version, uint32_t dir_ea,
     if (!g_ps3_guest_caller)
         return CELL_GAMEDATA_CBRESULT_OK;
 
-    /* Guest scratch for the 3 callback structs: CBResult(0x18)/StatGet(0xBE8)/StatSet(0x0C). */
+    /* Firmware StatGet is 0x1448 bytes: getParam at 0x860 alone occupies
+     * 0xB9C bytes. The old 0xC00 stride placed StatSet INSIDE getParam and
+     * wrote sizeKB into its localized-title array. Keep all three disjoint.
+     * Layout reference: RPCS3 Emu/Cell/Modules/cellGame.h. */
     uint32_t cb  = GAMEDATA_CB_BASE;
     uint32_t get = cb + 0x20;
-    uint32_t set = get + 0xC00;
+    uint32_t set = get + 0x1450;
     memset(vm_base + cb, 0, (set + 0x20) - cb);
 
     /* CellGameDataStatGet (offsets per SDK, RPCS3-verified). */
     vm_write32(get + 0x000, (u32)content_free_kb());
-    vm_write32(get + 0x004, is_new_data);                            /* isNewData = 0 (data exists) */
+    vm_write32(get + 0x004, is_new_data);
     snprintf((char*)(vm_base + get + 0x008), 96, "/dev_hdd0/game/%s", dir);          /* contentInfoPath */
     snprintf((char*)(vm_base + get + 0x427), 96, "/dev_hdd0/game/%s/USRDIR", dir);   /* gameDataPath */
-    vm_write32(get + 0xB9C, 0xFFFFFFFFu);                  /* sizeKB = NOTCALC (-1) */
-    vm_write32(get + 0xBA0, 0);                            /* sysSizeKB */
+    vm_write32(get + 0x13FC, is_new_data ? 0 : 0xFFFFFFFFu); /* sizeKB */
+    vm_write32(get + 0x1400, 0);                           /* sysSizeKB */
     /* getParam (CellGameDataSystemFileParam @0x860): title / titleId / dataVersion / attribute. */
     uint32_t gp = get + 0x860;
     snprintf((char*)(vm_base + gp + 0x000), 128, "%s", s_title);
@@ -529,10 +532,12 @@ s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
     if (version != 0 || !dir_ea || !func_opd)
         return CELL_GAME_ERROR_PARAM;
 
-    /* We report existing data (isNewData=0) + ample space; DeS's callback
-     * returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK. */
+    const char* dir = (const char*)(vm_base + dir_ea);
+    char path[CELL_GAME_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", content_root(), dir);
+    u32 is_new_data = dir_exists(path) ? 0u : 1u;
     s32 result = gamedata_stat_callback("DataCheckCreate2", version, dir_ea,
-                                        func_opd, 0);
+                                        func_opd, is_new_data);
     if (result < 0)
         return CELL_GAME_ERROR_PARAM;   /* callback reported an error */
     /* OK / OK_CANCEL: succeed (our HLE doesn't create/modify the on-disk data). */
