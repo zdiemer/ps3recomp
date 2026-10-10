@@ -137,11 +137,25 @@ def read_symbols(buf, shs):
     return funcs
 
 
-def pick_text(phs):
-    """Return (file_off, vaddr, size) of the executable PT_LOAD segment."""
-    for ph in phs:
-        if ph["type"] == 1 and (ph["flags"] & 1):     # PT_LOAD + PF_X
-            return ph["off"], ph["vaddr"], ph["filesz"]
+def pick_text(phs, entry=None):
+    """Return the file-backed executable PT_LOAD containing the ELF entry.
+
+    Multi-segment SPU ELFs may place a small executable table before the real
+    startup code. Selecting the first PF_X segment can then omit the entry
+    entirely. This selects the resident entry segment; it does not implement
+    overlay switching or merge other executable segments.
+
+    Callers without an entry retain the original first-segment behavior.
+    """
+    executable = [ph for ph in phs
+                  if ph["type"] == 1 and (ph["flags"] & 1) and ph["filesz"]]
+    if entry is not None:
+        for ph in executable:
+            if ph["vaddr"] <= entry < ph["vaddr"] + ph["filesz"]:
+                return ph["off"], ph["vaddr"], ph["filesz"]
+        raise SystemExit(f"SPU entry 0x{entry:X} is not in a file-backed executable PT_LOAD segment")
+    for ph in executable:
+        return ph["off"], ph["vaddr"], ph["filesz"]
     raise SystemExit("No executable PT_LOAD segment found")
 
 
@@ -595,7 +609,7 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
         text_off, text_va, text_size = 0, base, len(buf)
     else:
         elf = parse_elf(buf)
-        text_off, text_va, text_size = pick_text(elf["phs"])
+        text_off, text_va, text_size = pick_text(elf["phs"], elf["entry"])
     code = buf[text_off:text_off + text_size]
     base = base_override if base_override is not None else text_va
     insns = disassemble_spu(code, base_addr=base)
