@@ -135,6 +135,7 @@ if(WIN32)
         xinput      # XInput for gamepad
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
+        dxguid      # D3D12 backend: IID_IDXGIFactory6 and DXGI interface GUIDs
     )
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
