@@ -4557,6 +4557,14 @@ static ID3D12PipelineState* get_pso(
         f = fopen(fn, "wb"); if (f) { fputs(vi > 0 ? vs_hlsl : "<vp fail>", f); fclose(f); }
         snprintf(fn, sizeof fn, "%s/hlsl_%016llx.ps.txt", hd, (unsigned long long)live_legacy_pso_key());
         f = fopen(fn, "wb"); if (f) { fputs(fi > 0 ? ps_hlsl : "<fp fail>", f); fclose(f); }
+        snprintf(fn, sizeof fn, "%s/hlsl_%016llx.fp.bin", hd, (unsigned long long)live_legacy_pso_key());
+        f = fopen(fn, "wb"); if (f) { fwrite(fp_uc, 1, fp_size, f); fclose(f); }
+        snprintf(fn, sizeof fn, "%s/hlsl_%016llx.state.txt", hd, (unsigned long long)live_legacy_pso_key());
+        f = fopen(fn, "w"); if (f) {
+            fprintf(f, "fp_location=%u fp_offset=%08X fp_size=%u fp_control=%08X\n",
+                    fp_loc, fp_off, fp_size, fp_ctrl);
+            fclose(f);
+        }
       } }
     if (vi > 0 && fi > 0)
         pso = build_pso(
@@ -4637,7 +4645,8 @@ static int ld_upload_pixel_constants(u32* out_offset)
  * Draw accumulation sink (mirrors the harness sink)
  * -----------------------------------------------------------------------*/
 typedef struct { float a[16][4]; } vtx_t;
-typedef struct { u32 first, count; } batch_t;
+#include "rsx_draw_batches.h"
+typedef rsx_draw_batch batch_t;
 
 typedef struct {
     /* INLINE_ARRAY source for this primitive, or NULL. The stream is the
@@ -4648,8 +4657,8 @@ typedef struct {
      * index order, which is what makes the offsets derivable at all (an
      * inline stream carries no per-array offset registers). */
     const u8* inl; u32 inl_bytes, inl_stride; u32 inl_off[16];
-    batch_t arr[256]; u32 n_arr;
-    batch_t idx[256]; u32 n_idx;
+    batch_t* arr; u32 n_arr, cap_arr;
+    batch_t* idx; u32 n_idx, cap_idx;
     u32     n_packets;
     vtx_t*  verts; u32 n_verts, cap_verts;
     rsx_vertex_ref* refs; u32 n_refs, cap_refs;
@@ -5882,8 +5891,9 @@ static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 coun
         return;
     }
     dc.n_packets++;
-    if (dc.n_arr >= 256) { g_ld_stats.packets_queue_full++; return; }
-    dc.arr[dc.n_arr].first = first; dc.arr[dc.n_arr].count = count; dc.n_arr++;
+    if (!rsx_draw_batch_append(&dc.arr, &dc.n_arr, &dc.cap_arr, first, count)) {
+        g_ld_stats.packets_queue_full++; return;
+    }
     g_ld_stats.packets_queued++;
 }
 /* INLINE_ARRAY arrives as one finished stream instead of a (first, count)
@@ -5906,9 +5916,9 @@ static void sink_inline_array(void* u, const rsx_dispatch* r,
 
     dc.inl = data; dc.inl_bytes = bytes; dc.inl_stride = stride;
     dc.n_packets++;
-    if (dc.n_arr >= 256) { g_ld_stats.packets_queue_full++; return; }
-    dc.arr[dc.n_arr].first = 0; dc.arr[dc.n_arr].count = bytes / stride;
-    dc.n_arr++;
+    if (!rsx_draw_batch_append(&dc.arr, &dc.n_arr, &dc.cap_arr, 0, bytes / stride)) {
+        g_ld_stats.packets_queue_full++; return;
+    }
     g_ld_stats.packets_queued++;
 }
 
@@ -5920,8 +5930,9 @@ static void sink_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count
         return;
     }
     dc.n_packets++;
-    if (dc.n_idx >= 256) { g_ld_stats.packets_queue_full++; return; }
-    dc.idx[dc.n_idx].first = first; dc.idx[dc.n_idx].count = count; dc.n_idx++;
+    if (!rsx_draw_batch_append(&dc.idx, &dc.n_idx, &dc.cap_idx, first, count)) {
+        g_ld_stats.packets_queue_full++; return;
+    }
     g_ld_stats.packets_queued++;
 }
 
@@ -10113,6 +10124,8 @@ void rsx_live_draw_shutdown(void)
 #endif
     if (g.dev) g.dev->lpVtbl->Release(g.dev);
     memset(&g, 0, sizeof(g));
+    free(dc.arr); dc.arr = NULL; dc.n_arr = dc.cap_arr = 0;
+    free(dc.idx); dc.idx = NULL; dc.n_idx = dc.cap_idx = 0;
     if (dc.verts) { free(dc.verts); dc.verts = NULL; dc.cap_verts = 0; }
     if (dc.refs) { free(dc.refs); dc.refs = NULL; dc.cap_refs = 0; }
     if (dc.compact_verts) {
