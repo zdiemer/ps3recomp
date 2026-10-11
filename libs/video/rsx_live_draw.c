@@ -191,6 +191,9 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 #define TEX_FMT_DXT45      0x88
 #define TEX_FMT_G8B8       0x8B
 #define TEX_FMT_DEPTH24_D8 0x90
+#define TEX_FMT_DEPTH24_D8_FLOAT 0x91
+#define TEX_FMT_DEPTH16 0x92
+#define TEX_FMT_DEPTH16_FLOAT 0x93
 #define TEX_FMT_LINEAR     0x20
 #define TEX_FMT_UNNORM     0x40
 #define TEX_FMT_BASE_MASK  0x9F
@@ -1389,6 +1392,8 @@ static void decode_render_state(render_state_t* rs)
     rs->depth_write = rsx_dsp_reg(&g.rsx, M_DEPTH_WRITE) & 1;
     rs->depth_func  = rsx_dsp_reg(&g.rsx, M_DEPTH_FUNC);
     rs->cull_enable = rsx_dsp_reg(&g.rsx, M_CULL_FACE_ENABLE) & 1;
+    { static int nc = -1; if (nc < 0) nc = getenv("LD_NO_CULL") ? 1 : 0;
+      if (nc) rs->cull_enable = 0; }
     rs->cull_face   = rsx_dsp_reg(&g.rsx, M_CULL_FACE);
     rs->front_face  = rsx_dsp_reg(&g.rsx, M_FRONT_FACE);
     /* s31 (scratch/s31_blue_emitter.md): honor the RAW register — 0 is a
@@ -4528,8 +4533,21 @@ static ID3D12PipelineState* get_pso(
           if (r) {
               char* semi = strchr(r, ';');
               if (semi) {
-                  const char rep[] = "    return float4(0,1,0,1);";
-                  const size_t rl = sizeof(rep) - 1;
+                  char rep[320] = "    return float4(0,1,0,1);";
+                  /* Preserve the return type of MRT programs. */
+                  if (strstr(ps_hlsl, "struct PSOutput")) {
+                      rep[0] = 0;
+                      for (u32 t = 0; t < 4; t++) {
+                          char field[32], assignment[64];
+                          snprintf(field, sizeof field, "SV_TARGET%u", t);
+                          if (!strstr(ps_hlsl, field)) continue;
+                          snprintf(assignment, sizeof assignment,
+                                   "    _out.t%u = float4(0,1,0,1);\n", t);
+                          strcat(rep, assignment);
+                      }
+                      strcat(rep, "    return _out;");
+                  }
+                  const size_t rl = strlen(rep);
                   const size_t old = (size_t)(semi + 1 - r);
                   const size_t used = strlen(ps_hlsl);
                   if (used - old + rl + 1 <= sizeof(ps_hlsl)) {
@@ -6835,6 +6853,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     /* LD_TRACE_PSO=<hex key>: raw vertex attributes + unit-0 texels of the
      * first three draws with that CSV pso_key. */
     { static u64 tk = 1; static int tn;
+      static u32 trace_surf = ~0u;
+      if (trace_surf == ~0u) { const char* e = getenv("LD_TRACE_SURFACE");
+          trace_surf = e ? (u32)strtoul(e, 0, 16) : 0; }
       if (tk == 1) { const char* e = getenv("LD_TRACE_PSO"); tk = e ? _strtoui64(e, 0, 16) : 0; }
       if (tk && live_legacy_pso_key() == tk && tn >= 3) {
           static u32 every;
@@ -6846,8 +6867,86 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
        * frame -- a PSO's first uses can predate the data it later draws. */
       static long tfrom = -1;
       if (tfrom < 0) { const char* e = getenv("LD_TRACE_PSO_FROM"); tfrom = e ? atol(e) : 0; }
-      if (tk && tn < 3 && live_legacy_pso_key() == tk && (long)g_ld_frames >= tfrom) {
+      static const char* trace_gate = (const char*)-1;
+      if (trace_gate == (const char*)-1) trace_gate = getenv("LD_TRACE_SURFACE_GATE");
+      int trace_open = 1;
+      if (trace_gate && trace_surf && tn < 3 && target < g.n_surfaces &&
+          g.surfaces[target].offset == trace_surf) {
+          FILE* gate = fopen(trace_gate, "rb"); trace_open = gate != NULL;
+          if (gate) fclose(gate);
+      }
+      if (tn < 3 && trace_open && (long)g_ld_frames >= tfrom &&
+          ((tk && live_legacy_pso_key() == tk) ||
+           (trace_surf && target < g.n_surfaces && g.surfaces[target].offset == trace_surf))) {
           tn++;
+          fprintf(stderr, "[pso-trace] frame=%u surface=%08X key=%016llX decoded=%u\n",
+                  g_ld_frames, g.surfaces[target].offset,
+                  (unsigned long long)live_legacy_pso_key(), dc.n_verts);
+          const char* trace_dir = getenv("LD_HLSL_DUMP");
+          if (trace_dir) {
+              char path[MAX_PATH * 2], source[131072];
+              u32 start = rsx_dsp_vp_start(&g.rsx);
+              const u8* uc = (const u8*)(g.rsx.vp + start * 4);
+              u32 instructions = rsx_vp_program_size_instrs(uc, (RSX_DSP_VP_INSTR - start) * 16);
+              rsx_vp_set_branch_base(start);
+              if (rsx_vp_decompile_ex(uc, instructions * 16, vertex_texture_mask(), source, sizeof source) > 0) {
+                  snprintf(path, sizeof path, "%s/trace_%u.vs.txt", trace_dir, tn);
+                  FILE* f = fopen(path, "wb"); if (f) { fputs(source, f); fclose(f); }
+              }
+              const u8* fp = guest_ptr(g_ld_current_pso.fp_location,
+                                      g_ld_current_pso.fp_offset, g_ld_current_pso.fp_size);
+              if (fp) {
+                  snprintf(path, sizeof path, "%s/trace_%u.fp.bin", trace_dir, tn);
+                  FILE* f = fopen(path, "wb");
+                  if (f) { fwrite(fp, 1, g_ld_current_pso.fp_size, f); fclose(f); }
+                  if (rsx_fp_decompile_buffered_ex(fp, g_ld_current_pso.fp_size,
+                          g_ld_current_pso.fp_control, g_ld_current_pso.cube_mask,
+                          source, sizeof source, NULL) > 0) {
+                      snprintf(path, sizeof path, "%s/trace_%u.ps.txt", trace_dir, tn);
+                      f = fopen(path, "wb"); if (f) { fputs(source, f); fclose(f); }
+                  }
+                  snprintf(path, sizeof path, "%s/trace_%u.fp_constants.bin", trace_dir, tn);
+                  f = fopen(path, "wb"); if (f) {
+                      fwrite(g.fp_constants.values, 16, g.fp_constants.count, f);
+                      float alpha[4] = {g.fp_alpha_ref, 0, 0, 0};
+                      fwrite(alpha, 1, sizeof alpha, f); fclose(f);
+                  }
+              }
+              u32 vertices = dc.n_verts < 65535 ? dc.n_verts : 65535;
+              float (*inputs)[16][4] = malloc((size_t)vertices * sizeof(*inputs));
+              for (u32 vi = 0; inputs && vi < vertices; ++vi)
+                  for (u32 ai = 0; ai < 16; ++ai) {
+                      float fallback[4];
+                      const float* a = dc_vertex_attr(vi < dc.n_verts ? vi : 0, ai, fallback);
+                      memcpy(inputs[vi][ai], a, sizeof inputs[vi][ai]);
+                  }
+              snprintf(path, sizeof path, "%s/trace_%u.inputs.bin", trace_dir, tn);
+              FILE* f = inputs ? fopen(path, "wb") : NULL;
+              if (f) { fwrite(inputs, sizeof(*inputs), vertices, f); fclose(f); }
+              free(inputs);
+              rsx_dsp_surface trace_sf; rsx_dsp_get_surface(&g.rsx, &trace_sf);
+              rsx_dsp_viewport trace_vp; rsx_dsp_get_viewport(&g.rsx, &trace_vp);
+              const float w = trace_sf.clip_w ? (float)trace_sf.clip_w : (float)g.width;
+              const float h = trace_sf.clip_h ? (float)trace_sf.clip_h : (float)g.height;
+              float xf[8] = {1,1,1,0,0,0,0,0};
+              if (trace_vp.scale[0] != 0 || trace_vp.translate[0] != 0) {
+                  xf[0] = trace_vp.scale[0] / (w * .5f); xf[1] = -trace_vp.scale[1] / (h * .5f);
+                  xf[2] = trace_vp.scale[2]; xf[4] = (trace_vp.translate[0] - w * .5f) / (w * .5f);
+                  xf[5] = -(trace_vp.translate[1] - h * .5f) / (h * .5f); xf[6] = trace_vp.translate[2];
+              }
+              snprintf(path, sizeof path, "%s/trace_%u.constants.bin", trace_dir, tn);
+              f = fopen(path, "wb"); if (f) {
+                  fwrite(g.rsx.constants, 1, sizeof g.rsx.constants, f);
+                  fwrite(xf, 1, sizeof xf, f); fclose(f);
+              }
+          }
+          for (u32 vi = 0; vi < dc.n_verts && vi < 4; ++vi)
+              for (u32 ai = 0; ai < 16; ++ai) {
+                  if (!((dc.layout.mask >> ai) & 1u)) continue;
+                  float fallback[4]; const float* a = dc_vertex_attr(vi, ai, fallback);
+                  fprintf(stderr, "[pso-decoded] vertex=%u attr=%u %.9g %.9g %.9g %.9g\n",
+                          vi, ai, a[0], a[1], a[2], a[3]);
+              }
           if (dc.inl) {
               fprintf(stderr, "[pso-trace] inline stride=%u bytes=%u:", dc.inl_stride, dc.inl_bytes);
               for (u32 k = 0; k < dc.inl_bytes && k < 6 * dc.inl_stride; k++)
@@ -7181,7 +7280,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             /* Mirror the replay-proven depth-RT contract: address and format
              * must match, and the pass must have executed a depth-writing draw.
              * Clear-only zetas intentionally fall through to guest VRAM. */
-            if (texture_base_fmt == TEX_FMT_DEPTH24_D8)
+            if (texture_base_fmt == TEX_FMT_DEPTH24_D8 ||
+                texture_base_fmt == TEX_FMT_DEPTH24_D8_FLOAT ||
+                texture_base_fmt == TEX_FMT_DEPTH16 ||
+                texture_base_fmt == TEX_FMT_DEPTH16_FLOAT)
                 for (u32 i = 0; i < g.n_zdepths; i++)
                     if (g.zdepths[i].location == t.location &&
                         g.zdepths[i].offset == t.offset &&
