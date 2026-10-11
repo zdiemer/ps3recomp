@@ -662,6 +662,21 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False, segment_i
     for t in collect_branch_targets(insns):
         if code_start <= t < code_end:
             seed_starts.add(t)
+    # Resident code can call an overlay entry which has no callers inside the
+    # overlay itself. Scan the other executable segments at their original LS
+    # addresses, then map targets into this segment's optional relocated base.
+    if not raw:
+        for ph in elf["phs"]:
+            if (ph["type"] != 1 or not (ph["flags"] & 1) or not ph["filesz"]
+                    or ph["off"] == text_off
+                    or ph["off"] + ph["filesz"] > len(buf)):
+                continue
+            other = disassemble_spu(buf[ph["off"]:ph["off"] + ph["filesz"]],
+                                    base_addr=ph["vaddr"])
+            for target in collect_branch_targets(other):
+                t = target + base - text_va
+                if code_start <= t < code_end and t in insns_by_addr:
+                    seed_starts.add(t)
     # Link-register resume addresses (`il`/`ila $r0, <code>` + a plain branch to
     # a stub that returns via `bi $r0`). Require the target to be 4-byte aligned
     # AND to decode as an instruction, so a scratch use of $r0 that happens to

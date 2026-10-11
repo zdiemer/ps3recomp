@@ -11,6 +11,28 @@ def segment(off, vaddr, size, flags=5, kind=1, memsz=None):
 
 
 class TextSelectionTests(unittest.TestCase):
+    def test_overlay_entry_called_only_by_resident_segment(self):
+        data = bytearray(0x120)
+        data[:6] = b"\x7fELF\x01\x02"
+        struct.pack_into(">H", data, 18, 23)
+        struct.pack_into(">II", data, 24, 0x20080, 52)
+        struct.pack_into(">HH", data, 42, 32, 2)
+        struct.pack_into(">8I", data, 52, 1, 0x100, 0x20080, 0x20080, 4, 4, 5, 128)
+        struct.pack_into(">8I", data, 84, 1, 0x110, 0x3080, 0x40000, 8, 8, 7, 128)
+        # brsl r0,0x3084 at resident address 0x20080.
+        branch = 0x33000000 | (((0x3084 - 0x20080) // 4 & 0xFFFF) << 7)
+        struct.pack_into(">I", data, 0x100, branch)
+        data[0x110:0x118] = bytes.fromhex("00200000 35000000")  # lnop; bi r0
+        funcs, _ = detect_functions(data, verbose=False, segment_index=1)
+        self.assertIn((0x3084, 0x3088), funcs)
+        relocated, _ = detect_functions(data, verbose=False, segment_index=1,
+                                        base_override=0x4080)
+        self.assertIn((0x4084, 0x4088), relocated)
+        # Data bytes that happen to decode as branches must not seed code.
+        struct.pack_into(">I", data, 52 + 24, 6)
+        funcs, _ = detect_functions(data, verbose=False, segment_index=1)
+        self.assertEqual(funcs, [(0x3080, 0x3088)])
+
     def test_explicit_overlay_is_separate_from_resident_code(self):
         data = bytearray(0x110)
         data[:6] = b"\x7fELF\x01\x02"
