@@ -200,6 +200,17 @@ s32 cellPadClearBuf(u32 port_no);
 /* Internal: call once per frame to update pad state from host input */
 void cellPad_poll(void);
 
+/* Optional port-owned host input. Register before starting guest threads.
+ * Return nonzero to replace a port's sampled state; zero keeps the backend.
+ * The callback runs at host polling cadence, not necessarily on the UI thread. */
+typedef struct CellPadHostInput {
+    u16 buttons;
+    u8 lx, ly, rx, ry;
+    u8 l2, r2;
+} CellPadHostInput;
+typedef int (*CellPadHostInputCallback)(u32 port, CellPadHostInput* input, void* user);
+void cellPad_set_host_input_callback(CellPadHostInputCallback callback, void* user);
+
 #ifdef __cplusplus
 }
 #endif
