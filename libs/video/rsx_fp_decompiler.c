@@ -786,14 +786,14 @@ static int rsx_fp_decompile_internal(
                         snprintf(buf, sizeof(buf),
                                  "      /* exec_if=none: write suppressed */\n");
                     } else {
-                        /* Per-component select gated by the CC sign test.
-                         * lerp(dst, _v, mask) == mask ? _v : dst since the
-                         * mask is exactly 0.0/1.0 from the bool->float cast. */
+                        /* Select components without arithmetic: lerp with a
+                         * 0/1 mask still propagates inactive infinities/NaNs,
+                         * and cannot replace an active NaN destination. */
                         snprintf(buf, sizeof(buf),
-                                 "      float4 _p = (float4)((cc%u).%s %s (float4)0.0);\n"
-                                 "      %s[%u].%s = lerp(%s[%u].%s, _v.%s, _p.%s);\n",
+                                 "      bool4 _p = ((cc%u).%s %s (float4)0.0);\n"
+                                 "      %s[%u].%s = _p.%s ? _v.%s : %s[%u].%s;\n",
                                  cc_read, cswz, cmp_op,
-                                 reg, dst_idx, m, reg, dst_idx, m, m, m);
+                                 reg, dst_idx, m, m, m, reg, dst_idx, m);
                     }
                     out_puts(&o, buf);
                 }
