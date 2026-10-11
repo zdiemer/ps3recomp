@@ -25,6 +25,7 @@ static u32 s_gcm_context_ea = 0;
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -296,6 +297,8 @@ static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
  * wait for the RSX to catch up before recycling the ring (else the frame's
  * just-written commands are lost). Updated in cellGcm_rsx_process_fifo. */
 volatile u32 g_gcm_fifo_drained_ea = 0;
+/* A guest callback owns the context until both wrap acknowledgments arrive. */
+static atomic_uint s_fifo_recycle_active = 0;
 
 /* The guest variable cellGcmInit's ctx_out pointed at -- the title's own
  * gCellGcmCurrentContext. A title that switches to a command buffer of its own
@@ -1372,7 +1375,7 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 static void gcm_fifo_dump_around(u32 getoff)
 {
     static int d = 0;
-    if (!getenv("GCM_RECDBG") || d++ >= 3) return;
+    if ((!getenv("GCM_RECDBG") && !getenv("GCM_FIFO_TRACE_ERRORS")) || d++ >= 3) return;
     for (u32 t = 0; t < GCM_TRACE_N; t++) {
         u32 k = (s_tr_i + t) % GCM_TRACE_N;
         if (!s_tr_w[k]) continue;
@@ -1796,6 +1799,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) vm_write32(la, v);
                     else if (m == 0x68u && vm_read32(la) != v) {
+            static int trace_limit = -1;
+            static unsigned trace_count;
+            if (trace_limit < 0) { const char* e = getenv("GCM_SEMA_TRACE");
+                trace_limit = e ? atoi(e) : 0; }
+            if (trace_count < (unsigned)trace_limit) {
+                ++trace_count;
+                fprintf(stderr, "[sema-wait] label=%08X want=%08X have=%08X get=%08X put=%08X\n",
+                        la, v, vm_read32(la), s_fifo_getoff, put);
+            }
             /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
              * the hardware does. Off by default: a title whose label nothing
              * ever writes would wedge the drain permanently, and RELEASE on
@@ -1805,7 +1817,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             if (blk) { sem_blocked = 1; break; }
         }
                 }
-                if (sem_blocked) break;
+                if (sem_blocked) { why = "semaphore-acquire"; break; }
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
@@ -1987,7 +1999,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
       } else burned = 0; }
 
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (s_fifo_getoff == last && s_fifo_getoff != put) {
+      if (strcmp(why, "semaphore-acquire") && s_fifo_getoff == last && s_fifo_getoff != put) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
       } else { stuck = 0; last = s_fifo_getoff; } }
@@ -2020,7 +2032,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      *
      * ponytail: append the JUMP at `current` the way the SDK's own callback
      * does, rather than tracking a second copy of the ring's geometry. */
-    if (s_gcm_ctx_out_ea) {
+    if (s_gcm_ctx_out_ea && !atomic_load_explicit(&s_fifo_recycle_active, memory_order_acquire)) {
         u32 ctx = vm_read32(s_gcm_ctx_out_ea);
         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
@@ -2068,6 +2080,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * and near-end recycling is enabled from then on. */
         static int s_title_overran = 0;
         if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
+        /* A real semaphore wait must retain all commands after the acquire. */
+        if (!strcmp(why, "semaphore-acquire")) head_consumed = 0;
         if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
                 && head_consumed && s_title_overran) {
             u32 io_begin = gcm_ea2io(begin);
@@ -2121,12 +2135,29 @@ static u32 gcm_ea2io(u32 ea)
     return ((u32)io_page << 20) | (ea & 0xFFFFFu);
 }
 
+static void gcm_fifo_wait_for_ea(u32 expected)
+{
+    unsigned spins = 0;
+    while (g_gcm_fifo_drained_ea != expected) {
+        if (s_gcm_kick_ev && !(spins & 31u)) SetEvent(s_gcm_kick_ev);
+        Sleep(1);
+        if (++spins == 2000) {
+            static unsigned warned;
+            if (warned++ < 4)
+                fprintf(stderr, "[cellGcmSys] fifo recycle waiting for consumer "
+                        "(drained=0x%08X expected=0x%08X); retaining pending commands\n",
+                        g_gcm_fifo_drained_ea, expected);
+        }
+    }
+}
+
 void cellGcm_fifo_recycle(u32 ctx_ea)
 {
     if (!ctx_ea) return;
     u32 begin   = vm_read32(ctx_ea + 0x0);
     u32 current = vm_read32(ctx_ea + 0x8);
     if (current <= begin) return;                       /* nothing to recycle */
+    atomic_store_explicit(&s_fifo_recycle_active, ctx_ea, memory_order_release);
 
     if (getenv("CELLMARK_BLINKDBG"))
         printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
@@ -2145,35 +2176,36 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * consumes the tail, follows the jump, and idles at begin; then it's safe
      * for the guest to write from begin (that region was consumed long ago). */
     u32 io_begin = gcm_ea2io(begin);
-    if (io_begin != 0xFFFFFFFFu) {
+    u32 io_current = gcm_ea2io(current);
+    if (io_begin != 0xFFFFFFFFu && io_current != 0xFFFFFFFFu) {
         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
         /* The jump has to be in guest memory before `put` moves behind the
          * walker's `get`. Program order is not enough on arm64: the walker
          * may observe the new `put`, find `get` != `put`, and read the old
          * word at `current` before the jump lands there. */
         atomic_thread_fence(memory_order_release);
+        /* Drain the tail before publishing the wrap. If GET is still at
+         * begin, immediately setting PUT=begin would look like an empty FIFO
+         * and falsely acknowledge an entirely unconsumed ring. */
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_current);
+        gcm_fifo_wait_for_ea(current);
         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
-    }
-
-    /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
-     * no commands are lost; a stalled ticker degrades to dropped commands. */
-    int spins = 0;
-    while (g_gcm_fifo_drained_ea != begin && spins < 2000) { Sleep(1); spins++; }
-    if (spins >= 2000) {
-        static int warned = 0;
-        if (warned++ < 4)
-            printf("[cellGcmSys] fifo recycle: drain stalled (drained=0x%08X begin=0x%08X)\n",
-                   g_gcm_fifo_drained_ea, begin);
+        gcm_fifo_wait_for_ea(begin);
+    } else {
+        fprintf(stderr, "[cellGcmSys] cannot recycle unmapped command buffer\n");
+        atomic_store_explicit(&s_fifo_recycle_active, 0, memory_order_release);
+        return;
     }
 
     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
+    atomic_store_explicit(&s_fifo_recycle_active, 0, memory_order_release);
 
     if (s_recdbg)
-        fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
+        fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X\n",
                 GetCurrentThreadId(), vm_read32(ctx_ea + 0x8),
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
-                g_gcm_fifo_drained_ea, spins);
+                g_gcm_fifo_drained_ea);
 }
 
 /* NID: 0xDC09357E */
@@ -2326,15 +2358,15 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * ring wraps, and the recycle above keys on them. */
     if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
     vm_write32(cur, GCM_FLIP_MARKER | bufferId);
-    /* Wrap here, on the guest thread, once the ring is nearly used -- what the
-     * SDK's buffer-full callback does. Otherwise the drain thread recycles it
-     * (see "recycled the title's own ring"), rewriting ctx->current and put
-     * while the guest may be between advancing current and flushing: put
-     * then lands on begin, the guest's closing fence is never executed, and
-     * it spins on `ref` for good. Safe when the walker has left the head of
-     * the ring well behind, which is the region the guest writes next. */
+    /* A context with our reserve callback already has a synchronized wrap.
+     * Rewinding it here after only the first 128KB was read allows the title
+     * to overwrite the still-pending tail while the host compiles shaders. */
     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
+    const u32 callback = vm_read32(ctx + 12);
+    const int synchronized_wrap = callback &&
+        vm_read32(callback) == GCM_FIFO_CALLBACK_SENTINEL_EA;
     if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+        !synchronized_wrap &&
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
         vm_write32(ctx + 8, begin);
