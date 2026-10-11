@@ -136,6 +136,10 @@ int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,
 int rsx_vertex_remap_build(
     rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
     u32* unique_count);
+/* Diagnostic comparison of direct dense lookup and the original probe loop. */
+int rsx_vertex_remap_build_ex(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* unique_count, int direct_dense);
 
 u32 rsx_vertex_remap_index(
     const rsx_vertex_remap* remap, u32 occurrence);

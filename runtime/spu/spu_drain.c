@@ -37,6 +37,7 @@ void* volatile    g_pm_flow_ctx = 0;
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdatomic.h>
 
 /* Sync-model ring-drain: the wwsjob PM's job ring drains only when jobs mark
  * their record's "done" bit (0x8000 in the record's first halfword @LS 0xDF0).
@@ -345,33 +346,54 @@ void (*spu_take_interrupt(spu_context* ctx,
 /* See the declaration in spu_context.h. */
 void spu_depth_guard(spu_context* ctx)
 {
-    static uint32_t s_max = 0;
+    static _Thread_local uint32_t s_max = 0;
+    static _Thread_local const char* control;
     if (!s_max) {
         const char* e = getenv("SPU_HOST_DEPTH_MAX");
         s_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
+        control=getenv("SPU_DEPTH_RING_FILE");
+    }
+    /* The usual path needs no diagnostic writes or benchmark bookkeeping. */
+    if (!control && ctx->host_depth < s_max) return;
+
+    /* The per-thread trampoline history already records these PCs. The former
+     * shared diagnostic ring wrote the same cache lines from every SPU on each
+     * drain entry, racing and mixing unrelated threads' histories. Retain a
+     * race-free approximation only for an opt-in same-process cost comparison. */
+    enum { RING = 24 };
+    static _Atomic uint32_t shared_ring[RING], shared_n;
+    static _Thread_local int configured, private_history;
+    static _Thread_local unsigned checks;
+    if (!configured) {
+        private_history=1; configured=1;
+    }
+    if (control && (++checks & 65535u)==0) {
+        FILE* file=fopen(control,"r"); unsigned flags;
+        if (file) {
+            if (fscanf(file,"%u",&flags)==1 && private_history!=((flags & 16u)!=0)) {
+                private_history=(flags & 16u)!=0;
+                fprintf(stderr,"[spu-depth-history] image=%d private=%d\n",ctx->image_id,private_history);
+            }
+            fclose(file);
+        }
+    }
+    if (!private_history) {
+        const uint32_t n=atomic_load_explicit(&shared_n,memory_order_relaxed);
+        atomic_store_explicit(&shared_ring[n%RING],(uint32_t)ctx->pc & SPU_LS_MASK,memory_order_relaxed);
+        atomic_store_explicit(&shared_n,n+1,memory_order_relaxed);
     }
 
-    /* Ring of recent drain sites. When the depth trips, the useful question is
-     * not "where are we" but "what cycle got us here" -- one pc names a point,
-     * a ring names the loop. */
-    enum { RING = 24 };
-    static uint32_t s_ring[RING];
-    static uint32_t s_n;
-    s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
-    s_n++;
-
     if (ctx->host_depth < s_max) return;
-    static int s_reported = 0;
-    if (s_reported < 1) {   /* one report: five SPU threads all trip together */
-        s_reported++;
+    static atomic_flag reported = ATOMIC_FLAG_INIT;
+    if (!atomic_flag_test_and_set_explicit(&reported,memory_order_relaxed)) {
         fprintf(stderr, "[spu-depth] img=%d pc=0x%05X lr=0x%05X host_depth=%u"
                         " -- lifted call recursion, halting the SPU\n",
                 ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->host_depth);
         fprintf(stderr, "[spu-depth] recent drain sites (oldest first):");
-        uint32_t start = (s_n > RING) ? (s_n - RING) : 0;
-        for (uint32_t k = start; k < s_n; k++)
-            fprintf(stderr, " %05X", s_ring[k % RING]);
+        uint32_t recent[RING];
+        const unsigned count=spu_recent_pcs(recent,RING);
+        for (unsigned k=0; k<count; ++k) fprintf(stderr," %05X",recent[k]);
         fprintf(stderr, "\n");
         fflush(stderr);
     }

@@ -33,6 +33,7 @@
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #include "../ps3_log.h"
 #include "ppu_recomp.h"
+#include "ppu_wait_profile.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../spu/spu_overlay_registry.h"
@@ -2998,6 +2999,7 @@ extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
 
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
+    PpuWaitProfile wait_profile(ctx, "syscall", (uint32_t)ctx->gpr[11]);
     /* One-shot: PPU_GUARD_EA=<hex> arms the page guard on that address without
      * waiting for a store watch to fire. Armed here because lv2_syscall runs
      * early and unconditionally; used to measure how far a guest block clear

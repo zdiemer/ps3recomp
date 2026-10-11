@@ -8,6 +8,7 @@
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdlib.h>
+#include "../platform/win32_usleep.h"
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -214,6 +215,28 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */
+    {
+        static _Thread_local const char* control = NULL;
+        static _Thread_local int initialized = 0;
+        static _Thread_local unsigned checks = 0;
+        static _Thread_local unsigned mode = 0;
+        if (!initialized) {
+            control = getenv("PS3_USLEEP_MODE_FILE");
+            initialized = 1;
+        }
+        if (control && (++checks & 255u)==0) {
+            FILE* file = fopen(control,"r"); unsigned flags;
+            if (file) {
+                if (fscanf(file,"%u",&flags)==1 && mode!=(flags & 8u)) {
+                    mode=flags & 8u;
+                    fprintf(stderr,"[usleep-mode] guest_tid=%llu timer=%u\n",
+                        (unsigned long long)ctx->thread_id,mode!=0);
+                }
+                fclose(file);
+            }
+        }
+        if (mode && usec>=50 && ps3_usleep_high_resolution(usec)) return CELL_OK;
+    }
     if (usec >= 1000) {
         HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
         if (timer) {

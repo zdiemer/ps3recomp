@@ -2,6 +2,13 @@
 #define RSX_TEXTURE_HASH_H
 #include <stdint.h>
 #include <string.h>
+#define XXH_INLINE_ALL
+#include "../../third_party/xxhash/xxhash.h"
+
+static inline uint64_t rsx_texture_hash_xxh3(const void* data, uint32_t size)
+{
+    return XXH3_64bits(data, size);
+}
 
 /* Full-content mutation check. Four independent word streams remove the
  * serial multiply dependency while still reading every byte, including tails.

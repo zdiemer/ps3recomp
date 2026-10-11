@@ -325,12 +325,34 @@ static uint64_t spu_job_clock_ms(void)
 #endif
 }
 
+static uint64_t spu_job_cycles(void)
+{
+#ifdef _WIN32
+    ULONG64 cycles=0;
+    QueryThreadCycleTime(GetCurrentThread(),&cycles);
+    return cycles;
+#else
+    return 0;
+#endif
+}
+
+static uint64_t spu_job_qpc(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER now; QueryPerformanceCounter(&now); return now.QuadPart;
+#else
+    return 0;
+#endif
+}
+
 static void spu_async_run(spu_async_job* j)
 {
     /* Opt-in wall times distinguish taskset-lock contention, image setup and
      * actual lifted execution. Persistent tasks report only when they exit. */
     const int timing = getenv("SPU_JOB_TIMING") != NULL;
     const uint64_t job_start = timing ? spu_job_clock_ms() : 0;
+    const uint64_t setup_qpc = timing ? spu_job_qpc() : 0;
+    const uint64_t setup_cycles = timing ? spu_job_cycles() : 0;
     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
      * back to a fresh per-dispatch LS when disabled / no taskset. */
     spu_ts_ls_slot* ts_slot = NULL;
@@ -616,16 +638,30 @@ static void spu_async_run(spu_async_job* j)
             }
             spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
             const uint64_t execute_start = timing ? spu_job_clock_ms() : 0;
-            int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
-                                                1, j->have_r3 ? j->r3 : 0, 0);
+            const uint64_t execute_qpc = timing ? spu_job_qpc() : 0;
+            const uint64_t execute_cycles = timing ? spu_job_cycles() : 0;
+            spu_abi_profile abi_profile = {0};
+            int32_t rc = spu_run_lifted_job_abi_profiled(j->fn, ls, j->args_ea, j->image_id,
+                                                1, j->have_r3 ? j->r3 : 0, 0,
+                                                timing ? &abi_profile : NULL);
             if (timing) {
                 const uint64_t end = spu_job_clock_ms();
+                const uint64_t end_qpc = spu_job_qpc(), end_cycles = spu_job_cycles();
                 fprintf(stderr, "[spu-job-time] image=%d taskset=%08X task=%u "
-                        "setup_ms=%llu run_ms=%llu end_ms=%llu\n",
+                        "setup_ms=%llu run_ms=%llu end_ms=%llu "
+                        "begin_qpc=%llu execute_qpc=%llu end_qpc=%llu setup_cycles=%llu run_cycles=%llu "
+                        "abi_prepare_cycles=%llu native_cycles=%llu abi_finish_cycles=%llu\n",
                         j->image_id, j->taskset_ea, j->taskid,
                         (unsigned long long)(execute_start - job_start),
                         (unsigned long long)(end - execute_start),
-                        (unsigned long long)end);
+                        (unsigned long long)end,
+                        (unsigned long long)setup_qpc,(unsigned long long)execute_qpc,
+                        (unsigned long long)end_qpc,
+                        (unsigned long long)(execute_cycles-setup_cycles),
+                        (unsigned long long)(end_cycles-execute_cycles),
+                        (unsigned long long)abi_profile.prepare_cycles,
+                        (unsigned long long)abi_profile.execute_cycles,
+                        (unsigned long long)abi_profile.finish_cycles);
             }
             /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
              * the kernel re-enters it when work is signaled. Our HLE runs it once,
@@ -698,15 +734,26 @@ static void spu_async_run(spu_async_job* j)
 
 #ifdef _WIN32
 static DWORD WINAPI spu_async_thread(LPVOID p) {
+    const int timing=getenv("SPU_JOB_TIMING")!=NULL;
+    const int image=((spu_async_job*)p)->image_id;
+    const uint64_t begin=timing?spu_job_cycles():0;
     /* Reserve handler headroom so a stack overflow in lifted SPU code (e.g. a
      * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
      * instead of killing the process silently with 0x80000001. */
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    const uint64_t ready=timing?spu_job_cycles():0;
     spu_async_run((spu_async_job*)p);
+    const uint64_t completed=timing?spu_job_cycles():0;
     /* Nothing on this stack may stay in the lock-line reserver set. */
     { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
       extern void spu_coh_forget_range(uintptr_t, uintptr_t);
       spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi); }
+    if (timing) {
+        const uint64_t end=spu_job_cycles();
+        fprintf(stderr,"[spu-thread-time] image=%d end_qpc=%llu headroom_cycles=%llu job_cycles=%llu cleanup_cycles=%llu\n",
+            image,(unsigned long long)spu_job_qpc(),(unsigned long long)(ready-begin),
+            (unsigned long long)(completed-ready),(unsigned long long)(end-completed));
+    }
     return 0;
 }
 #else
@@ -1143,10 +1190,22 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
      * chains are deep host call chains with fat lifted frames -- a 1MB stack
      * blew the guard page (STATUS_GUARD_PAGE_VIOLATION 0x80000001, silent
      * process death) the moment the real decode path first executed. */
+    /* Capture identity before CreateThread: the worker can free j before it
+     * returns. Measure submitting-thread CPU separately from worker cycles. */
+    const int dispatch_timing = getenv("SPU_JOB_TIMING") != NULL;
+    const int dispatch_image = j->image_id;
+    const uint64_t dispatch_cycles = dispatch_timing ? spu_job_cycles() : 0;
+    const uint64_t dispatch_qpc = dispatch_timing ? spu_job_qpc() : 0;
     HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
                              STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!th) { free(j); return 0; }
     CloseHandle(th);   /* detached */
+    if (dispatch_timing) {
+        const uint64_t end_cycles = spu_job_cycles(), end_qpc = spu_job_qpc();
+        fprintf(stderr, "[spu-dispatch-time] image=%d begin_qpc=%llu end_qpc=%llu create_cycles=%llu\n",
+            dispatch_image, (unsigned long long)dispatch_qpc, (unsigned long long)end_qpc,
+            (unsigned long long)(end_cycles - dispatch_cycles));
+    }
 #else
     /* Same 256 MB reservation, for the same reason: pthread stacks are
      * mmap'd and committed on touch, so this reserves address space rather

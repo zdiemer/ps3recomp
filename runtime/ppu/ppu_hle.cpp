@@ -17,6 +17,7 @@
  * Compiled as C++ (matches the lifted output). Game-agnostic.
  */
 #include "ppu_recomp.h"   /* ppu_context */
+#include "ppu_wait_profile.h"
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include <stdlib.h>       /* getenv */
@@ -194,6 +195,7 @@ extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    PpuWaitProfile wait_profile(ctx, "hle", nid);
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
      * event queue, which misses a thread that stops looping while it is BUSY --

@@ -87,6 +87,9 @@ static volatile long g_ld_ps1_vram_ready = 0;
 
 static rsx_vertex_payload_cache g_ld_vertex_cache;
 static int g_ld_apply_polygon_bias=1;
+/* Independently benchmark reference filling (1), dense remapping (2), and
+ * texture hashing (4). Live changes apply at presentation boundaries. */
+static unsigned g_ld_cpu_work=3;
 static int g_ld_vertex_cache_enabled=-1;
 static int ld_vertex_cache_enabled(void)
 {
@@ -261,6 +264,7 @@ typedef struct {
     u32 cubemap, mipmaps, dimension, hash_next, hash_bucket;
     ID3D12Resource* tex;
     u64 content_hash;
+    unsigned content_hash_kind;
     u32 last_hash_frame;
     u64 last_use_serial;
 } texcache_t;
@@ -1103,6 +1107,11 @@ typedef struct {
     u64 ps_compile_qpc;
     u64 create_pso_qpc;
     u64 pso_prepare_qpc;
+    u64 pso_lookup_qpc;
+    u64 vertex_refs_qpc;
+    u64 vertex_remap_qpc;
+    u64 vertex_plan_qpc;
+    u64 vertex_decode_qpc;
     u64 flush_qpc;
     u64 fence_wait_qpc;
     u64 flush_reason[LD_FLUSH_REASON_COUNT];
@@ -2164,7 +2173,7 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
 }
 
 #include "rsx_texture_hash.h"
-static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
+static u64 texture_content_hash_kind(const rsx_dsp_texture* t, int* readable, unsigned kind)
 {
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG hash_begin = ld_profile_qpc();
@@ -2206,7 +2215,8 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
     u64 hash = 1469598103934665603ull;
     static int legacy_hash = -1;
     if (legacy_hash < 0) legacy_hash = getenv("RSX_LEGACY_TEXTURE_HASH") != NULL;
-    if (!legacy_hash) hash = rsx_texture_hash(src, span);
+    if (kind == 1) hash = rsx_texture_hash_xxh3(src, span);
+    else if (!legacy_hash) hash = rsx_texture_hash(src, span);
     else {
     u32 i = 0;
     for (; i + 8 <= span; i += 8) {
@@ -2226,6 +2236,26 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
     g_ld_profile.total.texture_hash_qpc += ld_profile_qpc() - hash_begin;
 #endif
     return hash;
+}
+
+static unsigned texture_hash_kind(void) { return (g_ld_cpu_work >> 2) & 1u; }
+static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
+{
+    return texture_content_hash_kind(t, readable, texture_hash_kind());
+}
+static int texture_cached_content_changed(
+    texcache_t* entry, const rsx_dsp_texture* t, u64 hash, int* readable)
+{
+    if (!*readable) return 0;
+    if (entry->content_hash_kind == texture_hash_kind())
+        return hash != entry->content_hash;
+    /* A benchmark toggle must not trigger fake uploads or conceal mutation. */
+    const u64 old_hash = texture_content_hash_kind(t, readable, entry->content_hash_kind);
+    if (!*readable) return 0;
+    if (old_hash != entry->content_hash) return 1;
+    entry->content_hash = hash;
+    entry->content_hash_kind = texture_hash_kind();
+    return 0;
 }
 
 static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
@@ -2610,6 +2640,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
             if (entry->tex) {
                 int readable=0;
                 entry->content_hash=texture_content_hash(t,&readable);
+                entry->content_hash_kind=texture_hash_kind();
                 write_texture_srv(i,entry);
             } else ++g_ld_texture_decode_fail;
         }
@@ -2617,6 +2648,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
             entry->last_hash_frame != g_ld_frames) {
             int readable = 0;
             const u64 hash = texture_content_hash(t, &readable);
+            const int hash_changed = texture_cached_content_changed(entry,t,hash,&readable);
             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
              * reads are microseconds apart, so they can only disagree if a
              * guest thread is writing this texture right now -- i.e. we are
@@ -2653,7 +2685,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                   static unsigned long long checks = 0, unread = 0, changed = 0;
                   checks++;
                   if (!readable) unread++;
-                  if (readable && hash != entry->content_hash) changed++;
+                  if (hash_changed) changed++;
                   if ((checks % 64) == 0 || checks < 4)
                       fprintf(stderr, "[fbdbg] ps1fb checks=%llu unreadable=%llu"
                                       " changed=%llu span=%u %ux%u pitch=%u\n",
@@ -2662,13 +2694,14 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                               t->pitch);
               } }
             entry->last_hash_frame = g_ld_frames;
-            if (readable && hash != entry->content_hash) {
+            if (hash_changed) {
                 ID3D12Resource* replacement =
                     decode_guest_texture_profiled(t, remap);
                 if (replacement) {
                     ID3D12Resource* old = entry->tex;
                     entry->tex = replacement;
                     entry->content_hash = hash;
+                    entry->content_hash_kind = texture_hash_kind();
                     write_texture_srv(i, entry);
                     retire_texture(old);
                     static u32 refresh_count = 0;
@@ -2733,6 +2766,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     {
         int readable = 0;
         replacement.content_hash = texture_content_hash(t, &readable);
+        replacement.content_hash_kind = texture_hash_kind();
     }
     replacement.tex = decode_guest_texture_profiled(t, remap);
     /* Commit negative entries even when full. Previously this branch kept the
@@ -4510,6 +4544,7 @@ static ID3D12PipelineState* get_pso(
 
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.pso_lookups++;
+    const LONGLONG lookup_begin = ld_profile_qpc();
 #endif
     for (u32 i = 0; i < g.n_psos; i++) {
 #if defined(YZ_PERF_PROFILE)
@@ -4518,11 +4553,13 @@ static ID3D12PipelineState* get_pso(
         if (g.psos[i].key == key) {
 #if defined(YZ_PERF_PROFILE)
             g_ld_profile.total.pso_hits++;
+            g_ld_profile.total.pso_lookup_qpc += ld_profile_qpc() - lookup_begin;
 #endif
             return g.psos[i].pso;
         }
     }
 #if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.pso_lookup_qpc += ld_profile_qpc() - lookup_begin;
     g_ld_profile.total.pso_misses++;
 #endif
     if (g.n_psos >= MAX_PSOS) {
@@ -4804,19 +4841,28 @@ static void push_vert(const vtx_t* v)
     dc.verts[dc.n_verts++] = *v;
 }
 
-static void push_compact_ref(u32 vertex_id, u32 base_index)
+static int reserve_compact_refs(u32 additional)
 {
-    if (dc.n_refs >= dc.cap_refs) {
-        const u32 next_capacity = dc.cap_refs ? dc.cap_refs * 2u : 4096u;
+    if (additional > UINT32_MAX-dc.n_refs) return 0;
+    const u32 required = dc.n_refs+additional;
+    if (required > dc.cap_refs) {
+        u32 next_capacity = dc.cap_refs ? dc.cap_refs : 4096u;
+        while (next_capacity < required) {
+            if (next_capacity > UINT32_MAX/2u) return 0;
+            next_capacity *= 2u;
+        }
         rsx_vertex_ref* refs = (rsx_vertex_ref*)realloc(
             dc.refs, (size_t)next_capacity * sizeof(*refs));
-        if (!refs) {
-            dc.fetch_ok = 0;
-            return;
-        }
+        if (!refs) return 0;
         dc.refs = refs;
         dc.cap_refs = next_capacity;
     }
+    return 1;
+}
+
+static void push_compact_ref(u32 vertex_id, u32 base_index)
+{
+    if (!reserve_compact_refs(1)) { dc.fetch_ok = 0; return; }
     dc.refs[dc.n_refs].vertex_id = vertex_id;
     dc.refs[dc.n_refs].base_index = base_index;
     dc.n_refs++;
@@ -5017,9 +5063,23 @@ static void fetch_batches(void)
 static void fetch_batches_hoisted(
     const rsx_vertex_layout_plan* layout, int packed_payload)
 {
-    for (u32 batch = 0; batch < dc.n_arr && dc.fetch_ok; batch++)
-        for (u32 i = 0; i < dc.arr[batch].count && dc.fetch_ok; i++)
+#if defined(YZ_PERF_PROFILE)
+    LONGLONG stage_begin = ld_profile_qpc();
+#endif
+    const int bulk_refs = (g_ld_cpu_work & 1u) != 0;
+    for (u32 batch = 0; batch < dc.n_arr && dc.fetch_ok; batch++) {
+        const u32 count = dc.arr[batch].count;
+        if (bulk_refs) {
+            if (!reserve_compact_refs(count)) { dc.fetch_ok = 0; return; }
+            rsx_vertex_ref* output = dc.refs + dc.n_refs;
+            for (u32 i = 0; i < count; ++i) {
+                output[i].vertex_id = dc.arr[batch].first + i;
+                output[i].base_index = 0;
+            }
+            dc.n_refs += count;
+        } else for (u32 i = 0; i < count && dc.fetch_ok; i++)
             push_compact_ref(dc.arr[batch].first + i, 0);
+    }
 
     if (dc.n_idx && dc.fetch_ok) {
         const u32 base_index = rsx_dsp_vertex_data_base_index(&g.rsx);
@@ -5037,6 +5097,10 @@ static void fetch_batches_hoisted(
         for (u32 batch = 0; batch < dc.n_idx && dc.fetch_ok; batch++) {
             const u32 first = dc.idx[batch].first;
             const u32 count = dc.idx[batch].count;
+            if (bulk_refs && !reserve_compact_refs(count)) {
+                dc.fetch_ok = 0;
+                return;
+            }
             const u64 start64 =
                 (u64)index_array.offset + (u64)first * element_size;
             const u64 bytes64 = (u64)count * element_size;
@@ -5072,7 +5136,10 @@ static void fetch_batches_hoisted(
                     }
                     continue;
                 }
-                push_compact_ref(index, base_index);
+                if (bulk_refs) {
+                    dc.refs[dc.n_refs].vertex_id = index;
+                    dc.refs[dc.n_refs++].base_index = base_index;
+                } else push_compact_ref(index, base_index);
             }
         }
     }
@@ -5080,14 +5147,23 @@ static void fetch_batches_hoisted(
     if (!dc.fetch_ok)
         return;
     dc.n_source_refs = dc.n_refs;
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.vertex_refs_qpc += ld_profile_qpc() - stage_begin;
+    stage_begin = ld_profile_qpc();
+#endif
     if (packed_payload && dc.n_refs > 1) {
         u32 unique_refs = dc.n_refs;
-        if (rsx_vertex_remap_build(
-                &dc.ref_remap, dc.refs, dc.n_refs, &unique_refs)) {
+        if (rsx_vertex_remap_build_ex(
+                &dc.ref_remap, dc.refs, dc.n_refs, &unique_refs,
+                (g_ld_cpu_work & 2u) != 0)) {
             dc.refs_remapped = unique_refs < dc.n_refs;
             dc.n_refs = unique_refs;
         }
     }
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.vertex_remap_qpc += ld_profile_qpc() - stage_begin;
+    stage_begin = ld_profile_qpc();
+#endif
     dc.layout = *layout;
     rsx_vertex_fetch_plan_init(
         &dc.fetch_plan, &g.rsx, layout,
@@ -5099,6 +5175,10 @@ static void fetch_batches_hoisted(
         if (dc.fetch_plan.attr[attr].desc.frequency >= 2)
             g_ld_divider_fetches += dc.n_refs;
     }
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.vertex_plan_qpc += ld_profile_qpc() - stage_begin;
+    stage_begin = ld_profile_qpc();
+#endif
     if (packed_payload) {
         const u64 required = (u64)dc.n_refs * layout->stride;
         if (!reserve_compact_vertices(required)) {
@@ -5147,6 +5227,9 @@ static void fetch_batches_hoisted(
             }
         }
     }
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.vertex_decode_qpc += ld_profile_qpc() - stage_begin;
+#endif
     dc.n_verts = dc.n_refs;
 }
 
@@ -5361,12 +5444,13 @@ static void ld_profile_present(u32 frame)
             if (csv) fprintf(csv, "frame,qpc,dt_ms,draw_cpu_ms,vertex_pack_ms,"
                 "flush_ms,fence_wait_ms,decompile_ms,vs_compile_ms,ps_compile_ms,"
                 "create_pso_ms,texture_decode_ms,draws,vertices,texture_upload_bytes,"
-                "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms\n");
+                "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
+                "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work\n");
         }
     }
     if (csv) {
         fprintf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f\n", frame, now, frame_ms,
+            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
@@ -5385,7 +5469,12 @@ static void ld_profile_present(u32 frame)
             g_ld_gpu_frequency ? (double)LD_PROFILE_DELTA(gpu_ticks)*1000.0/g_ld_gpu_frequency : -1.0,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(texture_hash_qpc)),
             (unsigned long long)LD_PROFILE_DELTA(texture_hash_bytes),
-            ld_profile_ticks_ms(LD_PROFILE_DELTA(pso_prepare_qpc)));
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(pso_prepare_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(pso_lookup_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_refs_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_remap_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_plan_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_decode_qpc)),g_ld_cpu_work);
         if ((frame & 63u) == 0) fflush(csv);
     }
     g_ld_profile.measured_frames++;
@@ -9041,6 +9130,18 @@ void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
     if (g_ld_frames%60==0) {
+        static const char* work_control=(const char*)-1;
+        if (work_control==(const char*)-1) work_control=getenv("RSX_CPU_WORK_FILE");
+        if (work_control) {
+            FILE* file=fopen(work_control,"r"); unsigned flags;
+            if (file) {
+                if (fscanf(file,"%u",&flags)==1 && flags<=31 && flags!=g_ld_cpu_work) {
+                    g_ld_cpu_work=flags;
+                    fprintf(stderr,"[cpu-work] frame=%u flags=%u\n",g_ld_frames,flags);
+                }
+                fclose(file);
+            }
+        }
         static const char* bias_control=(const char*)-1;
         if (bias_control==(const char*)-1) bias_control=getenv("RSX_BIAS_FILE");
         if (bias_control) {

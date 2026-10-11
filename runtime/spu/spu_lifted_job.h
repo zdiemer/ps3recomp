@@ -19,6 +19,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(_WIN32) && defined(YZ_PERF_PROFILE)
+#include <windows.h>
+#endif
 
 typedef void (*spu_lifted_entry_fn)(spu_context*);
 /* Guest RAM base, for decoding a raw SPU thread's argument block. */
@@ -152,15 +155,38 @@ typedef struct spu_run_opts {
     uint32_t group_id;
 } spu_run_opts;
 
-static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+/* Optional phase counters exclude logging and distinguish ABI bring-up from
+ * translated execution (including its runtime helpers). Normal callers pass
+ * NULL and the compiler removes these counters. CPU cycles are not wall time. */
+typedef struct spu_abi_profile {
+    uint64_t prepare_cycles, execute_cycles, finish_cycles;
+} spu_abi_profile;
+
+static inline uint64_t spu_abi_cycles(const spu_abi_profile* profile)
+{
+#if defined(_WIN32) && defined(YZ_PERF_PROFILE)
+    if (profile) {
+        ULONG64 cycles = 0;
+        QueryThreadCycleTime(GetCurrentThread(), &cycles);
+        return cycles;
+    }
+#else
+    (void)profile;
+#endif
+    return 0;
+}
+
+static inline int32_t spu_run_lifted_job_abi_profiled(spu_lifted_entry_fn entry,
                                              uint8_t* local_store,
                                              uint32_t args_ea,
                                              int image_id,
                                              int spurs_task_abi,
                                              const uint32_t* r3_override,
-                                             const spu_run_opts* opts)
+                                             const spu_run_opts* opts,
+                                             spu_abi_profile* profile)
 {
     if (!entry) return -1;
+    const uint64_t profile_begin = spu_abi_cycles(profile);
     spu_context ctx;
     spu_context_init(&ctx, 0);
     { static int s_cl = -1;
@@ -298,8 +324,10 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
         fflush(stderr);
     }
     int _halted = 0;
+    const uint64_t profile_ready = spu_abi_cycles(profile);
     { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
       _halted = spu_run_with_halt(entry, &ctx); }               /* run with halt pad   */
+    const uint64_t profile_executed = spu_abi_cycles(profile);
     { const char* image = getenv("SPU_JOB_TRACE_IMG");
       if (image && atoi(image) == image_id) {
           fprintf(stderr, "[spu-job-return] img=%d halted=%d status=%X stop=%X "
@@ -346,7 +374,25 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
     { extern void spu_mfc_release(spu_context*);
       spu_mfc_release(&ctx); }
+    if (profile) {
+        const uint64_t profile_end = spu_abi_cycles(profile);
+        profile->prepare_cycles = profile_ready - profile_begin;
+        profile->execute_cycles = profile_executed - profile_ready;
+        profile->finish_cycles = profile_end - profile_executed;
+    }
     return 0;
+}
+
+static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+                                             uint8_t* local_store,
+                                             uint32_t args_ea,
+                                             int image_id,
+                                             int spurs_task_abi,
+                                             const uint32_t* r3_override,
+                                             const spu_run_opts* opts)
+{
+    return spu_run_lifted_job_abi_profiled(entry, local_store, args_ea, image_id,
+                                          spurs_task_abi, r3_override, opts, NULL);
 }
 
 static inline int32_t spu_run_lifted_job_img(spu_lifted_entry_fn entry,

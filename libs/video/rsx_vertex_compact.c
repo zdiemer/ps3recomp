@@ -505,9 +505,9 @@ static u64 rsx_vertex_remap_hash(u64 value)
     return value;
 }
 
-int rsx_vertex_remap_build(
+int rsx_vertex_remap_build_ex(
     rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
-    u32* unique_count)
+    u32* unique_count, int direct_dense)
 {
     if (!remap || (!refs && count) || !unique_count)
         return 0;
@@ -568,6 +568,22 @@ int rsx_vertex_remap_build(
     }
 
     u32 unique = 0;
+    if (dense && direct_dense) {
+        /* A common base and bounded range make vertex_id-min_id an exact
+         * identity, so neither a 64-bit key nor a probe chain is needed. */
+        for (u32 occurrence = 0; occurrence < count; ++occurrence) {
+            const rsx_vertex_ref ref = refs[occurrence];
+            rsx_vertex_remap_slot* slot = &remap->slots[ref.vertex_id-min_id];
+            if (slot->generation != remap->generation) {
+                slot->generation = remap->generation;
+                slot->value = unique;
+                refs[unique++] = ref;
+            }
+            remap->occurrence_to_unique[occurrence] = slot->value;
+        }
+        *unique_count = unique;
+        return 1;
+    }
     const u32 mask = remap->slot_capacity - 1u;
     for (u32 occurrence = 0; occurrence < count; occurrence++) {
         const rsx_vertex_ref ref = refs[occurrence];
@@ -593,6 +609,13 @@ int rsx_vertex_remap_build(
     }
     *unique_count = unique;
     return 1;
+}
+
+int rsx_vertex_remap_build(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* unique_count)
+{
+    return rsx_vertex_remap_build_ex(remap, refs, count, unique_count, 1);
 }
 
 u32 rsx_vertex_remap_index(
