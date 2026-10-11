@@ -106,6 +106,8 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
      * gone. See spu_coh_unregister. */
     spu_mfc_release(&ctx);
     spu_coh_unregister(&ctx);
+    { extern void spu_mfc_release(spu_context*);
+      spu_mfc_release(&ctx); }
     return (int32_t)ctx.stop_code;
 }
 
@@ -336,6 +338,8 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     spu_mfc_release(&ctx);
     spu_coh_unregister(&ctx);
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
+    { extern void spu_mfc_release(spu_context*);
+      spu_mfc_release(&ctx); }
     return 0;
 }
 

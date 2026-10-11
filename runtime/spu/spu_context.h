@@ -332,6 +332,9 @@ typedef struct spu_context {
      * spu_channels.c casts to the real types. */
     void* ch_wait_cv;
     void* ch_wait_lock;
+    /* Private lazy MFC engine. Host task dispatch can run more than eight
+     * contexts concurrently; command/tag state must never use a shared fallback. */
+    void* mfc_state;
 
     /* --- SPU interrupt facility (faithful; WWS jobmanager depends on it) ---
      * The bi-family E/D bits (bie/bid, irete/iretd...) toggle int_enable; while
