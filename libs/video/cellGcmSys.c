@@ -2102,8 +2102,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
         if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
         /* A real semaphore wait must retain all commands after the acquire. */
         if (!strcmp(why, "semaphore-acquire")) head_consumed = 0;
+        /* The installed SDK callback owns the entire wrap, including the
+         * interval before it enters cellGcm_fifo_recycle. A consumer can see
+         * current == end while the producer is about to call it. Rewinding
+         * current/PUT/GET here races that producer and lets old commands be
+         * overwritten. The active flag only protects the callback body. */
+        const u32 callback = ctx ? vm_read32(ctx + 12) : 0;
+        const int synchronized_wrap = callback &&
+            vm_read32(callback) == GCM_FIFO_CALLBACK_SENTINEL_EA;
         if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
-                && head_consumed && s_title_overran) {
+                && head_consumed && s_title_overran && !synchronized_wrap) {
             u32 io_begin = gcm_ea2io(begin);
             if (io_begin != 0xFFFFFFFFu) {
                 u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;

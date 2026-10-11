@@ -54,6 +54,18 @@ int main(void) {
     assert(vm_read32(0x108) == begin);
     CloseHandle(t);
     assert(!atomic_load(&s_fifo_recycle_active));
+    /* The producer may have filled the ring and be ABOUT to enter its
+     * synchronized callback. The consumer must not rewind its context in
+     * that window either; an inactive callback is not an absent callback. */
+    vm_write32(0x10C, 0x200);
+    vm_write32(0x200, GCM_FIFO_CALLBACK_SENTINEL_EA);
+    vm_write32(0x108, tail);
+    vm_write32(GCM_CONTROL_GUEST_ADDR, 0x1000);
+    s_fifo_getoff = 0x1000;
+    cellGcm_rsx_process_fifo();
+    assert(vm_read32(0x108) == tail);
+    assert(vm_read32(GCM_CONTROL_GUEST_ADDR) == 0x1000);
+    assert(s_fifo_getoff == 0x1000);
     /* Flip insertion must retain the write head until the reserve callback. */
     vm_write32(0x104, 0x142000); vm_write32(0x108, 0x140000);
     vm_write32(0x10C, 0x200); vm_write32(0x200, GCM_FIFO_CALLBACK_SENTINEL_EA);
