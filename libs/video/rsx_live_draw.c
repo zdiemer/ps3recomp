@@ -4526,9 +4526,17 @@ static ID3D12PipelineState* get_pso(
     { static int fg = -1;
       /* LD_FORCE_GREEN=<pso key hex> limits it to one PSO. */
       static u64 gk = 0;
+      static u32 green_attributes = 0;
       if (fg < 0) { const char* e = getenv("LD_FORCE_GREEN"); fg = e ? 1 : 0;
-                    gk = e ? _strtoui64(e, 0, 16) : 0; if (gk == 1) gk = 0; }
-      if (fg && fi > 0 && (!gk || gk == live_legacy_pso_key())) {
+                    gk = e ? _strtoui64(e, 0, 16) : 0; if (gk == 1) gk = 0;
+                    e = getenv("LD_FORCE_GREEN_ATTRIBUTES");
+                    green_attributes = e ? (u32)strtoul(e, NULL, 16) & 0xFFFFu : 0; }
+      rsx_vp_input_analysis green_inputs = {0};
+      if (fg && green_attributes)
+          rsx_vp_analyze_inputs(vp_uc, vp_instrs * 16, &green_inputs);
+      if (fg && fi > 0 && (!gk || gk == live_legacy_pso_key()) &&
+          (!green_attributes || (green_inputs.exact &&
+              (green_inputs.input_mask & green_attributes) == green_attributes))) {
           /* The emulated alpha test discards before the return, so replacing
            * only the return still showed nothing for a failing alpha. */
           for (char* d = strstr(ps_hlsl, "discard;"); d; d = strstr(d, "discard;"))
@@ -6104,15 +6112,15 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
     const u32 target = current_surface();
     const u32 surf = target < g.n_surfaces ? g.surfaces[target].offset : 0;
     /* LD_DRAW_DUMP=<dir> [LD_DRAW_DUMP_EVERY=k, default 10]: in the first
-     * gated frame, read back each k-th draw's target BEFORE it is recorded,
+     * complete frame after the gate opens, read back each k-th draw's target BEFORE it is recorded,
      * named by frame-relative index -- bisects which draw changes a surface. */
-    { static const char* dir = (const char*)-1; static u32 every, frame = ~0u, idx, dumped_frame = ~0u;
+    { static const char* dir = (const char*)-1; static u32 every, frame = ~0u, idx, capture_frame = ~0u;
       if (dir == (const char*)-1) { dir = getenv("LD_DRAW_DUMP");
           const char* e = getenv("LD_DRAW_DUMP_EVERY"); every = e ? (u32)atoi(e) : 10; if (!every) every = 10; }
       if (frame != g_ld_frames) { frame = g_ld_frames; idx = 0; }
-      if (dir && target < g.n_surfaces && (dumped_frame == ~0u || dumped_frame == frame) &&
+      if (dir && capture_frame == ~0u) capture_frame = frame + 1u;
+      if (dir && target < g.n_surfaces && capture_frame == frame &&
           (idx % every) == 0) {
-          dumped_frame = frame;
           char path[MAX_PATH * 2];
           snprintf(path, sizeof(path), "%s\\draw_f%06u_i%04u_%08X.ppm", dir, frame, idx, surf);
           ld_dump_surface_ppm(path, &g.surfaces[target]);
@@ -7335,12 +7343,14 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     const u32 vtex_mask = vertex_texture_mask();
     /* Diagnostic unit mask: isolate texture-dependent fragment calculations. */
     { static u32 white_units = ~0u;
-      static u32 white_surface;
+      static u32 white_surface, white_attributes;
       if (white_units == ~0u) { const char* e = getenv("LD_WHITE_UNITS");
           white_units = e ? (u32)strtoul(e, NULL, 16) & 0xFFFFu : 0;
-          e = getenv("LD_WHITE_SURFACE"); white_surface = e ? (u32)strtoul(e, NULL, 16) : 0; }
+          e = getenv("LD_WHITE_SURFACE"); white_surface = e ? (u32)strtoul(e, NULL, 16) : 0;
+          e = getenv("LD_WHITE_ATTRIBUTES"); white_attributes = e ? (u32)strtoul(e, NULL, 16) & 0xFFFFu : 0; }
       for (u32 u = 0; u < SRV_TABLE_SIZE; ++u)
           if ((white_units & (1u << u)) &&
+              (!white_attributes || (used_layout.mask & white_attributes) == white_attributes) &&
               (!white_surface || g.surfaces[target].offset == white_surface)) slots[u] = SRV_WHITE;
     }
     u32 vtex_slots[SRV_TABLE_SIZE];
