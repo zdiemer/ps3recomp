@@ -149,18 +149,7 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
             r.group_exit ? " group-exit" : "", r.faulted ? " FAULT" : "");
     fflush(stderr);
 
-    /* The SPU has stopped, so its MFC engine is idle and the slot it holds in
-     * the per-context table can go back. There are eight of those and they used
-     * to be claimed for good, which a title only notices once it has started
-     * its ninth SPU thread: from there on every thread shares one engine with
-     * every other, tags and queue included. This is the natural place to give
-     * one back -- the context may be started again (the group is destroyed
-     * later, and lv2 keeps the context until then), and a fresh run claims a
-     * freshly initialized engine, which is what a fresh SPU thread should get.
-     *
-     * The fallback and interpreter paths are unchanged: neither runs a context
-     * through here, so both keep the engine they had for as long as they had
-     * it. */
+    /* Release private DMA state; a restarted thread gets a fresh engine. */
     spu_mfc_release(ctx);
 
     if (out) *out = r;
