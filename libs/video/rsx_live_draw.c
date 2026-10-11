@@ -8813,15 +8813,19 @@ void rsx_live_draw_present(u32 buffer_id)
      * title that scans out through cellResc never matches a registered display
      * buffer and presents the fallback surface, so matching here dumped nothing. */
     static int dump_every = -1; static const char* dump_dir; static unsigned dump_n;
+    static unsigned dump_written, dump_limit;
     if (dump_every < 0) { dump_dir = getenv("LD_FRAME_DUMP");
                           const char* e = getenv("LD_FRAME_DUMP_EVERY");
                           dump_every = (dump_dir && dump_dir[0]) ? (e ? atoi(e) : 300) : 0;
-                          if (dump_every <= 0 && dump_dir && dump_dir[0]) dump_every = 300; }
+                          if (dump_every <= 0 && dump_dir && dump_dir[0]) dump_every = 300;
+                          const char* count = getenv("LD_FRAME_DUMP_COUNT");
+                          dump_limit = count ? (unsigned)strtoul(count, NULL, 10) : 0; }
     /* LD_FRAME_DUMP_FROM=<frame>: start dumping there (dense captures of a
      * late scene, e.g. frames for a GIF, without thousands of early files). */
     static long dump_from = -1;
     if (dump_from < 0) { const char* e = getenv("LD_FRAME_DUMP_FROM"); dump_from = e ? atol(e) : 0; }
-    const int dump_now = dump_every > 0 && (long)g_ld_frames >= dump_from &&
+    const int dump_now = dump_every > 0 && (!dump_limit || dump_written < dump_limit) &&
+                         (long)g_ld_frames >= dump_from &&
                          (dump_n++ % (unsigned)dump_every) == 0;
     /* A flip names a registered display buffer. The current color target may
      * be an offscreen shadow/postprocess surface at that instant; copying it
@@ -8856,6 +8860,7 @@ void rsx_live_draw_present(u32 buffer_id)
     }
     g_ld_last_present_target = target;
     if (dump_now) {
+        dump_written++;
         char path[MAX_PATH * 2];
         snprintf(path, sizeof(path), "%s\\frame_%06u.ppm", dump_dir, dump_n - 1u);
         const u64 nb = ld_dump_surface_ppm(path, &g.surfaces[target]);

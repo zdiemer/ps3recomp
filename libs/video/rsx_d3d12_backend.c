@@ -2253,11 +2253,11 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             }
         }
     }
-    /* FP_FORCE=1: replace the translated body with solid magenta -- isolates
-     * geometry/transform problems from texture/blend problems. */
+    /* FP_FORCE=1: replace the translated shader with solid magenta. Replacing
+     * an obsolete "return r[0]" substring silently did nothing with the current
+     * decompiler, and a longer in-place replacement would corrupt its source. */
     if (getenv("FP_FORCE")) {
-        char* rp = strstr(hlsl, "return r[0];");
-        if (rp) memcpy(rp, "return float4(1,0,1,1)", 23);
+        strcpy(hlsl, "float4 main(float4 p:SV_Position):SV_Target { return float4(1,0,1,1); }\n");
     }
     ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
     HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_fp", NULL, NULL,
@@ -3106,11 +3106,10 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                           dr->tex[0].raw, dr->fp_addr,
                           ts[20], ts[21], ts[22], ts[23],
                           ts[24], ts[25], ts[26], ts[27], 10);
-                  const u32 raw = dr->fp_addr & ~0x3u;
-                  const u32 ea_main  = cellGcmResolveLocated(0, raw);
-                  const u32 ea_local = cellGcmResolveLocated(1, raw);
-                  fprintf(stderr, "[FPK]   ucode main@0x%08X:", ea_main);
-                  for (int b = 0; b < 48; b++) fprintf(stderr, "%s%02X", (b%16)?" ":"  |", vm_base[ea_main + b]);
+                  fprintf(stderr, "[FPK]   ucode %s@0x%08X:",
+                          (dr->fp_addr & 3u) == 1 ? "local" : "main", foff);
+                  if (vm_base && foff != 0xFFFFFFFFu)
+                      for (int b = 0; b < 48; b++) fprintf(stderr, "%s%02X", (b%16)?" ":"  |", vm_base[foff + b]);
                   fputc(10, stderr); }
               /* distinct fragment programs seen -- if every draw shares one,
                * SET_SHADER_PROGRAM is not being tracked per draw. */
@@ -3136,7 +3135,13 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
         fprintf(stderr, "[VPMVP] slot=%u lastNZ=c%d  c260=(%g %g %g %g) c467=(%g %g %g %g)\n",
                 slot, last_nz,
                 c[260*4+0], c[260*4+1], c[260*4+2], c[260*4+3],
-                c[467*4+0], c[467*4+1], c[467*4+2], c[467*4+3]); } }
+                c[467*4+0], c[467*4+1], c[467*4+2], c[467*4+3]);
+        for (int r = 0; r < 4; r++)
+            fprintf(stderr, "[VPMVP] c%d=(%g %g %g %g)\n", r,
+                    c[r*4], c[r*4+1], c[r*4+2], c[r*4+3]);
+        fprintf(stderr, "[VPMVP] viewport scale=(%g %g %g %g) offset=(%g %g %g %g)\n",
+                st->viewport_scale[0], st->viewport_scale[1], st->viewport_scale[2], st->viewport_scale[3],
+                st->viewport_offset[0], st->viewport_offset[1], st->viewport_offset[2], st->viewport_offset[3]); } }
     /* RSX_DBG_CB=<hex tex0 offset>: the constants as they land in the per-draw
      * constant buffer for that texture's draws -- i.e. exactly what the shader
      * samples, not what the CPU-side rsx_state holds. Those two agreeing is an
@@ -3187,17 +3192,15 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                if (lock && s_lock_valid) { ux = s_lock_x; uy = s_lock_y; }
                vpx[0] = k; vpx[1] = k; vpx[4] = -ux * k; vpx[5] = -uy * k; } }
 
-    /* Garbage-projection fallback (vkcube; see the original comment). */
-    int uses_c03 = (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n)
-                       ? s_d3d.vp_vs[vs_idx].uses_c03 : s_d3d.vp_uses_c03;
-    float* c = (float*)dst;
-    float c00 = c[0];
-    int garbage = !(c00 > 0.0f && c00 < 8.0f);
-    if (getenv("VP_NOFIXPROJ")) garbage = 0;
-    if ((garbage && uses_c03) || getenv("VP_FIXPROJ")) {
+    /* A negative/zero c0.x is legal: Haze uses a negative projection axis,
+     * and shaders may store unrelated data in this bank. Never replace guest
+     * constants by guessing a matrix from one coefficient. Retain the sample
+     * projection only as an explicit diagnostic override. */
+    if (getenv("VP_FIXPROJ") && !getenv("VP_NOFIXPROJ")) {
+        float* c = (float*)dst;
         { static int _fb = 0; if (_fb++ < 6)
-            printf("[VPFB] fallback proj on draw slot %u (c00=%g vs_idx=%d)\n",
-                   slot, c00, vs_idx); }
+            printf("[VPFB] diagnostic projection on draw slot %u (c00=%g vs_idx=%d)\n",
+                   slot, c[0], vs_idx); }
         for (int _i = 0; _i < 16; _i++) c[_i] = 0.0f;
         c[0]=1.358f; c[5]=2.414f; c[11]=1.0f;
         c[10]=1.0f/99.0f; c[14]=-1.0f/99.0f;
@@ -5438,6 +5441,23 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
             const rsx_vertex_attrib* a = &state->vertex_attribs[0];
             u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
             rsx_vtx_pos_dbg(state, out16[0].v, n);
+        }
+    }
+    /* VTX_INPUTS=N: one fetched vertex per distinct fragment program. Keep
+     * diagnostics bounded even when one strip contains thousands of vertices. */
+    static int cap = -1, count = 0;
+    static u32 seen[32];
+    if (cap < 0) { const char* e = getenv("VTX_INPUTS"); cap = e ? atoi(e) : 0; }
+    if (count < cap && count < 32) {
+        for (int i = 0; i < count; i++)
+            if (seen[i] == state->shader_program) return;
+        seen[count++] = state->shader_program;
+        fprintf(stderr, "[VTXINPUT] fp=0x%08X vi=%u\n", state->shader_program, vi);
+        for (int i = 0; i < 16; i++) {
+            if (i != 0 && i != 3 && i != 8 && !state->vertex_attribs[i].enabled) continue;
+            fprintf(stderr, "[VTXINPUT] a%d array=%d (%g %g %g %g)\n", i,
+                    state->vertex_attribs[i].enabled, out16[i].v[0], out16[i].v[1],
+                    out16[i].v[2], out16[i].v[3]);
         }
     }
 }

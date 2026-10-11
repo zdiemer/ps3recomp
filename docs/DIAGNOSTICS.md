@@ -1483,3 +1483,10 @@ empty resumes, GET/PUT copies, repark followed by completion, and concurrent
 resume admission. `MFC_TEST_SANITIZE=1` additionally runs them with UBSan on a
 compiler that supports it. The concurrent check verifies this dump's bound;
 it does not assert that unrelated existing diagnostic counters are race-free.
+### Haze rendering probes
+
+- `VTX_INPUTS=N`: log one fetched vertex per distinct fragment program (up to 32), including enabled attributes and the color/UV slots.
+- `VP_MVP=N`: also print constants c0 through c3 and the guest viewport transform.
+- `FPK_DBG=1`: shader bytes now come from the program's actual local/main location.
+- `FP_FORCE=1`: replace the fragment shader with solid magenta; this now works with the current decompiler. Diagnostic output is not game rendering.
+- `LD_FRAME_DUMP_COUNT=N`: stop live-renderer PPM captures after N attempts; unset or zero retains unlimited capture. Use with `LD_FRAME_DUMP`, `LD_FRAME_DUMP_FROM`, and `LD_FRAME_DUMP_EVERY`.
