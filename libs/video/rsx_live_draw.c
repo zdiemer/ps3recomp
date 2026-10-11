@@ -86,6 +86,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <stdlib.h>
 
 static rsx_vertex_payload_cache g_ld_vertex_cache;
+static int g_ld_apply_polygon_bias=1;
 static int g_ld_vertex_cache_enabled=-1;
 static int ld_vertex_cache_enabled(void)
 {
@@ -1101,6 +1102,7 @@ typedef struct {
     u64 vs_compile_qpc;
     u64 ps_compile_qpc;
     u64 create_pso_qpc;
+    u64 pso_prepare_qpc;
     u64 flush_qpc;
     u64 fence_wait_qpc;
     u64 flush_reason[LD_FLUSH_REASON_COUNT];
@@ -1419,7 +1421,7 @@ static void decode_render_state(render_state_t* rs)
     { static int nd = -1; if (nd < 0) nd = getenv("LD_NO_DEPTH") ? 1 : 0; if (nd) rs->depth_test = 0; }
     rs->depth_write = rsx_dsp_reg(&g.rsx, M_DEPTH_WRITE) & 1;
     rs->depth_func  = rsx_dsp_reg(&g.rsx, M_DEPTH_FUNC);
-    if (rsx_dsp_reg(&g.rsx, 0x0A68) & 1) {
+    if (g_ld_apply_polygon_bias && (rsx_dsp_reg(&g.rsx, 0x0A68) & 1)) {
         rs->bias_factor = rsx_dsp_reg(&g.rsx, 0x0A78);
         rs->bias_units = rsx_dsp_reg(&g.rsx, 0x0A7C);
     }
@@ -5443,12 +5445,12 @@ static void ld_profile_present(u32 frame)
             if (csv) fprintf(csv, "frame,qpc,dt_ms,draw_cpu_ms,vertex_pack_ms,"
                 "flush_ms,fence_wait_ms,decompile_ms,vs_compile_ms,ps_compile_ms,"
                 "create_pso_ms,texture_decode_ms,draws,vertices,texture_upload_bytes,"
-                "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes\n");
+                "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms\n");
         }
     }
     if (csv) {
         fprintf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu\n", frame, now, frame_ms,
+            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
@@ -5466,7 +5468,8 @@ static void ld_profile_present(u32 frame)
             (unsigned long long)LD_PROFILE_DELTA(flush_reason[LD_FLUSH_GUEST_REFERENCE]),
             g_ld_gpu_frequency ? (double)LD_PROFILE_DELTA(gpu_ticks)*1000.0/g_ld_gpu_frequency : -1.0,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(texture_hash_qpc)),
-            (unsigned long long)LD_PROFILE_DELTA(texture_hash_bytes));
+            (unsigned long long)LD_PROFILE_DELTA(texture_hash_bytes),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(pso_prepare_qpc)));
         if ((frame & 63u) == 0) fflush(csv);
     }
     g_ld_profile.measured_frames++;
@@ -7004,9 +7007,15 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         write_topology_indices(
             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
 
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG pso_begin=ld_profile_qpc();
+#endif
     ID3D12PipelineState* pso = get_pso(
         ld_vertex_mask_signature() ? &used_layout : NULL,
         ld_vertex_compact_payload());
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.pso_prepare_qpc+=ld_profile_qpc()-pso_begin;
+#endif
     if (!pso) {
 #if defined(YZ_PERF_PROFILE)
         ld_profile_note_rejected_pso();
@@ -9151,6 +9160,19 @@ void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
     if (g_ld_frames%60==0) {
+        static const char* bias_control=(const char*)-1;
+        if (bias_control==(const char*)-1) bias_control=getenv("RSX_BIAS_FILE");
+        if (bias_control) {
+            FILE* file=fopen(bias_control,"r"); unsigned enabled;
+            if (file) {
+                if (fscanf(file,"%u",&enabled)==1 && enabled<=1 &&
+                    g_ld_apply_polygon_bias!=(int)enabled) {
+                    g_ld_apply_polygon_bias=(int)enabled;
+                    fprintf(stderr,"[polygon-bias] frame=%u enabled=%u\n",g_ld_frames,enabled);
+                }
+                fclose(file);
+            }
+        }
         static const char* control=(const char*)-1;
         if (control==(const char*)-1) control=getenv("RSX_VERTEX_CACHE_FILE");
         if (control) {
