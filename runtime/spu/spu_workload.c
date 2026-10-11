@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -215,7 +216,46 @@ typedef struct {
     int                 have_r3;
     uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
     uint32_t            taskid;
+    int                 heap_context; /* captured experiment mode per dispatch */
 } spu_async_job;
+
+#ifdef _WIN32
+static INIT_ONCE s_execution_config = INIT_ONCE_STATIC_INIT;
+static SRWLOCK s_execution_control_lock = SRWLOCK_INIT;
+static const char* s_execution_control;
+static int s_execution_heap;
+static ULONGLONG s_execution_next_check;
+static BOOL CALLBACK spu_execution_config(PINIT_ONCE once, PVOID param, PVOID* context)
+{
+    (void)once; (void)param; (void)context;
+    s_execution_control = getenv("SPU_EXECUTION_MODE_FILE");
+    const char* heap = getenv("SPU_HEAP_CONTEXT");
+    s_execution_heap = !heap || strcmp(heap,"0") != 0;
+    return TRUE;
+}
+static int spu_execution_heap_enabled(void)
+{
+    InitOnceExecuteOnce(&s_execution_config, spu_execution_config, NULL, NULL);
+    if (!s_execution_control) return s_execution_heap;
+    AcquireSRWLockExclusive(&s_execution_control_lock);
+    ULONGLONG now = GetTickCount64();
+    if (now >= s_execution_next_check) {
+        s_execution_next_check = now + 100;
+        FILE* file = fopen(s_execution_control, "r"); unsigned flags;
+        if (file) {
+            if (fscanf(file, "%u", &flags) == 1 && flags <= 63 &&
+                    s_execution_heap != ((flags & 32u) != 0)) {
+                s_execution_heap = (flags & 32u) != 0;
+                fprintf(stderr, "[spu-execution] heap_context=%d\n", s_execution_heap);
+            }
+            fclose(file);
+        }
+    }
+    int enabled = s_execution_heap;
+    ReleaseSRWLockExclusive(&s_execution_control_lock);
+    return enabled;
+}
+#endif
 
 /* ---- Persistent per-taskset local store (LBP_PERSIST_LS) ------------------
  * Real SPURS time-multiplexes a taskset's tasks onto SPUs, saving/restoring a
@@ -345,11 +385,18 @@ static uint64_t spu_job_qpc(void)
 #endif
 }
 
+static int spu_job_timing_enabled(int image)
+{
+    if (!getenv("SPU_JOB_TIMING")) return 0;
+    const char* filter = getenv("SPU_JOB_TIMING_IMAGE");
+    return !filter || atoi(filter) == image;
+}
+
 static void spu_async_run(spu_async_job* j)
 {
     /* Opt-in wall times distinguish taskset-lock contention, image setup and
      * actual lifted execution. Persistent tasks report only when they exit. */
-    const int timing = getenv("SPU_JOB_TIMING") != NULL;
+    const int timing = spu_job_timing_enabled(j->image_id);
     const uint64_t job_start = timing ? spu_job_clock_ms() : 0;
     const uint64_t setup_qpc = timing ? spu_job_qpc() : 0;
     const uint64_t setup_cycles = timing ? spu_job_cycles() : 0;
@@ -640,18 +687,34 @@ static void spu_async_run(spu_async_job* j)
             const uint64_t execute_start = timing ? spu_job_clock_ms() : 0;
             const uint64_t execute_qpc = timing ? spu_job_qpc() : 0;
             const uint64_t execute_cycles = timing ? spu_job_cycles() : 0;
+#ifdef _WIN32
+            if (timing && getenv("SPU_JOB_TIMING_IMAGE")) {
+                wchar_t name[64]; swprintf(name,64,L"spu-image-%d",j->image_id);
+                SetThreadDescription(GetCurrentThread(),name);
+                fprintf(stderr, "[spu-job-start] image=%d tid=%lu begin_qpc=%llu heap_context=%d\n",
+                    j->image_id, GetCurrentThreadId(), (unsigned long long)execute_qpc, j->heap_context);
+            }
+#endif
             spu_abi_profile abi_profile = {0};
-            int32_t rc = spu_run_lifted_job_abi_profiled(j->fn, ls, j->args_ea, j->image_id,
+            int32_t rc;
+#ifdef _WIN32
+            if (j->heap_context)
+                rc = spu_run_lifted_job_abi_heap(j->fn, ls, j->args_ea, j->image_id,
+                                                1, j->have_r3 ? j->r3 : 0, 0,
+                                                timing ? &abi_profile : NULL);
+            else
+#endif
+                rc = spu_run_lifted_job_abi_profiled(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0, 0,
                                                 timing ? &abi_profile : NULL);
             if (timing) {
                 const uint64_t end = spu_job_clock_ms();
                 const uint64_t end_qpc = spu_job_qpc(), end_cycles = spu_job_cycles();
                 fprintf(stderr, "[spu-job-time] image=%d taskset=%08X task=%u "
-                        "setup_ms=%llu run_ms=%llu end_ms=%llu "
+                        "heap_context=%d setup_ms=%llu run_ms=%llu end_ms=%llu "
                         "begin_qpc=%llu execute_qpc=%llu end_qpc=%llu setup_cycles=%llu run_cycles=%llu "
                         "abi_prepare_cycles=%llu native_cycles=%llu abi_finish_cycles=%llu\n",
-                        j->image_id, j->taskset_ea, j->taskid,
+                        j->image_id, j->taskset_ea, j->taskid, j->heap_context,
                         (unsigned long long)(execute_start - job_start),
                         (unsigned long long)(end - execute_start),
                         (unsigned long long)end,
@@ -734,8 +797,8 @@ static void spu_async_run(spu_async_job* j)
 
 #ifdef _WIN32
 static DWORD WINAPI spu_async_thread(LPVOID p) {
-    const int timing=getenv("SPU_JOB_TIMING")!=NULL;
     const int image=((spu_async_job*)p)->image_id;
+    const int timing=spu_job_timing_enabled(image);
     const uint64_t begin=timing?spu_job_cycles():0;
     /* Reserve handler headroom so a stack overflow in lifted SPU code (e.g. a
      * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
@@ -1165,6 +1228,10 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
     if (!j) return 0;
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
     j->fn = fn; j->image_id = image_id;
+    j->heap_context = 0;
+#ifdef _WIN32
+    j->heap_context = spu_execution_heap_enabled();
+#endif
     j->taskset_ea = taskset_ea; j->taskid = taskid;
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
      * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
@@ -1222,8 +1289,8 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
      * process death) the moment the real decode path first executed. */
     /* Capture identity before CreateThread: the worker can free j before it
      * returns. Measure submitting-thread CPU separately from worker cycles. */
-    const int dispatch_timing = getenv("SPU_JOB_TIMING") != NULL;
     const int dispatch_image = j->image_id;
+    const int dispatch_timing = spu_job_timing_enabled(dispatch_image);
     const uint64_t dispatch_cycles = dispatch_timing ? spu_job_cycles() : 0;
     const uint64_t dispatch_qpc = dispatch_timing ? spu_job_qpc() : 0;
     HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
