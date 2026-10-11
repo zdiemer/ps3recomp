@@ -217,41 +217,45 @@ typedef struct {
     uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
     uint32_t            taskid;
     int                 heap_context; /* captured experiment mode per dispatch */
+    int                 byte_ops_simd;
 } spu_async_job;
+
+SPU_THREAD_LOCAL int g_spu_byte_ops_simd = 1;
 
 #ifdef _WIN32
 static INIT_ONCE s_execution_config = INIT_ONCE_STATIC_INIT;
 static SRWLOCK s_execution_control_lock = SRWLOCK_INIT;
 static const char* s_execution_control;
-static int s_execution_heap;
+static unsigned s_execution_mode;
 static ULONGLONG s_execution_next_check;
 static BOOL CALLBACK spu_execution_config(PINIT_ONCE once, PVOID param, PVOID* context)
 {
     (void)once; (void)param; (void)context;
     s_execution_control = getenv("SPU_EXECUTION_MODE_FILE");
     const char* heap = getenv("SPU_HEAP_CONTEXT");
-    s_execution_heap = !heap || strcmp(heap,"0") != 0;
+    s_execution_mode = (!heap || strcmp(heap,"0") != 0) ? 96u : 64u;
     return TRUE;
 }
-static int spu_execution_heap_enabled(void)
+static unsigned spu_execution_mode(void)
 {
     InitOnceExecuteOnce(&s_execution_config, spu_execution_config, NULL, NULL);
-    if (!s_execution_control) return s_execution_heap;
+    if (!s_execution_control) return s_execution_mode;
     AcquireSRWLockExclusive(&s_execution_control_lock);
     ULONGLONG now = GetTickCount64();
     if (now >= s_execution_next_check) {
         s_execution_next_check = now + 100;
         FILE* file = fopen(s_execution_control, "r"); unsigned flags;
         if (file) {
-            if (fscanf(file, "%u", &flags) == 1 && flags <= 63 &&
-                    s_execution_heap != ((flags & 32u) != 0)) {
-                s_execution_heap = (flags & 32u) != 0;
-                fprintf(stderr, "[spu-execution] heap_context=%d\n", s_execution_heap);
+            if (fscanf(file, "%u", &flags) == 1 && flags <= 127 &&
+                    s_execution_mode != (flags & 96u)) {
+                s_execution_mode = flags & 96u;
+                fprintf(stderr, "[spu-execution] heap_context=%d byte_ops_simd=%d\n",
+                    (s_execution_mode & 32u)!=0, (s_execution_mode & 64u)!=0);
             }
             fclose(file);
         }
     }
-    int enabled = s_execution_heap;
+    unsigned enabled = s_execution_mode;
     ReleaseSRWLockExclusive(&s_execution_control_lock);
     return enabled;
 }
@@ -797,6 +801,7 @@ static void spu_async_run(spu_async_job* j)
 
 #ifdef _WIN32
 static DWORD WINAPI spu_async_thread(LPVOID p) {
+    g_spu_byte_ops_simd = ((spu_async_job*)p)->byte_ops_simd;
     const int image=((spu_async_job*)p)->image_id;
     const int timing=spu_job_timing_enabled(image);
     const uint64_t begin=timing?spu_job_cycles():0;
@@ -1199,8 +1204,11 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
     j->fn = fn; j->image_id = image_id;
     j->heap_context = 0;
+    j->byte_ops_simd = 1;
 #ifdef _WIN32
-    j->heap_context = spu_execution_heap_enabled();
+    unsigned execution_mode = spu_execution_mode();
+    j->heap_context = (execution_mode & 32u)!=0;
+    j->byte_ops_simd = (execution_mode & 64u)!=0;
 #endif
     j->taskset_ea = taskset_ea; j->taskid = taskid;
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
