@@ -1402,6 +1402,10 @@ static void decode_render_state(render_state_t* rs)
      * reset default (0x01010101), so never-written reads as all-on. */
     rs->color_mask  = rsx_dsp_reg(&g.rsx, M_COLOR_MASK);
     rs->stencil_enable    = rsx_dsp_reg(&g.rsx, M_STENCIL_TEST_ENABLE) & 1;
+    { static int ns = -1; if (ns < 0) ns = getenv("LD_NO_STENCIL") != NULL;
+      if (ns) rs->stencil_enable = 0; }
+    { static int na = -1; if (na < 0) na = getenv("LD_NO_ALPHA") != NULL;
+      if (na) rs->alpha_test_enable = 0; }
     rs->stencil_two_sided = rsx_dsp_reg(&g.rsx, M_TWO_SIDED_STENCIL) & 1;
     rs->s_func       = rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC);
     rs->s_func_mask  = rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_MASK) & 0xFF;
@@ -7329,6 +7333,16 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     }
 
     const u32 vtex_mask = vertex_texture_mask();
+    /* Diagnostic unit mask: isolate texture-dependent fragment calculations. */
+    { static u32 white_units = ~0u;
+      static u32 white_surface;
+      if (white_units == ~0u) { const char* e = getenv("LD_WHITE_UNITS");
+          white_units = e ? (u32)strtoul(e, NULL, 16) & 0xFFFFu : 0;
+          e = getenv("LD_WHITE_SURFACE"); white_surface = e ? (u32)strtoul(e, NULL, 16) : 0; }
+      for (u32 u = 0; u < SRV_TABLE_SIZE; ++u)
+          if ((white_units & (1u << u)) &&
+              (!white_surface || g.surfaces[target].offset == white_surface)) slots[u] = SRV_WHITE;
+    }
     u32 vtex_slots[SRV_TABLE_SIZE];
     for (u32 u = 0; u < SRV_TABLE_SIZE; u++)
         vtex_slots[u] = SRV_WHITE;
