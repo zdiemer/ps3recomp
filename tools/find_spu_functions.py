@@ -77,7 +77,7 @@ def parse_elf(buf):
         off = e_phoff + i * e_phentsize
         p_type, p_off, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align = \
             struct.unpack_from(">IIIIIIII", buf, off)
-        phs.append(dict(type=p_type, off=p_off, vaddr=p_vaddr, filesz=p_filesz,
+        phs.append(dict(type=p_type, off=p_off, vaddr=p_vaddr, paddr=p_paddr, filesz=p_filesz,
                         memsz=p_memsz, flags=p_flags))
 
     # Section headers (Elf32_Shdr = 40 bytes)
@@ -614,7 +614,7 @@ def collect_lifecycle_targets(buf, shs):
     return targets
 
 
-def detect_functions(buf, base_override=None, verbose=True, raw=False):
+def detect_functions(buf, base_override=None, verbose=True, raw=False, segment_index=None):
     if raw:
         # A raw local-store image: a SPURS job binary, which the title loads
         # from its own data files as a flat code+data blob rather than as an
@@ -630,7 +630,15 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
         text_off, text_va, text_size = 0, base, len(buf)
     else:
         elf = parse_elf(buf)
-        text_off, text_va, text_size = pick_text(elf["phs"], elf["entry"])
+        if segment_index is None:
+            text_off, text_va, text_size = pick_text(elf["phs"], elf["entry"])
+        else:
+            if not 0 <= segment_index < len(elf["phs"]):
+                raise ValueError("SPU program-header index is out of range")
+            ph = elf["phs"][segment_index]
+            if ph["type"] != 1 or not ph["filesz"] or ph["off"] + ph["filesz"] > len(buf):
+                raise ValueError("SPU segment must be a complete file-backed PT_LOAD")
+            text_off, text_va, text_size = ph["off"], ph["vaddr"], ph["filesz"]
     code = buf[text_off:text_off + text_size]
     base = base_override if base_override is not None else text_va
     insns = disassemble_spu(code, base_addr=base)

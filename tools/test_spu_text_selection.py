@@ -1,7 +1,8 @@
 """SPU startup segment regression tests; no game binaries are needed."""
 import unittest
+import struct
 
-from find_spu_functions import pick_text, collect_lifecycle_targets
+from find_spu_functions import pick_text, collect_lifecycle_targets, detect_functions
 
 
 def segment(off, vaddr, size, flags=5, kind=1, memsz=None):
@@ -10,6 +11,24 @@ def segment(off, vaddr, size, flags=5, kind=1, memsz=None):
 
 
 class TextSelectionTests(unittest.TestCase):
+    def test_explicit_overlay_is_separate_from_resident_code(self):
+        data = bytearray(0x110)
+        data[:6] = b"\x7fELF\x01\x02"
+        struct.pack_into(">H", data, 18, 23)
+        struct.pack_into(">II", data, 24, 0x20080, 52)
+        struct.pack_into(">HH", data, 42, 32, 2)
+        struct.pack_into(">8I", data, 52, 1, 0x100, 0x20080, 0x20080, 4, 4, 5, 128)
+        struct.pack_into(">8I", data, 84, 1, 0x108, 0x3080, 0x40000, 4, 4, 7, 128)
+        data[0x100:0x104] = data[0x108:0x10C] = bytes.fromhex("35000000")  # bi r0
+        resident, mapping = detect_functions(data, verbose=False)
+        self.assertEqual(mapping, (0x100, 0x20080, 4))
+        overlay, mapping = detect_functions(data, verbose=False, segment_index=1)
+        self.assertEqual(mapping, (0x108, 0x3080, 4))
+        self.assertEqual(overlay, [(0x3080, 0x3084)])
+        self.assertEqual(resident, [(0x20080, 0x20084)])
+        with self.assertRaises(ValueError):
+            detect_functions(data, verbose=False, segment_index=2)
+
     def test_single_constructor_between_sentinels(self):
         data = bytes.fromhex("ffffffff 00020190 00000000")
         section = dict(name=".ctors", off=0, size=len(data))
