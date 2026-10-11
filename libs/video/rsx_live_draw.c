@@ -8827,6 +8827,14 @@ void rsx_live_draw_present(u32 buffer_id)
     const int dump_now = dump_every > 0 && (!dump_limit || dump_written < dump_limit) &&
                          (long)g_ld_frames >= dump_from &&
                          (dump_n++ % (unsigned)dump_every) == 0;
+    /* A closed-loop driver can request one additional frame after navigating
+     * a menu. Explicit requests remain available after periodic capture ends. */
+    static const char* dump_trigger; static int trigger_initialized;
+    if (!trigger_initialized) {
+        dump_trigger = getenv("LD_FRAME_DUMP_TRIGGER"); trigger_initialized = 1;
+    }
+    int dump_requested = dump_dir && dump_dir[0] && dump_trigger && dump_trigger[0] &&
+                         GetFileAttributesA(dump_trigger) != INVALID_FILE_ATTRIBUTES;
     /* A flip names a registered display buffer. The current color target may
      * be an offscreen shadow/postprocess surface at that instant; copying it
      * caused a010 to present black despite executing the scene's draws. */
@@ -8859,10 +8867,14 @@ void rsx_live_draw_present(u32 buffer_id)
         return;
     }
     g_ld_last_present_target = target;
-    if (dump_now) {
-        dump_written++;
+    if (dump_requested && !DeleteFileA(dump_trigger)) dump_requested = 0;
+    if (dump_now || dump_requested) {
+        if (dump_now) dump_written++;
         char path[MAX_PATH * 2];
-        snprintf(path, sizeof(path), "%s\\frame_%06u.ppm", dump_dir, dump_n - 1u);
+        if (dump_requested)
+            snprintf(path, sizeof(path), "%s\\requested_%06u.ppm", dump_dir, g_ld_frames);
+        else
+            snprintf(path, sizeof(path), "%s\\frame_%06u.ppm", dump_dir, dump_n - 1u);
         const u64 nb = ld_dump_surface_ppm(path, &g.surfaces[target]);
         fprintf(stderr, "[frame-dump] %s %ux%u nonblack=%llu\n", path,
                 g.surfaces[target].w, g.surfaces[target].h,
