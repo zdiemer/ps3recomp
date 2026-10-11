@@ -351,85 +351,8 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
     return slot;
 }
 
-/* Minimal taskset scheduling for tasks the PPU never created.
- *
- * SPU code can create tasks itself, or mark existing ones ready, and rely on
- * the taskset policy module to schedule them. Tasks created from the PPU are
- * dispatched by our cellSpursCreateTask, but nothing looked at the taskset
- * afterwards, so SPU-scheduled work never ran. Guitar Hero III's Havok task
- * hands the rest of each physics step to other tasks and EXITs, and the step
- * then waits forever.
- *
- * Runs when a task of the taskset returns (our runner returns on the EXIT
- * syscall; waiting tasks park instead). The returning task's ready, pending
- * and enabled bits are cleared, as the real policy does on exit, and every
- * other enabled task that is pending or ready and not already running here is
- * started from its ELF.
- *
- * Taskset layout: bitsets of 16 bytes at +0x10 ready, +0x20 pending,
- * +0x30 enabled (task 0 = MSB of byte 0); task_info[t] at +0x80 + 0x30*t with
- * the ELF EA at +0x14 and the context save EA at +0x1C. */
-#define TS_TRACK 8
-static struct { uint32_t ea; uint8_t running[16]; } s_ts_run[TS_TRACK];
-static volatile LONG s_ts_lock;
-static uint8_t* ts_running(uint32_t taskset_ea)
-{
-    for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == taskset_ea) return s_ts_run[i].running;
-    for (int i = 0; i < TS_TRACK; i++) if (!s_ts_run[i].ea) { s_ts_run[i].ea = taskset_ea; return s_ts_run[i].running; }
-    return NULL;
-}
-static void ts_lock(void)   { while (InterlockedExchange(&s_ts_lock, 1)) Sleep(0); }
-static void ts_unlock(void) { InterlockedExchange(&s_ts_lock, 0); }
-
-static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
-{
-    if (!taskset_ea || t >= 128) return;
-    ts_lock();
-    uint8_t* r = ts_running(taskset_ea);
-    uint8_t m = (uint8_t)(0x80u >> (t & 7));
-    if (r) { if (on) r[t / 8] |= m; else r[t / 8] &= (uint8_t)~m; }
-    ts_unlock();
-}
-
-static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
-{
-    extern uint8_t* vm_base;
-    extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-    ts_lock();
-    uint8_t* ts = vm_base + taskset_ea;
-    uint8_t* run = ts_running(taskset_ea);
-    if (done_task < 128) {
-        uint8_t m = (uint8_t)(0x80u >> (done_task & 7));
-        ts[0x10 + done_task / 8] &= (uint8_t)~m;
-        ts[0x20 + done_task / 8] &= (uint8_t)~m;
-        ts[0x30 + done_task / 8] &= (uint8_t)~m;
-        if (run) run[done_task / 8] &= (uint8_t)~m;
-    }
-    for (uint32_t t = 0; t < 128 && run; t++) {
-        uint8_t m = (uint8_t)(0x80u >> (t & 7));
-        if (!(ts[0x30 + t / 8] & m) || (run[t / 8] & m)) continue;
-        if (!((ts[0x10 + t / 8] | ts[0x20 + t / 8]) & m)) continue;
-        const uint8_t* ti = ts + 0x80 + 0x30 * t;
-        uint32_t elf = ((uint32_t)ti[0x14] << 24) | ((uint32_t)ti[0x15] << 16) |
-                       ((uint32_t)ti[0x16] << 8) | ti[0x17];
-        uint32_t ctx = ((uint32_t)ti[0x1C] << 24) | ((uint32_t)ti[0x1D] << 16) |
-                       ((uint32_t)ti[0x1E] << 8) | ti[0x1F];
-        if (!elf) continue;
-        size_t sz = spu_elf_image_size(vm_base + elf, 2u * 1024 * 1024);
-        if (!sz) continue;
-        ts[0x20 + t / 8] &= (uint8_t)~m;                 /* pending -> started */
-        run[t / 8] |= m;
-        fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
-                        "(after task %u exited)\n", t, taskset_ea, elf, done_task);
-        g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
-        spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
-    }
-    ts_unlock();
-}
-
 static void spu_async_run(spu_async_job* j)
 {
-    spu_taskset_mark(j->taskset_ea, j->taskid, 1);
     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
      * back to a fresh per-dispatch LS when disabled / no taskset. */
     spu_ts_ls_slot* ts_slot = NULL;
@@ -1136,8 +1059,8 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     return 0;
 }
 
-int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
-                                uint32_t args_ea)
+int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
+                                    uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid)
 {
     if (!image || image_size == 0) return 0;
 
@@ -1177,18 +1100,13 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     if (!j) return 0;
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
     j->fn = fn; j->image_id = image_id;
-    /* Capture the taskset+taskid NOW (PPU thread, right after cellSpursCreateTask
-     * set the globals for THIS task). Reading them later in the async thread races
-     * the next CreateTask overwriting the single-slot globals -- with two audio
-     * tasks that made both run task 1's descriptor. */
-    { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-      j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
+    j->taskset_ea = taskset_ea; j->taskid = taskid;
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
      * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
      * async SPU thread reading it later would race the PPU stack. word1 is
      * overridden to args_ea (eaContext) in spu_run_lifted_job_abi. */
     j->have_r3 = 0;
-    if (args_ea) {
+    if (args_ea && !taskset_ea) {
         extern uint8_t* vm_base;
         const uint8_t* c = vm_base + args_ea + 0x10;
         for (int k = 0; k < 4; k++)
@@ -1256,4 +1174,17 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     pthread_detach(th);
 #endif
     return 1;
+}
+
+/* Legacy PPU entry point: capture the caller's identity before spawning. The
+ * scheduler uses the explicit entry point and never overwrites these globals. */
+int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+                                uint32_t args_ea)
+{
+    extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+    uint32_t ts = g_ydkj_real_taskset_ea, task = g_ydkj_real_taskid;
+    if (ts && !spu_taskset_claim(ts, task)) return 1;
+    int dispatched = spu_workload_dispatch_async_task(image, image_size, args_ea, ts, task);
+    if (!dispatched && ts) spu_taskset_release(ts, task);
+    return dispatched;
 }

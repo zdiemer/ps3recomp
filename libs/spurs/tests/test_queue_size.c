@@ -7,11 +7,15 @@ uint8_t* vm_base;
 int g_resv_store_active = 0;
 uint32_t g_ww_lo = 0, g_ww_hi = 0;
 static int locked;
+static int notifications, signals;
+static u32 signalled_task;
 void spu_lockline_lock(void) { assert(!locked); locked = 1; }
 void spu_lockline_unlock(void) { assert(locked); locked = 0; }
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 int spu_coh_is_reserved(uint32_t ea) { (void)ea; return 0; }
-void spu_coh_notify_write(uint32_t ea) { (void)ea; }
+void spu_coh_notify_write(uint32_t ea) { assert(locked && ea == 0x100); ++notifications; }
+void spu_taskset_signal_task(uint32_t ts, uint32_t task)
+{ assert(!locked && ts == 0x900); ++signals; signalled_task = task; }
 void ps3_ww_report_inline(uint32_t ea, uint64_t v, int w) { (void)ea; (void)v; (void)w; }
 
 static void expect_size(u32 head, u32 tail, u32 depth, u32 expected)
@@ -43,6 +47,29 @@ int main(void)
     assert(_cellSpursQueueInitialize(0, 0, 0x100, 0x401, 16, 8, 2) == CELL_SPURS_TASK_ERROR_ALIGN);
     assert(_cellSpursQueueInitialize(0, 0, 0x100, 0x400, 15, 8, 2) == CELL_SPURS_TASK_ERROR_INVAL);
     assert(_cellSpursQueueInitialize(0, 0, 0x100, 0x400, 16, 8, 3) == CELL_SPURS_TASK_ERROR_INVAL);
+    memset(vm_base + 0x300, 0x69, 16);
+    assert(cellSpursQueuePushBody(0x100, 0x300, 0) == CELL_OK);
+    assert(!memcmp(vm_base + 0x400, vm_base + 0x300, 16) && vm_read32(0x104) == 1);
+    assert(notifications == 1 && signals == 0);
+    assert(cellSpursQueuePopBody(0x100, 0x300, 0) == CELL_SPURS_TASK_ERROR_PERM);
+    /* Pop only on SPU->PPU queues. */
+    vm_write32(0x11C, 1);
+    memset(vm_base + 0x300, 0, 16);
+    assert(cellSpursQueuePopBody(0x100, 0x300, 0) == CELL_OK);
+    assert(vm_base[0x300] == 0x69 && vm_read32(0x100) == 1);
+    assert(cellSpursQueuePopBody(0x100, 0x300, 0) == CELL_SPURS_TASK_ERROR_AGAIN);
+    vm_write32(0x11C, 2);
+    vm_write32(0x100, 15); vm_write32(0x104, 15);
+    vm_base[0x120] = 2; vm_base[0x121] = 7; vm_base[0x122] = 9;
+    assert(cellSpursQueuePushBody(0x100, 0x300, 0) == CELL_OK);
+    assert(vm_read32(0x104) == 0 && vm_base[0x470] == 0x69);
+    assert(signals == 1 && signalled_task == 7);
+    assert(vm_base[0x120] == 1 && vm_base[0x121] == 9);
+    vm_write32(0x100, 0); vm_write32(0x104, 8);
+    assert(cellSpursQueuePushBody(0x100, 0x300, 0) == CELL_SPURS_TASK_ERROR_AGAIN);
+    assert(vm_read32(0x104) == 8);
+    vm_write32(0x100, 0); vm_write32(0x104, ~1u);
+    assert(cellSpursQueuePushBody(0x100, 0x300, 0) == CELL_SPURS_TASK_ERROR_AGAIN);
     expect_size(0, 0, 8, 0);       /* empty */
     expect_size(0, 8, 8, 8);       /* full */
     expect_size(14, 2, 8, 4);      /* wrap around twice-depth boundary */
