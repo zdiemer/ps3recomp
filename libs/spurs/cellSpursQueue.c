@@ -54,12 +54,12 @@ static int queue_take_waiter(uint8_t* q, unsigned offset)
     return task;
 }
 
-static s32 queue_transfer(u64 queue_ea, u64 data_ea, u32 blocking, int push)
+static s32 queue_transfer(u64 queue_ea, u64 data_ea, u32 blocking, int push, u32 peek)
 {
     u32 q = (u32)queue_ea, data = (u32)data_ea;
     if (!q || !data) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     if ((q & 127u) || (data & 15u)) return CELL_SPURS_TASK_ERROR_ALIGN;
-    if (blocking > 1 || queue_ea > UINT32_MAX || data_ea > UINT32_MAX)
+    if (blocking > 1 || peek > 1 || queue_ea > UINT32_MAX || data_ea > UINT32_MAX)
         return CELL_SPURS_TASK_ERROR_INVAL;
 
     for (;;) {
@@ -95,7 +95,7 @@ static s32 queue_transfer(u64 queue_ea, u64 data_ea, u32 blocking, int push)
         int busy = (head | tail) & 0x80000000u;
         if (busy || (push ? count == depth : count == 0)) {
             spu_lockline_unlock();
-            if (!blocking) return CELL_SPURS_TASK_ERROR_AGAIN;
+            if (!blocking) return busy ? CELL_SPURS_TASK_ERROR_BUSY : CELL_SPURS_TASK_ERROR_AGAIN;
             Sleep(1);
             continue;
         }
@@ -103,6 +103,10 @@ static s32 queue_transfer(u64 queue_ea, u64 data_ea, u32 blocking, int push)
         uint8_t* slot = vm_base + (u32)buffer64 + (size_t)(index % depth) * size;
         if (push) memcpy(slot, vm_base + data, size);
         else memcpy(vm_base + data, slot, size);
+        if (peek) {
+            spu_lockline_unlock();
+            return CELL_OK;
+        }
         /* Payload precedes publication under the same lock as GETLLAR/PUTLLC. */
         queue_write_index(vm_base + q + (push ? 4 : 0), (index + 1) % modulus);
         u32 taskset = (u32)vm_read64(q + 0x70);
@@ -116,12 +120,13 @@ static s32 queue_transfer(u64 queue_ea, u64 data_ea, u32 blocking, int push)
 
 s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
 {
-    return queue_transfer(queue_ea, data_ea, isBlocking, 1);
+    return queue_transfer(queue_ea, data_ea, isBlocking, 1, 0);
 }
 
-s32 cellSpursQueuePopBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
+s32 cellSpursQueuePopBody(u64 queue_ea, u64 data_ea, u32 isPeek, u32 isBlocking)
 {
-    return queue_transfer(queue_ea, data_ea, isBlocking, 0);
+    /* Retail r5 selects Peek; blocking is the fourth argument in r6. */
+    return queue_transfer(queue_ea, data_ea, isBlocking, 0, isPeek);
 }
 
 /* The queue initializer and the SPU consumer use W0/W1 as pop/push indices,
