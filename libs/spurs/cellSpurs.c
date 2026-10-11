@@ -2788,50 +2788,6 @@ s32 cellSpursKickJobChain(u64 jc_ea, u32 numReadyCount)
  * Log-only bring-up: capture the shapes before wiring real state.
  * =====================================================================*/
 
-/* SDK ABI (cell/spurs/queue.h):
- *   _cellSpursQueueInitialize(CellSpurs*, CellSpursTaskset*, CellSpursQueue*,
- *       const void* buffer, u32 size, u32 depth, CellSpursQueueDirection) */
-s32 _cellSpursQueueInitialize(u64 spurs_ea, u64 taskset_ea, u64 queue_ea,
-                              u64 buffer_ea, u32 size, u32 depth, u32 direction)
-{
-    (void)spurs_ea;
-    if (!queue_ea || !buffer_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-    if (!size || !depth)         return CELL_SPURS_TASK_ERROR_INVAL;
-
-    /* Same 128-byte big-endian line as the LF variant below, and the title's
-     * own call says so: it passes q=0x032B2980 with buffer=0x032B2A00, exactly
-     * 0x80 apart, just as its LFQueue passes 0x4059FD00/0x4059FD80. The
-     * consumer is task 5 (image 1), whose CellSpursTaskArgument points into
-     * this same 0x032B2xxx block and which reads the line with GETLLAR/PUTLLC,
-     * so leaving it uninitialised handed recompiled SPU code a zero-depth
-     * queue to reason about. */
-    uint32_t q = (uint32_t)queue_ea;
-    for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
-    /* W3 at +0x0C is the ring modulus the consumer reduces indices by: the
-     * empty test is (W1-W0) mod 2*W3 and the buffer slot is index mod W3
-     * (derived at 0x12914..0x129B8). Leaving it zero degenerated both and made
-     * the queue look permanently empty no matter what a producer wrote. */
-    vm_write32(q + 0x0C, depth);
-    vm_write32(q + 0x10, size);
-    vm_write32(q + 0x14, depth);
-    vm_write64(q + 0x18, (u64)(uint32_t)buffer_ea);
-    /* NOT direction at +0x24 and NOT init at +0x2C. Both sit inside the
-     * 16-byte group at +0x20..+0x2F that the consumer owns and shifts wholesale
-     * (shlqbyi <group>,1 at 0x12A0C). The trace shows the two values we used to
-     * write there marching through it one byte per dequeue --
-     *   +0x24: 00000002 -> 00000200 -> 00020000 -> 02000000
-     *   +0x2C: 00000001 -> 00000100 -> 00010000 -> 01000000
-     * -- i.e. we were feeding garbage into the SPU's own state every cycle.
-     * Whatever holds direction/init, it is not these offsets. */
-    vm_write64(q + 0x70, (u64)(uint32_t)taskset_ea);
-    memset(vm_base + (uint32_t)buffer_ea, 0, (size_t)size * depth);
-
-    static int _n = 0;
-    if (_n++ < 8)
-        printf("[cellSpurs] _QueueInitialize(taskset=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u) -> BE line written\n",
-               (u32)taskset_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
-    return CELL_OK;
-}
 
 s32 cellSpursQueueClear(u64 queue_ea)
 {
@@ -2874,9 +2830,9 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
     if (!queue_ea || !data_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
     uint32_t q   = (uint32_t)queue_ea;
-    uint32_t sz  = vm_read32(q + 0x10);
-    uint32_t dep = vm_read32(q + 0x14);
-    uint32_t buf = (uint32_t)vm_read64(q + 0x18);
+    uint32_t sz  = vm_read32(q + 0x08);
+    uint32_t dep = vm_read32(q + 0x0C);
+    uint32_t buf = (uint32_t)vm_read64(q + 0x10);
     uint32_t tsp = (uint32_t)vm_read64(q + 0x70);      /* eaSignal: taskset */
     if (!sz || !dep || !buf) return CELL_SPURS_TASK_ERROR_INVAL;
 

@@ -286,6 +286,8 @@ s32 cellSpursTaskGetReadOnlyAreaPattern(u64 pattern_ea, u64 elf_ea);
 s32 cellSpursTaskGetContextSaveAreaSize(u64 size_out_ea, u64 pattern_ea);
 s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size);
 s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea);
+s32 _cellSpursQueueInitialize(u64 spurs_ea, u64 taskset_ea, u64 queue_ea,
+                            u64 buffer_ea, u32 size, u32 depth, u32 direction);
 s32 cellSpursQueueSize(u64 queue_ea, u64 size_out_ea);
 s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                 u32 size, u32 depth, u32 direction);

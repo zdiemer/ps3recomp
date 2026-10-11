@@ -30,6 +30,19 @@ int main(void)
 {
     vm_base = (uint8_t*)calloc(1, 0x1000);
     assert(vm_base);
+    /* The SPU consumer loads its size from W2 and its 64-bit EA from W4/W5.
+     * Preserve caller-owned ring data; initialization only owns the header. */
+    memset(vm_base + 0x400, 0xA5, 128);
+    assert(_cellSpursQueueInitialize(0x800, 0x900, 0x100, 0x400, 16, 8, 2) == CELL_OK);
+    assert(vm_read32(0x100) == 0 && vm_read32(0x104) == 0);
+    assert(vm_read32(0x108) == 16 && vm_read32(0x10C) == 8);
+    assert(vm_read64(0x110) == 0x400 && vm_read32(0x11C) == 2);
+    assert(vm_read64(0x170) == 0x900);
+    assert(vm_base[0x400] == 0xA5 && vm_base[0x47F] == 0xA5);
+    assert(_cellSpursQueueInitialize(0, 0, 0x101, 0x400, 16, 8, 2) == CELL_SPURS_TASK_ERROR_ALIGN);
+    assert(_cellSpursQueueInitialize(0, 0, 0x100, 0x401, 16, 8, 2) == CELL_SPURS_TASK_ERROR_ALIGN);
+    assert(_cellSpursQueueInitialize(0, 0, 0x100, 0x400, 15, 8, 2) == CELL_SPURS_TASK_ERROR_INVAL);
+    assert(_cellSpursQueueInitialize(0, 0, 0x100, 0x400, 16, 8, 3) == CELL_SPURS_TASK_ERROR_INVAL);
     expect_size(0, 0, 8, 0);       /* empty */
     expect_size(0, 8, 8, 8);       /* full */
     expect_size(14, 2, 8, 4);      /* wrap around twice-depth boundary */
