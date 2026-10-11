@@ -10,6 +10,7 @@
 
 #include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
+#include "rsx_m2mf.h"
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
@@ -837,6 +838,40 @@ static u32 s_fifo_calloff = 0;
  * -----------------------------------------------------------------------*/
 extern u32 cellGcmResolveLocated(int local, u32 offset);
 
+static rsx_m2mf s_m2mf;
+static void gcm_m2mf_move(void* unused, unsigned char* dst, const unsigned char* src, u32 size)
+{
+    (void)unused;
+    u32 ea = (u32)(dst - vm_base);
+    if (vm_block_reserved(ea, size)) {
+        spu_lockline_lock();
+        memmove(dst, src, size);
+        vm_block_notify(ea, size);
+        spu_lockline_unlock();
+    } else memmove(dst, src, size);
+}
+static unsigned char* gcm_m2mf_resolve(void* unused, u32 dma, u32 offset, u32 size)
+{
+    (void)unused;
+    if (!vm_base) return NULL;
+    if (dma == 0xFEED0000u) {
+        if ((u64)offset + size > s_config.localSize ||
+            (u64)s_config.localAddress + offset + size > 0x100000000ull) return NULL;
+        return vm_base + s_config.localAddress + offset;
+    }
+    if (dma == 0xFEED0001u) {
+        if ((u64)offset + size > 0x100000000ull) return NULL;
+        u32 ea = gcm_io2ea(offset);
+        if (!ea || (u64)ea + size > 0x100000000ull) return NULL;
+        /* The host copy requires a contiguous EA range even across IO pages. */
+        for (u64 next = ((u64)offset & ~0xFFFFFull) + 0x100000ull;
+             next < (u64)offset + size; next += 0x100000ull)
+            if (gcm_io2ea((u32)next) != ea + (u32)(next - offset)) return NULL;
+        return vm_base + ea;
+    }
+    return NULL;
+}
+
 static struct {
     u32 dst_dma;      /* NV3062 0x0188 SET_CONTEXT_DMA_IMAGE_DESTIN */
     u32 color_fmt;    /* NV3062 0x0300 SET_COLOR_FORMAT             */
@@ -1087,6 +1122,22 @@ static void nv3089_blit(void)
 
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
 {
+    if (subch == 1) {
+        int action = rsx_m2mf_method(&s_m2mf, method, data);
+        if (action == 2) {
+            int ok = rsx_m2mf_copy(&s_m2mf, gcm_m2mf_resolve, gcm_m2mf_move, NULL);
+            static int warned, trace = -1, traced;
+            if (trace < 0) { const char* e = getenv("GCM_M2MF_TRACE"); trace = e ? atoi(e) : 0; }
+            if ((!ok && warned++ < 16) || (trace && traced++ < trace))
+                fprintf(stderr, "[NV0039] %s %08X:%08X -> %08X:%08X length=%u lines=%u pitch=%d/%d format=%04X notify=%X\n",
+                        ok ? "copy" : "unsupported/bad-range", s_m2mf.dma_in, s_m2mf.offset_in,
+                        s_m2mf.dma_out, s_m2mf.offset_out, s_m2mf.length, s_m2mf.lines,
+                        s_m2mf.pitch_in, s_m2mf.pitch_out, s_m2mf.format, data);
+            if (data) { static int n; if (n++ < 4)
+                fprintf(stderr, "[NV0039] notification DMA is not implemented (notify=%X)\n", data); }
+        }
+        return;
+    }
     /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
      * subchannel a title binds each 2D object to is libgcm-version-specific and
      * SET_OBJECT binds are not tracked, so state landing on an unexpected
@@ -1885,12 +1936,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     if (s_user_handler_opd) cellGcmQueueUserCommand(vm_read32(dea));
                     continue;
                 }
-                /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
-                 * The title issues NV4097 methods on it -- 0x1A80..0x1AC0 is
-                 * SET_TEXTURE_OFFSET for units 4-6 -- and the 2D path silently
-                 * discards whatever it does not recognise, so that state never
-                 * reaches the renderer. SET_OBJECT binds are not tracked, which
-                 * is what makes the subchannel-to-engine mapping a guess. */
                 /* GCM_OBJDBG=1: log every SET_OBJECT (method 0). The handle a
                  * title binds to a subchannel is what says which engine that
                  * subchannel drives; comparing subchannel 1 against subchannel 0
@@ -1905,22 +1950,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
                           printf("[GCM-OBJ] subch=%u SET_OBJECT handle=0x%08X%c",
                                  subch, h, 10); fflush(stdout);
                       } } }
-                /* The subchannel is a binding slot, not an engine selector: a
-                 * title may bind NV4097 to something other than subchannel 0.
-                 * Twisted Metal uses subchannel 1, and caner (canersaka) hit
-                 * the same thing in Yakuza Dead Souls, where SPU-built command
-                 * lists bind NV4097 elsewhere -- his rsx_live_draw.c masks the
-                 * subchannel out of the method for exactly this reason.
-                 *
-                 * gcm_2d_method only ever handles subchannels 2..7 (NV3062,
-                 * NV308A/NV309E, NV3089), so anything arriving on 1 was being
-                 * dropped on the floor -- for this title that included
-                 * SET_SHADER_PROGRAM, leaving one stale fragment program bound
-                 * for every draw in the game. Treat the subchannels the 2D path
-                 * does not claim as 3D. GCM_SUBCH1_2D=1 restores the old split.
-                 */
-                static int s1_2d = -1;
-                if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
+                /* Standard libgcm binds NV0039 to subchannel 1. Some titles
+                 * instead use it for NV4097; retain an explicit override.
+                 * SET_OBJECT handles alone do not identify an engine class. */
+                static int s1_3d = -1;
+                if (s1_3d < 0) {
+                    const char* e = getenv("GCM_SUBCH1_3D");
+                    const char* old = getenv("GCM_SUBCH1_2D");
+                    s1_3d = e ? atoi(e) : (old ? !atoi(old) : 0);
+                }
+                const int is_3d = subch == 0 || (subch == 1 && s1_3d);
                 /* GCM_SUBCH_GATE=<file>: while <file> exists, log every method on a
                  * non-zero subchannel -- what each binding slot actually carries. */
                 { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
@@ -1943,13 +1982,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       if ((poll++ & 255u) == 0) { FILE* g = fopen(sg, "rb"); open_g = g != NULL; if (g) fclose(g); }
                       if (open_g) printf("[subch] %u 0x%04X = 0x%08X%c", subch, m, vm_read32(dea), 10);
                   } }
-                /* Mirror the whole method stream into the live NV4097->D3D12
+                /* Mirror only 3D methods into the live NV4097->D3D12
                  * engine (caner / canersaka). Inert unless RSX_LIVE_DRAW is set.
                  * It wants the raw method with its subchannel bits -- it
                  * canonicalises with & 0x1FFC itself. */
                 { static int live = -1;
                   if (live < 0) live = rsx_live_draw_enabled();
-                  if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
+                  if (live && is_3d) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
 
                 /* And into the platform-neutral register-file draw engine,
                  * which is the macOS path under PS3RECOMP_RSX_ENGINE=dispatch.
@@ -1957,7 +1996,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * same reason the live engine does, and masks them itself. */
                 { static int eng = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                  if (eng && is_3d) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
@@ -1984,7 +2023,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     cellGcmQueueUserCommand(vm_read32(dea));
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
-                } else if (subch == 0 || (subch == 1 && !s1_2d)) {
+                } else if (is_3d) {
                     rsx_process_method(&s_state, m, vm_read32(dea));
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
