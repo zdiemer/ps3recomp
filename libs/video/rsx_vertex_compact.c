@@ -180,6 +180,12 @@ void rsx_vertex_fetch_plan_prepare(
 {
     if (!plan)
         return;
+    u32 vertex_first=UINT_MAX, vertex_last=0;
+    for (u32 i=0; refs && i<count; ++i) {
+        const u32 element=(refs[i].vertex_id+refs[i].base_index)&0xFFFFFu;
+        if (element<vertex_first) vertex_first=element;
+        if (element>vertex_last) vertex_last=element;
+    }
     for (u32 slot = 0; slot < plan->layout.count; slot++) {
         const u32 attr = plan->layout.attrs[slot];
         rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
@@ -213,8 +219,10 @@ void rsx_vertex_fetch_plan_prepare(
         if (!plan->guest_ptr)
             continue;
 
-        u32 first = UINT_MAX;
-        u32 last = 0;
+        u32 first = vertex_first;
+        u32 last = vertex_last;
+        if (fetch->desc.frequency>1) {
+        first=UINT_MAX; last=0;
         for (u32 i = 0; i < count; i++) {
             const u32 element = rsx_vertex_element_index(
                 refs[i].vertex_id, refs[i].base_index,
@@ -222,6 +230,7 @@ void rsx_vertex_fetch_plan_prepare(
                 (plan->divider_mask >> attr) & 1u);
             if (element < first) first = element;
             if (element > last) last = element;
+        }
         }
 
         const u64 prefix =
@@ -292,6 +301,47 @@ int rsx_vertex_fetch_one(
     return 1;
 }
 
+int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out)
+{
+    if (!plan || (!refs && count) || (!out && plan->layout.stride && count)) return 0;
+    /* Rare/fallback plans retain the exact scalar resolver semantics. Inline
+     * streams can have out-of-range references, so leave them on that path. */
+    int fast = !plan->inline_data;
+    for (u32 slot=0; slot<plan->layout.count; ++slot) {
+        const rsx_vertex_fetch_attr* f=&plan->attr[plan->layout.attrs[slot]];
+        if (f->desc.type && f->desc.size && (!f->stable_base || f->desc.frequency>1)) fast=0;
+    }
+    if (!fast) {
+        for (u32 i=0; i<count; ++i)
+            if (!rsx_vertex_fetch_one(plan,&refs[i],out+(u64)i*plan->layout.stride)) return 0;
+        return 1;
+    }
+    for (u32 slot=0; slot<plan->layout.count; ++slot) {
+        const u32 attr=plan->layout.attrs[slot];
+        const rsx_vertex_fetch_attr* f=&plan->attr[attr];
+        const u32 type=f->desc.type, size=f->desc.size;
+        for (u32 i=0; i<count; ++i) {
+            float* value=(float*)(out+(u64)i*plan->layout.stride+slot*16);
+            if (!type || !size) { memcpy(value,f->default_value,16); continue; }
+            const u32 element=(refs[i].vertex_id+refs[i].base_index)&0xFFFFFu;
+            if (element<f->stable_first || element>f->stable_last) {
+                if (!rsx_vertex_fetch_one(plan,&refs[i],out+(u64)i*plan->layout.stride)) return 0;
+                continue;
+            }
+            const u8* source=f->stable_base+(u64)(element-f->stable_first)*f->stride;
+            if (type==RSX_VTX_TYPE_FLOAT) {
+                value[0]=value[1]=value[2]=0; value[3]=1;
+                for (u32 k=0; k<size && k<4; ++k) value[k]=rsx_compact_be_f32(source+k*4);
+            } else if (!rsx_vertex_decode_element(type,size,source,value)) {
+                if (attr==0) return 0;
+                memcpy(value,f->default_value,16);
+            }
+        }
+    }
+    return 1;
+}
+
 static u64 rsx_vertex_remap_hash(u64 value)
 {
     value ^= value >> 33;
@@ -323,6 +373,21 @@ int rsx_vertex_remap_build(
 
     if (count > UINT_MAX / 2u)
         return 0;
+    // Dense indexed meshes need no hash/probe chain. Preserve the complete
+    // (base_index, vertex_id) identity by requiring a common base first.
+    u32 min_id=refs[0].vertex_id, max_id=min_id;
+    int common_base=1, ascending=1;
+    for (u32 i=1; i<count; ++i) {
+        if (refs[i].base_index!=refs[0].base_index) common_base=0;
+        if (refs[i].vertex_id<=refs[i-1].vertex_id) ascending=0;
+        if (refs[i].vertex_id<min_id) min_id=refs[i].vertex_id;
+        if (refs[i].vertex_id>max_id) max_id=refs[i].vertex_id;
+    }
+    if (common_base && ascending) {
+        for (u32 i=0; i<count; ++i) remap->occurrence_to_unique[i]=i;
+        return 1;
+    }
+    const int dense=common_base && (u64)max_id-min_id+1 <= (u64)count*2;
     u32 slot_capacity = 16u;
     const u32 required_slots = count * 2u;
     while (slot_capacity < required_slots) {
@@ -354,7 +419,7 @@ int rsx_vertex_remap_build(
     for (u32 occurrence = 0; occurrence < count; occurrence++) {
         const rsx_vertex_ref ref = refs[occurrence];
         const u64 key = ((u64)ref.base_index << 32) | ref.vertex_id;
-        u32 slot_index = (u32)rsx_vertex_remap_hash(key) & mask;
+        u32 slot_index = dense ? ref.vertex_id-min_id : (u32)rsx_vertex_remap_hash(key) & mask;
         for (;;) {
             rsx_vertex_remap_slot* slot = &remap->slots[slot_index];
             if (slot->generation != remap->generation) {

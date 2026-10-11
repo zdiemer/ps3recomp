@@ -1384,6 +1384,23 @@ static inline int vm_null_store(uint32_t a, uint32_t v, int width, void* ra)
 /* Shared read-frequency histogram (PPU_HOTMAP): finds busy-loop polled
  * addresses across all read widths even when the loop touches several addresses
  * per iteration (so the consecutive HOTREAD detectors reset). */
+/* Memory diagnostics are cold unless explicitly requested. Do not charge
+ * every ordinary guest load/store for all the unrelated game probes. */
+static inline bool vm_memory_probes(void)
+{
+#ifdef VM_SAMPLE_READS
+    return true;
+#endif
+    static const bool enabled = [] {
+        const char* names[] = {"PPU_MEMORY_DIAGNOSTICS", "PPU_HOTMAP", "PPU_RWATCH",
+            "PPU_FORCE_READ_ADDR", "PPU_RVAL", "PPU_RVAL64", "PPU_SPINBT",
+            "PPU_WVAL", "PPU_WWATCH", "PPU_WW_GUARD", "PT", "YDKJ_RWATCH",
+            "PS3_NULL_READ", "PS3_NULL_SWEEP", "PS3_NULL_WRITE"};
+        for (const char* name : names) if (getenv(name)) return true;
+        return false;
+    }();
+    return enabled;
+}
 static void vm_hotmap(uint32_t ea, int width)
 {
     static int en = -1; if (en < 0) en = getenv("PPU_HOTMAP") ? 1 : 0;
@@ -1599,7 +1616,12 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
-uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
+uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
+    if (!vm_memory_probes() && (uint32_t)a >= 0x10000u &&
+        !spu_raw_is_reg((uint32_t)a) && (uint32_t)a != VM_HLE_INJECT_BASE+0x2008u) {
+        uint32_t v; memcpy(&v,vm_base+(uint32_t)a,4); return __builtin_bswap32(v);
+    }
+    ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
     /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
      * cannot be served out of memory. Everything else in the window the SPU
@@ -1712,7 +1734,11 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
       } }
       else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap32(v); }
-uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap((uint32_t)a,8);
+uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0;
+    if (!vm_memory_probes() && (uint32_t)a >= 0x10000u) {
+        uint64_t v; memcpy(&v,vm_base+(uint32_t)a,8); return __builtin_bswap64(v);
+    }
+    vm_hotmap((uint32_t)a,8);
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 8, __builtin_return_address(0)); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read64 0x%08X\n", (uint32_t)a); }
@@ -1899,7 +1925,7 @@ extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* r
 {
     barrier_watch_hit(ea, val, width, ra);
 }
-void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
+void vm_write8 (uint64_t a, uint8_t  v) { if (vm_memory_probes() || g_barrier_sync_watch) barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
 #ifdef _WIN32
     /* PT detector: does this byte-write turn its word into the hunted truncated value? */
     { if(g_pt_val==-2){const char*e=getenv("PT"); g_pt_val=e?(int64_t)strtoul(e,0,16):-1;}
@@ -1909,9 +1935,9 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
         else if(((uint32_t)a&3)==0 && v!=0) pt_restore(wa); /* MSB byte set non-zero = restored */ } }
 #endif
     VM_WRITE_COH(a, &v, 1); }
-void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
+void vm_write16(uint64_t a, uint16_t v) { if (vm_memory_probes() || g_barrier_sync_watch) barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
     v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); }
-void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
+void vm_write32(uint64_t a, uint32_t v) { if (vm_memory_probes() || g_barrier_sync_watch) barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
      * previously-truncated slot clears the record (that truncation was transient). */
@@ -1919,6 +1945,10 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
 #endif
     { uint32_t _v = v;
       v = __builtin_bswap32(v); VM_WRITE_COH(a, &v, 4);
+      if ((uint32_t)a >= VM_HLE_INJECT_BASE && (uint32_t)a < VM_HLE_INJECT_BASE+0x2004u) {
+          extern void cellGcm_notify_guest_write(uint32_t,uint32_t);
+          cellGcm_notify_guest_write((uint32_t)a,4);
+      }
       /* Raw SPU problem state: run control, mailboxes and signal notification
        * have side effects. The plain store above still happens -- the registers
        * are guest memory and the PPU reads most of them straight back. */
@@ -1929,8 +1959,10 @@ void vm_write64(uint64_t a, uint64_t v) {
      * every 64-bit struct field is written with std, so a watch on one would
      * report nothing and read as "nobody writes this". Two halves so an
      * 8-byte store still shows up when only its low or high word is watched. */
-    barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));
-    barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
+    if (vm_memory_probes() || g_barrier_sync_watch) {
+        barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));
+        barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
+    }
     if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
     v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
 }

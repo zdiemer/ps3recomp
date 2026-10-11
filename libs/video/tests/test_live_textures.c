@@ -53,6 +53,19 @@ static void copy_source(ID3D12Resource* tex)
 }
 static void cache_tests(void)
 {
+    u8 bytes[1024]; memset(bytes,0x5A,sizeof(bytes));
+    const u64 original=rsx_texture_hash(bytes,sizeof(bytes));
+    for (u32 i=0; i<sizeof(bytes); ++i) {
+        bytes[i]^=0x80;
+        assert(rsx_texture_hash(bytes,sizeof(bytes))!=original);
+        bytes[i]^=0x80;
+    }
+    // Hash tails at a protected boundary: no overread for short/unaligned data.
+    u8* boundary=VirtualAlloc(NULL,8192,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+    assert(boundary); DWORD old; assert(VirtualProtect(boundary+4096,4096,PAGE_NOACCESS,&old));
+    memset(boundary,0x73,4096);
+    for (u32 n=0; n<128; ++n) (void)rsx_texture_hash(boundary+4096-n,n);
+    VirtualFree(boundary,0,MEM_RELEASE);
     rsx_dsp_texture t = {0}; t.format = 0x86; t.width = t.height = 64;
     t.dimension = 2; t.mipmaps = 7; t.remap = 0xAAE4;
     // Populate past the old 1024-entry limit and check all descriptors.
@@ -84,9 +97,148 @@ static void cache_tests(void)
     texture_cache_unlink(3002); assert(g.texture_buckets[3] == 3001);
     memset(g.textures,0,sizeof(g.textures)); memset(g.texture_buckets,0,sizeof(g.texture_buckets));
 }
+static void fetch_tests(void)
+{
+    rsx_vertex_fetch_plan p={0}; rsx_vertex_layout_plan_init(&p.layout,7);
+    rsx_vertex_ref refs[64]; u8 scalar[64*48], batch[64*48];
+    for (u32 i=0; i<sizeof(guest); ++i) guest[i]=(u8)(i*37+19);
+    for (u32 i=0; i<64; ++i) { refs[i].vertex_id=(i*7)%8; refs[i].base_index=0x100000; }
+    p.guest_ptr=resolve;
+    for (u32 a=0; a<3; ++a) {
+        p.attr[a].stride=16; p.attr[a].stable_base=guest+a*128;
+        p.attr[a].stable_last=7; p.attr[a].desc.offset=a*128;
+        p.attr[a].default_value[0]=17; p.attr[a].default_value[3]=29;
+    }
+    for (u32 type=1; type<=7; ++type) for (u32 size=1; size<=4; ++size)
+        for (u32 freq=0; freq<=2; ++freq) {
+            for (u32 a=0; a<3; ++a) {
+                p.attr[a].desc.type=a==1?0:type;
+                p.attr[a].desc.size=size; p.attr[a].desc.frequency=freq;
+                p.attr[a].elem_size=type==6?4:size*(type==2?4:type==1||type==3||type==5?2:1);
+            }
+            rsx_vertex_fetch_plan_prepare(&p,refs,64);
+            assert(p.attr[0].stable_first==0 && p.attr[0].stable_last==(freq>1?3:7));
+            for (u32 i=0; i<64; ++i) assert(rsx_vertex_fetch_one(&p,&refs[i],scalar+i*48));
+            assert(rsx_vertex_fetch_many(&p,refs,64,batch));
+            assert(memcmp(scalar,batch,sizeof(batch))==0);
+        }
+    puts("Batch vertex fetch matches scalar: types, sizes, divisors, disabled attributes, 20-bit wrap");
+    rsx_vertex_remap remap={0};
+    for (u32 trial=0; trial<128; ++trial) {
+        rsx_vertex_ref input[64], actual[64], expected[64]; u32 map[64], used=0;
+        for (u32 i=0; i<64; ++i) {
+            input[i].vertex_id=trial%4==0?i:trial%4==1?(i*13)%17:trial%4==2?(i*13)%17*100003:(i*13)%17;
+            input[i].base_index=trial%4==3?i%3:17;
+            u32 j; for (j=0; j<used; ++j) if (memcmp(&expected[j],&input[i],sizeof(input[i]))==0) break;
+            if (j==used) expected[used++]=input[i]; map[i]=j;
+        }
+        memcpy(actual,input,sizeof(input)); u32 unique=0;
+        assert(rsx_vertex_remap_build(&remap,actual,64,&unique));
+        assert(unique==used && memcmp(actual,expected,used*sizeof(*actual))==0);
+        for (u32 i=0; i<64; ++i) assert(rsx_vertex_remap_index(&remap,i)==map[i]);
+        if (trial==64) remap.generation=UINT_MAX; // generation wrap after dense/sparse reuse
+    }
+    rsx_vertex_remap_destroy(&remap);
+    puts("Vertex remap matches ordered reference: ascending/dense/sparse/mixed bases and generation wrap");
+}
+static void bias_tests(void)
+{
+    // Coplanar overlay: LESS fails without bias, negative bias brings it forward.
+    D3D12_HEAP_PROPERTIES hp={0}; hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd={0}; rd.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width=rd.Height=16; rd.DepthOrArraySize=rd.MipLevels=rd.SampleDesc.Count=1;
+    rd.Format=DXGI_FORMAT_R8G8B8A8_UNORM; rd.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource *color,*depth;
+    OK(g.dev->lpVtbl->CreateCommittedResource(g.dev,&hp,D3D12_HEAP_FLAG_NONE,&rd,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,NULL,&IID_ID3D12Resource,(void**)&color));
+    rd.Format=DXGI_FORMAT_D32_FLOAT_S8X24_UINT; rd.Flags=D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    OK(g.dev->lpVtbl->CreateCommittedResource(g.dev,&hp,D3D12_HEAP_FLAG_NONE,&rd,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,NULL,&IID_ID3D12Resource,(void**)&depth));
+    g.depth=depth;
+    ID3D12DescriptorHeap *rtv,*dsv;
+    D3D12_DESCRIPTOR_HEAP_DESC hd={0}; hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors=1;
+    OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&rtv));
+    hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&dsv));
+    D3D12_CPU_DESCRIPTOR_HANDLE rh,dh;
+    rtv->lpVtbl->GetCPUDescriptorHandleForHeapStart(rtv,&rh);
+    dsv->lpVtbl->GetCPUDescriptorHandleForHeapStart(dsv,&dh);
+    g.dev->lpVtbl->CreateRenderTargetView(g.dev,color,NULL,rh);
+    g.dev->lpVtbl->CreateDepthStencilView(g.dev,depth,NULL,dh);
+    ID3DBlob *root_blob,*vs,*red,*green;
+    D3D12_ROOT_SIGNATURE_DESC root={0};
+    OK(D3D12SerializeRootSignature(&root,D3D_ROOT_SIGNATURE_VERSION_1,&root_blob,NULL));
+    ID3D12RootSignature* sig;
+    OK(g.dev->lpVtbl->CreateRootSignature(g.dev,0,root_blob->lpVtbl->GetBufferPointer(root_blob),
+        root_blob->lpVtbl->GetBufferSize(root_blob),&IID_ID3D12RootSignature,(void**)&sig));
+    const char* v="float4 main(uint id:SV_VertexID):SV_Position { float2 p=float2((id<<1)&2,id&2); return float4(p*2-1,0.5,1); }";
+    const char* r="float4 main():SV_Target { return float4(1,0,0,1); }";
+    const char* b="float4 main():SV_Target { return float4(0,1,0,1); }";
+    OK(D3DCompile(v,strlen(v),NULL,NULL,NULL,"main","vs_5_0",0,0,&vs,NULL));
+    OK(D3DCompile(r,strlen(r),NULL,NULL,NULL,"main","ps_5_0",0,0,&red,NULL));
+    OK(D3DCompile(b,strlen(b),NULL,NULL,NULL,"main","ps_5_0",0,0,&green,NULL));
+    ID3D12Resource* rb=buffer(D3D12_HEAP_TYPE_READBACK);
+    for (int mode=0; mode<6; ++mode) {
+        if (mode==3) {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS16 feature={0};
+            if (FAILED(g.dev->lpVtbl->CheckFeatureSupport(g.dev,D3D12_FEATURE_D3D12_OPTIONS16,
+                    &feature,sizeof(feature))) || !feature.DynamicDepthBiasSupported) break;
+            OK(g.list->lpVtbl->QueryInterface(g.list,&IID_ID3D12GraphicsCommandList9,(void**)&g_ld_bias_list));
+        }
+        OK(g.alloc->lpVtbl->Reset(g.alloc)); OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd={0}; pd.pRootSignature=sig;
+        pd.VS.pShaderBytecode=vs->lpVtbl->GetBufferPointer(vs); pd.VS.BytecodeLength=vs->lpVtbl->GetBufferSize(vs);
+        pd.PS.pShaderBytecode=red->lpVtbl->GetBufferPointer(red); pd.PS.BytecodeLength=red->lpVtbl->GetBufferSize(red);
+        pd.SampleMask=UINT_MAX; pd.SampleDesc.Count=1;
+        pd.NumRenderTargets=1; pd.RTVFormats[0]=DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        render_state_t state={0}; state.color_mask=0x01010101; state.depth_test=state.depth_write=1; state.depth_func=0x201;
+        apply_render_state(&pd,&state);
+        ID3D12PipelineState *base,*overlay;
+        OK(g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev,&pd,&IID_ID3D12PipelineState,(void**)&base));
+        state.depth_write=0; float units=mode%3==1?-64.0f:mode%3==2?64.0f:0;
+        memcpy(&state.bias_units,&units,4); apply_render_state(&pd,&state);
+        pd.PS.pShaderBytecode=green->lpVtbl->GetBufferPointer(green); pd.PS.BytecodeLength=green->lpVtbl->GetBufferSize(green);
+        OK(g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev,&pd,&IID_ID3D12PipelineState,(void**)&overlay));
+        D3D12_VIEWPORT vp={0,0,16,16,0,1}; D3D12_RECT sc={0,0,16,16}; const float black[4]={0};
+        g.list->lpVtbl->RSSetViewports(g.list,1,&vp); g.list->lpVtbl->RSSetScissorRects(g.list,1,&sc);
+        g.list->lpVtbl->OMSetRenderTargets(g.list,1,&rh,FALSE,&dh);
+        g.list->lpVtbl->ClearRenderTargetView(g.list,rh,black,0,NULL);
+        g.list->lpVtbl->ClearDepthStencilView(g.list,dh,D3D12_CLEAR_FLAG_DEPTH,1,0,0,NULL);
+        g.list->lpVtbl->SetGraphicsRootSignature(g.list,sig);
+        g.list->lpVtbl->IASetPrimitiveTopology(g.list,D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g.list->lpVtbl->SetPipelineState(g.list,base); g.list->lpVtbl->DrawInstanced(g.list,3,1,0,0);
+        g.list->lpVtbl->SetPipelineState(g.list,overlay);
+        if (g_ld_bias_list) g_ld_bias_list->lpVtbl->RSSetDepthBias(g_ld_bias_list,units,0,0);
+        g.list->lpVtbl->DrawInstanced(g.list,3,1,0,0);
+        D3D12_RESOURCE_BARRIER bar={0}; bar.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bar.Transition.pResource=color; bar.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        bar.Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET; bar.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g.list->lpVtbl->ResourceBarrier(g.list,1,&bar);
+        read_subresource(color,0,rb,0,DXGI_FORMAT_R8G8B8A8_UNORM,16,16);
+        bar.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE; bar.Transition.StateAfter=D3D12_RESOURCE_STATE_RENDER_TARGET;
+        g.list->lpVtbl->ResourceBarrier(g.list,1,&bar);
+        OK(g.list->lpVtbl->Close(g.list)); ID3D12CommandList* lists[]={(ID3D12CommandList*)g.list};
+        g.queue->lpVtbl->ExecuteCommandLists(g.queue,1,lists);
+        OK(g.queue->lpVtbl->Signal(g.queue,g.fence,mode+2));
+        OK(g.fence->lpVtbl->SetEventOnCompletion(g.fence,mode+2,g.fence_event));
+        assert(WaitForSingleObject(g.fence_event,10000)==WAIT_OBJECT_0);
+        u8* bytes; OK(rb->lpVtbl->Map(rb,0,NULL,(void**)&bytes));
+        u8* pixel=bytes+8*256+8*4;
+        assert(pixel[0]==(mode%3==1?0:255) && pixel[1]==(mode%3==1?255:0));
+        rb->lpVtbl->Unmap(rb,0,NULL); overlay->lpVtbl->Release(overlay); base->lpVtbl->Release(base);
+    }
+    if (g_ld_bias_list) { g_ld_bias_list->lpVtbl->Release(g_ld_bias_list); g_ld_bias_list=NULL; }
+    rb->lpVtbl->Release(rb); sig->lpVtbl->Release(sig); root_blob->lpVtbl->Release(root_blob);
+    vs->lpVtbl->Release(vs); red->lpVtbl->Release(red); green->lpVtbl->Release(green);
+    color->lpVtbl->Release(color); depth->lpVtbl->Release(depth); g.depth=NULL;
+    rtv->lpVtbl->Release(rtv); dsv->lpVtbl->Release(dsv);
+    puts("Coplanar decal GPU readback: zero/positive bias occluded, negative bias visible");
+}
 int main(void)
 {
     cache_tests();
+    fetch_tests();
     IDXGIFactory4* factory; IDXGIAdapter* warp;
     OK(CreateDXGIFactory1(&IID_IDXGIFactory4,(void**)&factory));
     OK(factory->lpVtbl->EnumWarpAdapter(factory,&IID_IDXGIAdapter,(void**)&warp));
@@ -134,6 +286,7 @@ int main(void)
         for (u32 b = 0; b < 16; ++b) assert(bytes[face*512+b] == 0x11 + face);
     assert(bytes[4096] == 0x35 && bytes[4097] == 0x79 && bytes[4098] == 0xB2 && bytes[4099] == 255);
     readback->lpVtbl->Unmap(readback,0,NULL);
+    bias_tests();
     rgb->lpVtbl->Release(rgb); cube->lpVtbl->Release(cube); readback->lpVtbl->Release(readback);
     g.upload->lpVtbl->Unmap(g.upload,0,NULL); g.upload->lpVtbl->Release(g.upload);
     g.list->lpVtbl->Release(g.list); g.alloc->lpVtbl->Release(g.alloc);

@@ -19,6 +19,18 @@ int main(void) {
     const u32 begin = 0x100000, tail = 0x101000;
     vm_base = calloc(1, GCM_CONTROL_GUEST_ADDR + 4096);
     assert(vm_base);
+    HANDLE kick=(HANDLE)cellGcm_fifo_kick_event(); assert(kick);
+    assert(WaitForSingleObject(kick,0)==WAIT_TIMEOUT);
+    cellGcm_notify_guest_write(GCM_CONTROL_GUEST_ADDR,4);
+    assert(WaitForSingleObject(kick,0)==WAIT_OBJECT_0);
+    cellGcm_notify_guest_write(GCM_CONTROL_GUEST_ADDR+4,4); // consumer GET is not a submission
+    assert(WaitForSingleObject(kick,0)==WAIT_TIMEOUT);
+    cellGcm_notify_guest_write(GCM_LABEL_GUEST_BASE-8,16); // overlapping DMA label release
+    assert(WaitForSingleObject(kick,0)==WAIT_OBJECT_0);
+    cellGcm_notify_guest_write(GCM_LABEL_GUEST_BASE-8,8);
+    assert(WaitForSingleObject(kick,0)==WAIT_TIMEOUT);
+    gcm_note_spu_put(GCM_LABEL_GUEST_BASE+0x100,4);
+    assert(WaitForSingleObject(kick,0)==WAIT_OBJECT_0);
     memset(s_io_address_table, 0xFF, sizeof s_io_address_table);
     s_io_address_table[1] = 0; s_ea_address_table[0] = 1;
     s_gcm_context_ea = 0x100; s_gcm_ctx_out_ea = 0x80; vm_write32(0x80, 0x100);

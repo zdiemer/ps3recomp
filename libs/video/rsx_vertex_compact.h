@@ -115,6 +115,9 @@ void rsx_vertex_fetch_plan_prepare(
  * invalid enabled ATTR0 remains fatal. */
 int rsx_vertex_fetch_one(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
+/* Batch equivalent, with attribute state hoisted out of the vertex loop. */
+int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out);
 
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map
