@@ -1285,6 +1285,8 @@ void gcm_forget_spu_blocks(void)
 
 void gcm_note_spu_put(u32 ea, u32 size)
 {
+    extern void cellGcm_notify_guest_write(u32,u32);
+    cellGcm_notify_guest_write(ea,size);
     if (!size || size > 0x40000u) return;
     u32 room = 0;
     u32 io = gcm_ea2io_range(ea, &room);
@@ -1459,6 +1461,18 @@ static void gcm_rsx_process_fifo_unlocked(void);
  * the D3D12 backend it feeds) stays on the present thread -- running it from
  * the polling game thread killed the process silently. */
 static HANDLE s_gcm_kick_ev = NULL;
+/* Submission and CPU/SPU semaphore releases wake the FIFO consumer directly.
+ * A REF poll is only one producer path; waiting for that poll left Haze's
+ * label-dependent render passes paying the idle timeout. */
+void cellGcm_notify_guest_write(u32 ea, u32 size)
+{
+    const u64 end=(u64)ea+size;
+    if (!size || !((ea<GCM_LABEL_GUEST_BASE+0x1000u && end>GCM_LABEL_GUEST_BASE) ||
+        (ea<GCM_CONTROL_GUEST_ADDR+4u && end>GCM_CONTROL_GUEST_ADDR))) return;
+    static int enabled=-1;
+    if (enabled<0) { const char* e=getenv("GCM_WRITE_KICK"); enabled=!(e && *e=='0'); }
+    if (enabled && s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
+}
 void* cellGcm_fifo_kick_event(void)
 {
     if (!s_gcm_kick_ev) s_gcm_kick_ev = CreateEventA(NULL, FALSE, FALSE, NULL);

@@ -215,6 +215,8 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
     mark_class(rsx, M_COLOR_MASK,        1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_MRT_COLOR_MASK,    1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_DEPTH_FUNC,        3, RSX_DSP_CLASS_STATE); /* ..TEST_ENABLE */
+    mark_class(rsx, 0x0A60,             3, RSX_DSP_CLASS_STATE); /* polygon offset enables */
+    mark_class(rsx, 0x0A78,             2, RSX_DSP_CLASS_STATE); /* factor, units */
     mark_class(rsx, M_CULL_FACE,         1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_FRONT_FACE,        1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_CULL_FACE_ENABLE,  1, RSX_DSP_CLASS_STATE);

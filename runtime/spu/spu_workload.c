@@ -6,6 +6,7 @@
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
 #include "spu_workload.h"
+#include "spu_fingerprint_cache.h"
 #include "spu_elf_loader.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
@@ -31,13 +32,8 @@ int g_cri_video_dma = 0;
 
 uint64_t spu_workload_fingerprint(const void* data, size_t n)
 {
-    const uint8_t* p = (const uint8_t*)data;
-    uint64_t h = 1469598103934665603ULL;          /* FNV offset basis */
-    for (size_t i = 0; i < n; i++) {
-        h ^= p[i];
-        h *= 1099511628211ULL;                     /* FNV prime */
-    }
-    return h;
+    const char* legacy=getenv("SPU_FINGERPRINT_NO_CACHE");
+    return legacy ? spu_fingerprint_bytes(data,n) : spu_fingerprint_cached(data,n);
 }
 
 /* ---- registry ---------------------------------------------------------- */
