@@ -901,9 +901,10 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
      * ponytail: s_tasks[] is shared by every taskset and now only records the
      * last task per slot id -- enough for JoinTask2's lookup; key it by
      * (taskset, id) if a title joins tasks in two tasksets at once. */
-    u32 free_slot = CELL_SPURS_MAX_TASK;
-    for (u32 t = 0; t < CELL_SPURS_MAX_TASK; t++)
-        if (!(vm_read8(taskset_ea + 0x30 + t / 8) & (0x80u >> (t % 8)))) { free_slot = t; break; }
+    /* Reserve and publish under the scheduler's lock. Separate word-sized
+     * read/modify/writes can resurrect a sibling's enabled bit after it exits. */
+    u32 free_slot = spurs_taskset_create_task(taskset_ea, (uint64_t)elf_ea,
+                                             (uint64_t)context_ea, task_arg, task_lsp);
     if (free_slot < CELL_SPURS_MAX_TASK) {
         u32 i = free_slot;
         {
@@ -934,8 +935,6 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             /* Register the task in the REAL BE taskset: writes task_info[slot]
              * (args/elf/context/ls_pattern) + sets enabled+ready bits so the PM's
              * SELECT_TASK picks it. Slot index i = the SPURS taskId (bitset bit). */
-            spurs_taskset_add_task(taskset_ea, i, (uint64_t)elf_ea,
-                                   (uint64_t)context_ea, task_arg, task_lsp);
             /* Bridge to the image-22 dispatch so build_context uses this taskset+task. */
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
