@@ -6,6 +6,7 @@
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
 #include "spu_workload.h"
+#include "spu_elf_loader.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
@@ -115,42 +116,7 @@ static uint32_t rd_be32(const uint8_t* p)
 
 int spu_elf_load_to_ls(const uint8_t* image, size_t image_size, uint8_t* ls, uint32_t* entry_out)
 {
-    if (!image || !ls || image_size < 0x34) return 0;
-
-    /* ELF ident: 0x7F 'E' 'L' 'F', ELFCLASS32 (1), ELFDATA2MSB (2). */
-    if (!(image[0] == 0x7F && image[1] == 'E' && image[2] == 'L' && image[3] == 'F'))
-        return 0;
-    if (image[4] != 1 /*ELFCLASS32*/ || image[5] != 2 /*ELFDATA2MSB*/)
-        return 0;
-
-    uint32_t e_entry     = rd_be32(image + 0x18);
-    uint32_t e_phoff     = rd_be32(image + 0x1C);
-    uint16_t e_phentsize = rd_be16(image + 0x2A);
-    uint16_t e_phnum     = rd_be16(image + 0x2C);
-    if (e_phentsize < 0x20) e_phentsize = 0x20;
-
-    for (uint16_t i = 0; i < e_phnum; i++) {
-        size_t po = (size_t)e_phoff + (size_t)i * e_phentsize;
-        if (po + 0x20 > image_size) break;
-        const uint8_t* ph = image + po;
-
-        uint32_t p_type   = rd_be32(ph + 0x00);
-        if (p_type != 1 /*PT_LOAD*/) continue;
-        uint32_t p_offset = rd_be32(ph + 0x04);
-        uint32_t p_vaddr  = rd_be32(ph + 0x08);
-        uint32_t p_filesz = rd_be32(ph + 0x10);
-        uint32_t p_memsz  = rd_be32(ph + 0x14);
-
-        /* bounds: segment must fit in local store and in the image */
-        if ((uint64_t)p_vaddr + p_memsz > SPU_LS_SIZE)            return 0;
-        if ((uint64_t)p_offset + p_filesz > image_size)          return 0;
-
-        if (p_filesz) memcpy(ls + p_vaddr, image + p_offset, p_filesz);
-        if (p_memsz > p_filesz)
-            memset(ls + p_vaddr + p_filesz, 0, p_memsz - p_filesz);
-    }
-    if (entry_out) *entry_out = e_entry;
-    return 1;
+    return spu_elf_copy_segments(image, image_size, ls, entry_out);
 }
 
 size_t spu_elf_image_size(const uint8_t* image, size_t max_avail)
