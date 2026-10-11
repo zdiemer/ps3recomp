@@ -1,6 +1,13 @@
-/* macOS: clang -std=gnu17 -I include libs/system/tests/test_dialog_callbacks.c
- * libs/system/cellSysutil.c -Wl,-dead_strip -pthread -o /tmp/test_dialog_callbacks && /tmp/test_dialog_callbacks */
+/* Standalone test: include both callback producers and the real deferred queue. */
+#define vm_write8 test_vm_write8
+#define vm_write32 test_vm_write32
 #include "../cellMsgDialog.c"
+#undef vm_write8
+#undef vm_write32
+/* Match the scaffold's exported 64-bit-address memory wrappers. */
+void vm_write8(uint64_t ea, uint8_t v) { test_vm_write8((uint32_t)ea, v); }
+void vm_write32(uint64_t ea, uint32_t v) { test_vm_write32((uint32_t)ea, v); }
+#include "../cellSysutil.c"
 #include <assert.h>
 #include <stdlib.h>
 uint8_t* vm_base;
@@ -14,15 +21,27 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void np_psnr_pump(void) {}
+const char* cellGame_get_title_id(void) { return "TEST00001"; }
 
 static unsigned calls;
 static int waiting;
 static s32 last_result;
+static unsigned system_events;
+static u64 last_system_event;
 static void callback(u32 opd, u64 result, u64 user, u64 c, u64 d,
                      u64 e, u64 f, u64 g, u64 h)
 {
+    if (opd == 0x300 || opd == 0x308) {
+        assert(user == 0 && c == (opd == 0x300 ? 0x5678 : 0x5679));
+        assert(!d && !e && !f && !g && !h);
+        assert(result == CELL_SYSUTIL_DRAWING_BEGIN || result == CELL_SYSUTIL_DRAWING_END);
+        last_system_event = result;
+        system_events++;
+        return;
+    }
     assert(opd == 0x100 && user == 0x1234 && !c && !d && !e && !f && !g && !h);
     assert(waiting);
+    assert(last_system_event == CELL_SYSUTIL_DRAWING_END);
     calls++; last_result = (s32)result;
     if (calls == 1) {
         assert(cellMsgDialogOpen2(CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO,
@@ -36,16 +55,24 @@ int main(void)
     vm_base = calloc(1, 65536); assert(vm_base);
     memcpy(vm_base + 0x200, "Install data", 13);
     g_ps3_guest_caller = callback;
+    assert(cellSysutilRegisterCallback(0, (CellSysutilCallback)(uintptr_t)0x300,
+                                      (void*)0x5678) == CELL_OK);
+    assert(cellSysutilRegisterCallback(1, (CellSysutilCallback)(uintptr_t)0x308,
+                                      (void*)0x5679) == CELL_OK);
     assert(cellMsgDialogOpen2(0xA0, (void*)0x200, (void*)0x100,
                             (void*)0x1234, NULL) == CELL_OK);
-    assert(calls == 0);
+    assert(calls == 0 && system_events == 0);
     waiting = 1;
     cellSysutilCheckCallback(); assert(calls == 1 && last_result == CELL_MSGDIALOG_BUTTON_OK);
+    assert(system_events == 4);
     cellSysutilCheckCallback(); assert(calls == 2 && last_result == CELL_MSGDIALOG_BUTTON_YES);
+    assert(system_events == 8);
     cellSysutilCheckCallback(); assert(calls == 2);
+    assert(system_events == 8);
     assert(cellMsgDialogOpen2(CELL_MSGDIALOG_TYPE_PROGRESSBAR_SINGLE,
         (void*)0x200, (void*)0x100, (void*)0x1234, NULL) == CELL_OK);
     cellSysutilCheckCallback(); assert(calls == 2);
+    assert(system_events == 10 && last_system_event == CELL_SYSUTIL_DRAWING_BEGIN);
     assert(cellMsgDialogClose(0) == CELL_OK); assert(calls == 2);
     g_ps3_guest_caller = NULL;
     cellSysutilCheckCallback(); assert(calls == 2);
@@ -65,6 +92,15 @@ int main(void)
                               (void*)0x300, (void*)0x100, (void*)0x1234, NULL) == CELL_OK);
     cellSysutilCheckCallback();
     assert(calls == 4 && last_result == CELL_MSGDIALOG_BUTTON_YES);
+    assert(cellMsgDialogOpen2(CELL_MSGDIALOG_TYPE_PROGRESSBAR_SINGLE,
+        (void*)0x200, (void*)0x100, (void*)0x1234, NULL) == CELL_OK);
+    assert(cellMsgDialogOpen2(0, (void*)0x200, NULL, NULL, NULL) == (s32)0x8002B105);
+    cellSysutilCheckCallback();
+    unsigned before_abort = system_events;
+    assert(cellMsgDialogAbort() == CELL_OK);
+    cellSysutilCheckCallback();
+    assert(calls == 4 && system_events == before_abort + 2);
+    assert(last_system_event == CELL_SYSUTIL_DRAWING_END);
 
     /* The heuristic =auto would use, tested directly: the decision is cached on
      * first use so the env cannot be flipped mid-run, but the predicate is the

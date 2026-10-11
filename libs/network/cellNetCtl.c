@@ -260,7 +260,9 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         return CELL_NET_CTL_ERROR_INVALID_CODE;
     }
 
-    printf("[cellNetCtl] GetInfo(code=%d) -> OK\n", code);
+    const char* verbose = getenv("PS3_VERBOSE");
+    if (verbose && atoi(verbose))
+        printf("[cellNetCtl] GetInfo(code=%d) -> OK\n", code);
     return CELL_OK;
 }
 
