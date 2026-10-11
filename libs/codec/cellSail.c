@@ -363,6 +363,7 @@ s32 cellSailPlayerCancel(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_host_playback(_sp, 0);
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
     return CELL_OK;
 }

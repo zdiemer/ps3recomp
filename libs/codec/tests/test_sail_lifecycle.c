@@ -72,8 +72,9 @@ int main(void)
     assert(cellSailPlayerStop(0x1000)==CELL_OK);
     assert(host_stops==1);
     assert(cellSailPlayerCloseStream(0x1000)==CELL_OK && host_stops==2);
+    assert(cellSailPlayerCancel(0x1000)==CELL_OK && host_stops==3);
     assert(cellSailPlayerFinalize(0x1000) == CELL_OK);
-    assert(host_stops==3);
+    assert(host_stops==4);
     cellSail_set_host_playback_callback(0,0);
     assert(cellSailPlayerBoot(0x1000, 0) < 0);
     for (u32 i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
