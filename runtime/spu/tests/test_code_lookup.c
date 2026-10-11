@@ -36,8 +36,17 @@ int main(void)
     /* The base lift exists here, but its bytes have been overwritten. */
     assert(spu_lookup_resident(ctx, 0x1004) == 0);
     assert(spu_lookup_resident(ctx, 0x3000) == base);
-    ctx->resident_code[0].image_id = 0;
+    ctx->resident_code[0].source_ea = 0x50000;
+    /* Loading the writable tail must not evict the preceding code. */
+    spu_code_note_overwrite(ctx, 0x90000, 0x1100, 128);
+    assert(spu_lookup_resident(ctx, 0x1000) == overlay);
+    /* Continuation chunks from the same overlay also preserve ownership. */
+    spu_code_note_overwrite(ctx, 0x50080, 0x1080, 128);
+    assert(spu_lookup_resident(ctx, 0x1000) == overlay);
+    /* A different image overwriting actual instructions must evict it. */
+    spu_code_note_overwrite(ctx, 0x90000, 0x1080, 128);
     assert(spu_lookup_resident(ctx, 0x1000) == task);
+    assert(spu_lookup_resident(ctx, 0x2000) == second);
     free(ctx);
     puts("SPU resident code lookup tests passed.");
     return 0;
