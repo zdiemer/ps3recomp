@@ -113,6 +113,15 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
               fprintf(stderr, "[step] pc=0x%05X r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n",
                       (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[1]._u32[0],
                       ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
+              if (getenv("SPU_STEPTRACE_REGS")) {
+                  const unsigned regs[] = {3, 4, 5, 16, 17, 81};
+                  for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
+                      const unsigned r = regs[i];
+                      fprintf(stderr, "[step-reg] r%u=%08X %08X %08X %08X\n", r,
+                              ctx->gpr[r]._u32[0], ctx->gpr[r]._u32[1],
+                              ctx->gpr[r]._u32[2], ctx->gpr[r]._u32[3]);
+                  }
+              }
               fflush(stderr);
           }
       } }
