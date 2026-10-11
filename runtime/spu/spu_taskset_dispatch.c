@@ -47,8 +47,17 @@ static uint32_t be32(const uint8_t* p)
            ((uint32_t)p[2] << 8) | p[3];
 }
 
-static void ts_schedule(uint32_t ea)
+void spu_taskset_capture_args(uint32_t ea, uint32_t task, uint32_t args[4])
 {
+    spu_lockline_lock();
+    const uint8_t* ti = vm_base + ea + CSTS_TASKINFO + TI_SIZE * task;
+    for (unsigned i = 0; i < 4; ++i) args[i] = be32(ti + TI_ARGS + 4 * i);
+    spu_lockline_unlock();
+}
+
+void spu_taskset_start_ready(uint32_t ea)
+{
+    if (!ea) return;
     for (uint32_t task = 0; task < 128; ++task) {
         uint8_t mask = (uint8_t)(0x80u >> (task & 7));
         uint32_t elf = 0, context = 0;
@@ -88,7 +97,7 @@ void spu_taskset_task_exited(uint32_t ea, uint32_t task)
     if (run) run[task / 8] &= (uint8_t)~mask;
     spu_coh_notify_write(ea);
     spu_lockline_unlock();
-    ts_schedule(ea);
+    spu_taskset_start_ready(ea);
 }
 
 void spu_taskset_poll(uint32_t spurs_ea)
@@ -102,5 +111,5 @@ void spu_taskset_poll(uint32_t spurs_ea)
             tasksets[count++] = ea;
     }
     spu_lockline_unlock();
-    for (unsigned i = 0; i < count; ++i) ts_schedule(tasksets[i]);
+    for (unsigned i = 0; i < count; ++i) spu_taskset_start_ready(tasksets[i]);
 }

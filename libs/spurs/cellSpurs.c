@@ -993,29 +993,10 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                 fflush(stderr);
             }
 
-            /* Run the task's SPU program if a lifted build is registered for it.
-             * The registry maps the task ELF (by content fingerprint) to its
-             * pre-lifted native entry; dispatch loads the ELF into a local store
-             * and runs it with the task arg in r3. INERT until the title
-             * registers its lifted SPU set: an unregistered image MISSes and
-             * returns 0, preserving the prior "track only" behaviour.
-             *
-             * NOTE: dispatch is synchronous (runs to completion inline). That
-             * suits create+join task patterns; a workload/taskset whose SPU job
-             * waits on concurrent PPU-side signals will want the async lv2
-             * SPU-thread path instead — wired when a title exercises it. */
-            if (elf) {
-                /* elf/context are guest effective addresses; translate the image
-                 * pointer to host memory for fingerprint+load, but keep context
-                 * as the guest EA (the SPU job's DMA uses guest EAs / r3). */
-                const uint8_t* host_elf = GUEST_PTR(elf, const uint8_t*);
-                size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
-                if (sz)
-                    /* Async: SPURS tasks are persistent workers — running them
-                     * inline would block this PPU thread forever (deadlock). */
-                    spu_workload_dispatch_async(host_elf, (uint32_t)sz,
-                                                (uint32_t)(uintptr_t)context);
-            }
+            /* The scheduler may already have run a newly published task.
+             * Schedule its current ready state; launching this saved ELF again
+             * can race task-ID reuse and run it with the next task's arguments. */
+            if (elf) spu_taskset_start_ready(taskset_ea);
             return CELL_OK;
         }
     }

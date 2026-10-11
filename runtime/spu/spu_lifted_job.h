@@ -223,7 +223,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
             ctx.gpr[3]._u32[1] = r3_override[1];   /* task control block EA    */
             ctx.gpr[3]._u32[2] = r3_override[2];   /* queue/lock EA            */
             ctx.gpr[3]._u32[3] = r3_override[3];
-            if (!ctx.gpr[3]._u32[1]) ctx.gpr[3]._u32[1] = args_ea;
+            if (!taskset_ctx && !ctx.gpr[3]._u32[1]) ctx.gpr[3]._u32[1] = args_ea;
         } else if (image_id == 22) {
             /* cri_mpv leaf (func_00003E68) gate is `rotmai(r3.word0, 112) == 64`
              * = an ARITHMETIC RIGHT-SHIFT BY 16 then ceqi 64, i.e. it wants

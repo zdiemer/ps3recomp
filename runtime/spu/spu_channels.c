@@ -137,6 +137,33 @@ void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
 
 void spu_halt(spu_context* ctx)
 {
+    /* Optional bounded fault artifact: one full LS/register snapshot, only at
+     * a real halt assertion. Register words use guest big-endian byte order. */
+    if (ctx->status == SPU_STATUS_STOPPED_BY_HALT) {
+        const char* prefix = getenv("SPU_HALT_DUMP");
+        const char* filter = getenv("SPU_HALT_DUMP_IMG");
+        static volatile LONG claimed;
+        if (prefix && *prefix && (!filter || atoi(filter) == ctx->image_id) &&
+            InterlockedCompareExchange(&claimed, 1, 0) == 0) {
+            char path[512];
+            snprintf(path, sizeof path, "%s_img%d.ls.bin", prefix, ctx->image_id);
+            FILE* f = fopen(path, "wb");
+            if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f); }
+            snprintf(path, sizeof path, "%s_img%d.regs.bin", prefix, ctx->image_id);
+            f = fopen(path, "wb");
+            if (f) {
+                for (unsigned r = 0; r < 128; ++r)
+                    for (unsigned w = 0; w < 4; ++w) {
+                        uint32_t v = ctx->gpr[r]._u32[w];
+                        uint8_t bytes[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16),
+                                            (uint8_t)(v >> 8), (uint8_t)v};
+                        fwrite(bytes, 1, 4, f);
+                    }
+                fclose(f);
+            }
+            fprintf(stderr, "[spu-halt] wrote first fault snapshot: %s_img%d\n", prefix, ctx->image_id);
+        }
+    }
     /* Register/context dump at halt-asserts: the WWS job's parameter guard
      * (heqi 0x1650 in job_wws_7BD900) checks (r12 bit0) & (r9 16-aligned) &
      * (r15 != 0) -- job descriptor/ABI values our execute path must supply.
