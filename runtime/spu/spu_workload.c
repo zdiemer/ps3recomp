@@ -1102,7 +1102,13 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
      * async SPU thread reading it later would race the PPU stack. word1 is
      * overridden to args_ea (eaContext) in spu_run_lifted_job_abi. */
     j->have_r3 = 0;
-    if (args_ea && !taskset_ea) {
+    if (taskset_ea && taskid < 128) {
+        /* Snapshot by-value arguments before the host thread starts. A guest
+         * task-info slot is reusable after exit; it is not a durable job object. */
+        extern void spu_taskset_capture_args(uint32_t, uint32_t, uint32_t[4]);
+        spu_taskset_capture_args(taskset_ea, taskid, j->r3);
+        j->have_r3 = 1;
+    } else if (args_ea && !taskset_ea) {
         extern uint8_t* vm_base;
         const uint8_t* c = vm_base + args_ea + 0x10;
         for (int k = 0; k < 4; k++)

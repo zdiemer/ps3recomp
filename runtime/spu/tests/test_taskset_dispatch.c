@@ -47,6 +47,10 @@ int main(void)
     assert(dispatches == 1); /* claimed before asynchronous start */
     spu_taskset_task_exited(0x100, 1);
     assert(notifications == 1 && !(memory[0x100 + CSTS_ENABLED] & 0x40));
+    /* A task can finish between publication and CreateTask's scheduling call.
+     * Scheduling again must not launch a saved, already completed ELF. */
+    spu_taskset_start_ready(0x100);
+    assert(dispatches == 1);
     ready(1);
     spu_taskset_poll(0x2000);
     assert(dispatches == 2 && last_task == 1); /* task IDs recycle */
@@ -59,6 +63,13 @@ int main(void)
     assert(dispatches == 4 && last_task == 2); /* failed launch retried */
     spu_taskset_poll(0x2000);
     assert(dispatches == 4);
+    uint32_t ti = 0x100 + CSTS_TASKINFO + TI_SIZE;
+    const uint32_t expected[4] = {0x12000, 0, 0x34000, 0x56000};
+    for (unsigned i = 0; i < 4; ++i) write_be32(ti + TI_ARGS + 4*i, expected[i]);
+    uint32_t captured[4];
+    spu_taskset_capture_args(0x100, 1, captured);
+    memset(memory + ti + TI_ARGS, 0xCD, 16); /* next task overwrites its slot */
+    for (unsigned i = 0; i < 4; ++i) assert(captured[i] == expected[i]);
     puts("Taskset dispatch contract passed");
     return 0;
 }
