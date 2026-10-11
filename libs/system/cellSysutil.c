@@ -122,6 +122,17 @@ s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1)
     return cellSysutilQueueGuestCallbackArgs(opd, args);
 }
 
+s32 cellSysutilBroadcastEvent(u64 status, u64 param)
+{
+    for (int i = 0; i < CELL_SYSUTIL_MAX_CALLBACKS; i++) {
+        if (!s_callbacks[i].registered || !s_callbacks[i].guest_opd) continue;
+        const u64 args[8] = {status, param, s_callbacks[i].userdata, 0, 0, 0, 0, 0};
+        s32 result = cellSysutilQueueGuestCallbackArgs(s_callbacks[i].guest_opd, args);
+        if (result != CELL_OK) return result;
+    }
+    return CELL_OK;
+}
+
 static void drain_guest_completions(void)
 {
     static COMPLETION_TLS int draining;

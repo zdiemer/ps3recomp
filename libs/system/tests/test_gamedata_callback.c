@@ -16,6 +16,9 @@ void ps3_ww_report_inline(uint32_t ea, uint64_t v, int w) { (void)ea; (void)v; (
 
 static int calls;
 static u32 expected_new;
+static s32 callback_result = CELL_GAMEDATA_CBRESULT_OK_CANCEL;
+static int provide_param;
+static int expect_persisted;
 static void callback(uint32_t opd, uint64_t cb, uint64_t get, uint64_t set,
                      uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
@@ -33,7 +36,21 @@ static void callback(uint32_t opd, uint64_t cb, uint64_t get, uint64_t set,
     assert(vm_read32((u32)get + 0xB9C) == 0);
     assert(vm_base[get + 0x1447] == 0);
     assert(vm_base[set + 0x20] == 0xCD); /* scratch boundary stays intact */
-    vm_write32((u32)cb, CELL_GAMEDATA_CBRESULT_OK_CANCEL);
+    if (expect_persisted) {
+        assert(strcmp((char*)vm_base + get + 0x860, "Persisted Title") == 0);
+        assert(strcmp((char*)vm_base + get + 0x860 + 0xA8C, "02.34") == 0);
+        assert(strcmp((char*)vm_base + get + 0x860 + 0x80, "Localized title") == 0);
+        assert(vm_read32((u32)get + 0x860 + 0xA94) == 7);
+    }
+    if (provide_param) {
+        u32 param = (u32)get + 0x860;
+        strcpy((char*)vm_base + param, "Persisted Title");
+        strcpy((char*)vm_base + param + 0xA8C, "02.34");
+        strcpy((char*)vm_base + param + 0x80, "Localized title");
+        vm_write32(param + 0xA94, 7);
+        vm_write32((u32)set, param);
+    }
+    vm_write32((u32)cb, callback_result);
     calls++;
 }
 
@@ -65,14 +82,44 @@ int main(void)
                                     (void*)(uintptr_t)0x1234, 0) == CELL_OK);
     char fixture[CELL_GAME_PATH_MAX];
     snprintf(fixture, sizeof fixture, "%s/TEST00001", s_content_path);
+    assert(!dir_exists(fixture)); /* OK_CANCEL must not create data. */
+    callback_result = CELL_GAMEDATA_CBRESULT_OK;
+    assert(cellGameDataCheckCreate2(0, (const char*)(uintptr_t)0x100, 0,
+                                    (void*)(uintptr_t)0x1234, 0) == CELL_GAME_ERROR_PARAM);
+    assert(!dir_exists(fixture)); /* New data requires callback parameters. */
+    provide_param = 1;
+    assert(cellGameDataCheckCreate2(0, (const char*)(uintptr_t)0x100, 0,
+                                    (void*)(uintptr_t)0x1234, 0) == CELL_OK);
+    char usrdir[CELL_GAME_PATH_MAX], sfo[CELL_GAME_PATH_MAX], text[128];
+    snprintf(usrdir, sizeof usrdir, "%s/USRDIR", fixture);
+    snprintf(sfo, sizeof sfo, "%s/PARAM.SFO", fixture);
+    assert(dir_exists(usrdir));
+    assert(sfo_read_string(sfo, "TITLE", text, sizeof text) == 0);
+    assert(strcmp(text, "Persisted Title") == 0);
+    assert(sfo_read_string(sfo, "VERSION", text, sizeof text) == 0);
+    assert(strcmp(text, "02.34") == 0);
+    assert(sfo_read_string(sfo, "CATEGORY", text, sizeof text) == 0);
+    assert(strcmp(text, "GD") == 0);
+    assert(sfo_read_string(sfo, "TITLE_00", text, sizeof text) == 0);
+    assert(strcmp(text, "Localized title") == 0);
+    callback_result = CELL_GAMEDATA_CBRESULT_OK_CANCEL;
+    provide_param = 0;
+    expect_persisted = 1;
+    expected_new = 0;
+    assert(cellGameDataCheckCreate2(0, (const char*)(uintptr_t)0x100, 0,
+                                    (void*)(uintptr_t)0x1234, 0) == CELL_OK);
+    expect_persisted = 0;
+    assert(remove(sfo) == 0);
+    assert(TEST_RMDIR(usrdir) == 0);
+    assert(TEST_RMDIR(fixture) == 0);
     assert(HOST_MKDIR(fixture) == 0);
     expected_new = 0;
     assert(cellGameDataCheckCreate2(0, (const char*)(uintptr_t)0x100, 0,
                                     (void*)(uintptr_t)0x1234, 0) == CELL_OK);
-    assert(calls == 4);
+    assert(calls == 7);
     assert(cellGameDataCheckCreate2(1, (const char*)(uintptr_t)0x100, 0,
                                     (void*)(uintptr_t)0x1234, 0) == CELL_GAME_ERROR_PARAM);
-    assert(calls == 4);
+    assert(calls == 7);
     assert(TEST_RMDIR(fixture) == 0);
     assert(TEST_RMDIR(s_content_path) == 0);
     free(vm_base);

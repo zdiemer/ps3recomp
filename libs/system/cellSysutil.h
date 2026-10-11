@@ -119,6 +119,8 @@ s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
  * The slot must match the slot the game registered against; flOw and most
  * games use slot 0. */
 void cellSysutilQueueEvent(int slot, u32 status, u32 param);
+/* Ordered with one-shot callbacks; delivered only when the title polls. */
+s32 cellSysutilBroadcastEvent(u64 status, u64 param);
 
 /* value_ea / buf_ea are GUEST addresses, not host pointers: both write into
  * the title's own memory through vm_write*. Spelt u32 so a caller cannot
