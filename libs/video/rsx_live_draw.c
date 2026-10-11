@@ -124,7 +124,8 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 
 #define LD_SWAP_BUFFERS  2
 #define MAX_SURFACES     64
-#define MAX_TEXTURES     1024
+#define MAX_TEXTURES     4096
+#define TEXTURE_BUCKETS 8192
 #define MAX_RETIRED_TEXTURES 4096
 #define MAX_VTEX         64
 #define MAX_SAMPLERS     128
@@ -187,6 +188,7 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 #define TEX_FMT_A4R4G4B4   0x83
 #define TEX_FMT_R5G6B5     0x84
 #define TEX_FMT_A8R8G8B8   0x85
+#define TEX_FMT_D8R8G8B8   0x9E
 #define TEX_FMT_DXT1       0x86
 #define TEX_FMT_DXT23      0x87
 #define TEX_FMT_DXT45      0x88
@@ -243,7 +245,7 @@ typedef struct {
 } zdepth_t;
 typedef struct {
     u32 location, offset, format, width, height, pitch, remap;
-    u32 cubemap;
+    u32 cubemap, mipmaps, dimension, hash_next, hash_bucket;
     ID3D12Resource* tex;
     u64 content_hash;
     u32 last_hash_frame;
@@ -312,6 +314,7 @@ typedef struct {
     u32                        srv_step, srv_ring_used;
     ID3D12Resource*            white_tex;
     texcache_t                 textures[MAX_TEXTURES];
+    u32                        texture_buckets[TEXTURE_BUCKETS];
     u32                        n_textures;
     vtexcache_t                vtex[MAX_VTEX];
     u32                        n_vtex;
@@ -1901,6 +1904,8 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
         break;
     }
     case TEX_FMT_DEPTH24_D8: s[0] = 255; s[1] = s[2] = s[3] = p[0]; break;
+    case TEX_FMT_D8R8G8B8:
+        s[0] = 255; s[1] = p[1]; s[2] = p[2]; s[3] = p[3]; break;
     default: s[0] = p[0]; s[1] = p[1]; s[2] = p[2]; s[3] = p[3]; break;
     }
     d[0] = remap_comp(s, remap, 1);
@@ -2042,6 +2047,7 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
     case TEX_FMT_G8B8: texel_size = 2; break;
     case RSX_TEX_FMT_W16Z16Y16X16_FLOAT: texel_size = 8; break;
     case TEX_FMT_A8R8G8B8:
+    case TEX_FMT_D8R8G8B8:
     case TEX_FMT_DEPTH24_D8: texel_size = 4; break;
     default: return 0;
     }
@@ -2062,15 +2068,6 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
      * TEX_FMT_LINEAR) and shows banded green/magenta stripes, which is the same
      * symptom on the same mechanism. */
     if (linear) n_mips = 1;
-    if (t->cubemap && block_size) {
-        n_mips = 1;
-        for (u32 d = (t->width < t->height ? t->width : t->height) / 4;
-             d > 1; d >>= 1)
-            n_mips++;
-        if (t->mipmaps && n_mips > t->mipmaps)
-            n_mips = t->mipmaps;
-        if (n_mips > 14) n_mips = 14;
-    }
     u32 mw = t->width, mh = t->height, span = 0;
     for (u32 m = 0; m < n_mips; m++) {
         if (block_size)
@@ -2084,7 +2081,10 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
         mw = mw > 1 ? mw >> 1 : 1;
         mh = mh > 1 ? mh >> 1 : 1;
     }
-    return t->cubemap ? span * 6 : span;
+    // Cube faces contain their complete source mip pyramid, aligned to 128
+    // bytes. The host may upload fewer levels, but that cannot shorten the
+    // stride to the next guest face (especially the final 2x2/1x1 BC blocks).
+    return t->cubemap ? ((span + 127u) & ~127u) * 6 : span;
 }
 
 static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
@@ -2224,6 +2224,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
     case TEX_FMT_R5G6B5:
     case TEX_FMT_G8B8: texel_size = 2; break;
     case TEX_FMT_A8R8G8B8:
+    case TEX_FMT_D8R8G8B8:
     case TEX_FMT_DEPTH24_D8: texel_size = 4; break;
     case RSX_TEX_FMT_W16Z16Y16X16_FLOAT: texel_size = 8; break;
     default: return NULL;
@@ -2458,6 +2459,45 @@ static void write_texture_srv(u32 index, const texcache_t* entry)
     }
 }
 
+static u32 texture_cache_bucket(const rsx_dsp_texture* t)
+{
+    const u32 key[] = {t->location, t->offset, t->format, t->width, t->height,
+                       t->pitch, t->remap & 0xFFFFu, t->cubemap,
+                       t->mipmaps, t->dimension};
+    return (u32)fnv1a(key, sizeof(key), 1469598103934665603ull) & (TEXTURE_BUCKETS - 1u);
+}
+
+static u32 texture_cache_find(const rsx_dsp_texture* t, u32 bucket)
+{
+    for (u32 link = g.texture_buckets[bucket]; link; ) {
+        const u32 i = link - 1u;
+        const texcache_t* e = &g.textures[i];
+        if (e->location == t->location && e->offset == t->offset &&
+            e->format == t->format && e->width == t->width &&
+            e->height == t->height && e->pitch == t->pitch &&
+            e->remap == (t->remap & 0xFFFFu) && e->cubemap == t->cubemap &&
+            e->mipmaps == t->mipmaps && e->dimension == t->dimension)
+            return i;
+        link = e->hash_next;
+    }
+    return UINT32_MAX;
+}
+
+static void texture_cache_link(u32 index, u32 bucket)
+{
+    g.textures[index].hash_bucket = bucket;
+    g.textures[index].hash_next = g.texture_buckets[bucket];
+    g.texture_buckets[bucket] = index + 1u;
+}
+
+static void texture_cache_unlink(u32 index)
+{
+    u32* link = &g.texture_buckets[g.textures[index].hash_bucket];
+    while (*link && *link != index + 1u)
+        link = &g.textures[*link - 1u].hash_next;
+    if (*link) *link = g.textures[index].hash_next;
+}
+
 /* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
  * descriptor-only cache, re-hash the source once per frame and refresh the
  * D3D resource when the game rewrites the same guest address. */
@@ -2468,13 +2508,10 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     if (refresh_enabled < 0)
         refresh_enabled = getenv("RSX_NO_TEX_REFRESH") ? 0 : 1;
 
-    for (u32 i = 0; i < g.n_textures; i++) {
+    const u32 bucket = texture_cache_bucket(t);
+    const u32 i = texture_cache_find(t, bucket);
+    if (i != UINT32_MAX) {
         texcache_t* entry = &g.textures[i];
-        if (entry->location != t->location || entry->offset != t->offset ||
-            entry->format != t->format || entry->width != t->width ||
-            entry->height != t->height || entry->pitch != t->pitch ||
-            entry->remap != remap || entry->cubemap != t->cubemap)
-            continue;
         if (refresh_enabled && entry->tex &&
             entry->last_hash_frame != g_ld_frames) {
             int readable = 0;
@@ -2589,6 +2626,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     replacement.pitch = t->pitch;
     replacement.remap = remap;
     replacement.cubemap = t->cubemap;
+    replacement.mipmaps = t->mipmaps;
+    replacement.dimension = t->dimension;
     replacement.last_hash_frame = g_ld_frames;
     replacement.last_use_serial = ++g_ld_texture_use_serial;
     {
@@ -2598,13 +2637,18 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     replacement.tex = decode_guest_texture_profiled(t, remap);
     if (replacement.tex) {
         texcache_t* entry = &g.textures[index];
+        if (cache_was_full)
+            texture_cache_unlink(index);
         if (evicted)
             retire_texture(evicted);
         *entry = replacement;
+        texture_cache_link(index, bucket);
         write_texture_srv(index, entry);
     } else {
-        if (!cache_was_full)
+        if (!cache_was_full) {
             g.textures[index] = replacement;
+            texture_cache_link(index, bucket);
+        }
         g_ld_texture_decode_fail++;
         if (g_ld_texture_decode_fail <= 16 ||
             (g_ld_texture_decode_fail & (g_ld_texture_decode_fail - 1)) == 0)
