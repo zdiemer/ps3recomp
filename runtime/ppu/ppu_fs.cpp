@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include "../platform/host_file64.h"
+#include "../spu/spu_overlay_registry.h"
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
 /* Guest-resolving host backtrace (ppu_loader.cpp). Must be declared at file scope:
@@ -381,6 +382,7 @@ static void cellFsRead(ppu_context* ctx)
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    if (n <= UINT32_MAX) spu_overlay_bind_elf(buf, vm_base + buf, (uint32_t)n);
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
      * a second, so it cannot be watched to its end -- truncating the stream makes

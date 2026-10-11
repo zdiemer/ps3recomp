@@ -20,7 +20,8 @@ static inline void spu_code_note_overwrite(spu_context* ctx, uint32_t ea,
         uint32_t base = ctx->resident_code[i].lsa;
         uint32_t end = base + ctx->resident_code[i].size;
         if (lsa < end && (uint64_t)lsa + size > base &&
-            (lsa < base || ea != ctx->resident_code[i].source_ea + (lsa - base)))
+            (lsa < base || ea != ctx->resident_code[i].source_ea + (lsa - base) ||
+             (lsa == base && size >= ctx->resident_code[i].size)))
             ctx->resident_code[i].image_id = 0;
     }
 }

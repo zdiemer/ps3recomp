@@ -2102,7 +2102,8 @@ s32 _cellSpursEventFlagInitialize(void* spurs, void* taskset,
 s32 _cellSpursSendSignal(void* taskset, u32 taskId)
 {
     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
-    printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
+    if (ps3_log_verbose())
+        printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
     /* Real delivery now that SPU tasks execute (comment was stale). */
     if (taskset_ea) spu_taskset_signal_task(taskset_ea, taskId);
     return CELL_OK;
