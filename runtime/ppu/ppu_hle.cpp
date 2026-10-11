@@ -74,6 +74,19 @@ extern "C" int ps3_hle_has(uint32_t nid)
 typedef uint64_t (*hle_generic)(uint64_t, uint64_t, uint64_t, uint64_t,
                                 uint64_t, uint64_t, uint64_t, uint64_t);
 
+/* The deprecated SAIL initializer has nine integer arguments. The generic
+ * bridge covers only r3..r10; argument nine lives at the ELFv1 stack slot 0x70. */
+extern "C" int32_t cellSailPlayerInitialize(uint32_t, int32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+extern "C" void ps3_sail_player_initialize(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)cellSailPlayerInitialize(
+        (uint32_t)ctx->gpr[3], (int32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5],
+        (uint32_t)ctx->gpr[6], (uint32_t)ctx->gpr[7], (uint32_t)ctx->gpr[8],
+        (uint32_t)ctx->gpr[9], (uint32_t)ctx->gpr[10],
+        (uint32_t)vm_read64(ctx->gpr[1] + 0x70));
+}
+
 /* Host VM store (defined in ppu_loader.cpp) — used for the TOC save below. */
 void vm_write64(uint64_t addr, uint64_t val);
 
