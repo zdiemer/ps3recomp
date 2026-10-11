@@ -1003,6 +1003,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
 
             # Shift
             260: "vslb", 324: "vslh", 388: "vslw",
+            452: "vsl",
             516: "vsrb", 580: "vsrh", 644: "vsrw",
             772: "vsrab", 836: "vsrah", 900: "vsraw",
 
