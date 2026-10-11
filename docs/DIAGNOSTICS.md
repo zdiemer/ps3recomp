@@ -1468,3 +1468,11 @@ not changed while a title runs.
 - **`YDKJ_TUNERFIX`** — YDKJ_TUNERFIX (at the top so it wins over any registered handler): the profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre _cellSpursIsLaunchedFromTuner (0x3000D318), must return 0x8001112E ("profiler not loaded") on a normal run. Anything else trips the usertrace.c:123 assert AND makes the fn report "launched from tuner", so the caller runs tuner/trace setup that fails with CELL_SPURS_CORE_ERROR_STAT -> the SPURS task workload never attaches. */
   `runtime/ppu/ppu_hle.cpp:223`  _(+1 more sites)_
 
+
+### Haze rendering probes
+
+- `VTX_INPUTS=N`: log one fetched vertex per distinct fragment program (up to 32), including enabled attributes and the color/UV slots.
+- `VP_MVP=N`: also print constants c0 through c3 and the guest viewport transform.
+- `FPK_DBG=1`: shader bytes now come from the program's actual local/main location.
+- `FP_FORCE=1`: replace the fragment shader with solid magenta; this now works with the current decompiler. Diagnostic output is not game rendering.
+- `LD_FRAME_DUMP_COUNT=N`: stop live-renderer PPM captures after N attempts; unset or zero retains unlimited capture. Use with `LD_FRAME_DUMP`, `LD_FRAME_DUMP_FROM`, and `LD_FRAME_DUMP_EVERY`.
