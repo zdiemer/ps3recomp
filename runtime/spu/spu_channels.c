@@ -17,6 +17,7 @@
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
+#include "spu_overlay_registry.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1656,6 +1657,21 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         if (lsa < end && lsa + size > base &&
             (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)))
             ctx->resident_code[slot].image_id = 0;
+    }
+    uint32_t bound_span = 0;
+    int bound_image = spu_overlay_lookup_bound(ea, &bound_span);
+    if (bound_image && (uint64_t)lsa + bound_span <= SPU_LS_SIZE) {
+        for (unsigned slot = 0; slot < 4; ++slot) {
+            if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+                continue;
+            ctx->resident_code[slot].lsa = lsa;
+            ctx->resident_code[slot].size = bound_span;
+            ctx->resident_code[slot].source_ea = ea;
+            ctx->resident_code[slot].image_id = bound_image;
+            return;
+        }
+        fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", bound_image);
+        return;
     }
     for (int i = 0; i < s_ovl_src_count; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];

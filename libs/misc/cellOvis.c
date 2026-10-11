@@ -7,6 +7,7 @@
 #include "cellOvis.h"
 #include <stdio.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../../runtime/spu/spu_overlay_registry.h"
 
 /* Internal state */
 
@@ -94,6 +95,7 @@ s32 cellOvisInitializeOverlayTable(u32 table, u32 elf)
         u32 destination = table + physical - 0x40000;
         u32 source = elf + vm_read32(ph + 4);
         memcpy(vm_base + destination, vm_base + source, bytes);
+        spu_overlay_bind(destination, vm_base + destination, bytes);
     }
     return CELL_OK;
 }

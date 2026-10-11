@@ -2,6 +2,8 @@
 #include <assert.h>
 #include <stdlib.h>
 #include "../cellOvis.c"
+void spu_overlay_bind(uint32_t ea, const uint8_t* bytes, uint32_t span)
+{ assert(bytes == vm_base + ea); assert(span > 0); }
 uint8_t* vm_base;
 int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;
