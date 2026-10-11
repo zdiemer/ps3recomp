@@ -1699,6 +1699,11 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         if (si->stopping) break;
         if (disabled) continue;
         u32 ea = si->ea;
+        /* Guest-created siblings may become ready while a task stays alive. */
+        ReleaseSRWLockExclusive(&si->lock);
+        spu_taskset_poll(ea);
+        AcquireSRWLockExclusive(&si->lock);
+        if (si->stopping) break;
         AcquireSRWLockExclusive(&s_workload_registry_lock);
         si->pass_no++;
         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);
@@ -2856,114 +2861,6 @@ s32 cellSpursQueueClear(u64 queue_ea)
 {
     static int _n = 0;
     if (_n++ < 8) printf("[cellSpurs] QueueClear(q=0x%08X)\n", (u32)queue_ea);
-    return CELL_OK;
-}
-
-/* SDK ABI: cellSpursQueuePushBody(CellSpursQueue*, const void* buffer, bool isBlocking) */
-s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
-{
-    /* SPURS_QUEUE_PUSH=1 -- EXPERIMENT, off by default.
-     *
-     * A deliberately self-revealing probe rather than a finished push. The
-     * waiter half of the protocol is known (see PROGRESS.md phase 19): the
-     * 16-byte group at queue+0x20 is a ring of blocked task ids, byte[0] the
-     * count and byte[13] the cursor. The DATA half is not: which ring slot an
-     * element belongs in has never been observed, because nothing has ever
-     * pushed and so the consumer has never taken its non-empty path.
-     *
-     * So push into a CANDIDATE slot (a counter kept in the push1 half of the
-     * line at +0x0C), wake the registered waiter, and let the consumer's own
-     * DMA say where it actually looks. Its read address names the correct slot
-     * whether or not the guess was right, which turns one run into the answer.
-     * Everything is logged for that reason. */
-    static int s_exp = -1;
-    if (s_exp < 0) s_exp = getenv("SPURS_QUEUE_PUSH") ? 1 : 0;
-
-    static int _n = 0;
-    if (!s_exp) {
-        if (_n < 8)
-            printf("[cellSpurs] QueuePushBody(q=0x%08X data=0x%08X blocking=%u)\n",
-                   (u32)queue_ea, (u32)data_ea, isBlocking);
-        else if (_n == 8)
-            printf("[cellSpurs] QueuePushBody further logs suppressed\n");
-        _n++;
-        return CELL_OK;
-    }
-
-    if (!queue_ea || !data_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-
-    uint32_t q   = (uint32_t)queue_ea;
-    uint32_t sz  = vm_read32(q + 0x08);
-    uint32_t dep = vm_read32(q + 0x0C);
-    uint32_t buf = (uint32_t)vm_read64(q + 0x10);
-    uint32_t tsp = (uint32_t)vm_read64(q + 0x70);      /* eaSignal: taskset */
-    if (!sz || !dep || !buf) return CELL_SPURS_TASK_ERROR_INVAL;
-
-    /* Derived ring model (see PROGRESS.md phase 22). Working the dataflow of
-     * the consumer's decision at 0x12914..0x129D0 backwards:
-     *
-     *   r11 = normalise(W0)        W0 = queue+0x00
-     *   r2  = normalise(W1)        W1 = queue+0x04
-     *   r60 = W3                   W3 = queue+0x0C
-     *     where normalise(v) is  cgti/nor/selb  ==  (v >= 0 ? v : ~v)
-     *
-     *   r81 = r2 - r11
-     *   r79 = (r2 + r60) - (r11 - r60)  =  r2 - r11 + 2*r60
-     *   r68 = (r11 > r2) ? r79 : r81    =  (r2 - r11) mod 2*r60
-     *   ceqi r77, r68, 0                -> the EMPTY test
-     *
-     * and, separately at 0x129A8..0x129B8,
-     *
-     *   r14 = (r60 > r11) ? r11 : r11 - r60   =  index mod r60
-     *
-     * which is the buffer slot. So this is an ordinary ring: W0 is the pop
-     * index, W1 the push index, indices run modulo 2*W3, and the slot is the
-     * index modulo W3 -- the standard scheme that keeps "full" distinguishable
-     * from "empty". W3 is therefore the depth.
-     *
-     * And that is the bug: the initialiser left queue+0x0C at ZERO, so r60 = 0
-     * and the whole computation degenerates -- occupancy is (W1-W0) mod 0 and
-     * the slot is index mod 0. With both indices at 0 the empty test is
-     * trivially true, which is precisely why the consumer parked every time and
-     * never once read the element buffer, whatever the producer wrote. */
-    uint8_t* qp = vm_base + q;
-
-    int32_t  sync  = (int32_t)vm_read32(q + 0x00);          /* W0, pop  */
-    int32_t  tail  = (int32_t)vm_read32(q + 0x04);          /* W1, push */
-    int32_t  mod   = (int32_t)vm_read32(q + 0x0C);          /* W3       */
-    if (mod <= 0) mod = (int32_t)dep;                       /* pre-fix queues */
-
-    int32_t  nsync = (sync < 0) ? ~sync : sync;             /* normalise */
-    int32_t  cur   = (tail < 0) ? ~tail : tail;
-    uint32_t slot  = (uint32_t)(cur % mod);
-
-    memcpy(vm_base + buf + (size_t)slot * sz, vm_base + (uint32_t)data_ea, sz);
-
-    int32_t  nxt   = (cur + 1) % (2 * mod);
-    int32_t  ntail = nxt;
-    vm_write32(q + 0x04, (uint32_t)ntail);
-
-    /* Waiter ring at +0x20: byte[0] = count, byte[1..12] = task ids. */
-    uint32_t waiters = qp[0x20];
-    int woke = -1;
-    if (waiters > 0 && waiters <= 3 && tsp) {
-        /* The entry area is m_bs[1..3] ONLY -- bytes 0x21..0x23. Shifting the
-         * whole 16-byte group (as a first cut of this did) walks straight over
-         * direction at +0x24 and init at +0x2C and corrupts the header; the
-         * trace caught it as direction turning from 00000002 into 00020000. */
-        woke = qp[0x21];
-        qp[0x21] = qp[0x22];
-        qp[0x22] = qp[0x23];
-        qp[0x23] = 0;
-        qp[0x20] = (uint8_t)(waiters - 1);
-        extern void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
-        spu_taskset_signal_task(tsp, (uint32_t)woke);
-    }
-
-    if (_n++ < 16)
-        printf("[cellSpurs] QueuePush#%d q=0x%08X slot=%u (cur=%u->%u) buf=0x%08X+0x%X "
-               "size=%u depth=%u waiters=%u woke=%d sync=%d/%d tail=%d->%d taskset=0x%08X\n",
-               _n, q, slot, cur, nxt, buf, slot * sz, sz, dep, waiters, woke, sync, nsync, tail, ntail, tsp);
     return CELL_OK;
 }
 

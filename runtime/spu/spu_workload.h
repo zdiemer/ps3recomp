@@ -129,6 +129,14 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea);
 
+/* Explicit identity for SPU-created tasks; avoids racing PPU dispatch globals. */
+int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
+                                    uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid);
+int spu_taskset_claim(uint32_t taskset_ea, uint32_t taskid);
+void spu_taskset_release(uint32_t taskset_ea, uint32_t taskid);
+void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t taskid);
+void spu_taskset_poll(uint32_t spurs_ea);
+
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
 
