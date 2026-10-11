@@ -374,7 +374,6 @@ static inline int32_t spu_run_lifted_job_abi_in_context(spu_context* ctx,
     /* The context may have taken a lock-line reservation; left
      * in the reserver set it is walked by the next PPU store to that line.
      * GH3's Havok task returning is what first hit it. */
-    spu_mfc_release(ctx);
     spu_coh_unregister(ctx);
     if (local_store) memcpy(local_store, ctx->ls, SPU_LS_SIZE);  /* LS back out */
     { extern void spu_mfc_release(spu_context*);
