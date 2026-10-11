@@ -55,16 +55,21 @@ static void cache_tests(void)
 {
     u8 bytes[1024]; memset(bytes,0x5A,sizeof(bytes));
     const u64 original=rsx_texture_hash(bytes,sizeof(bytes));
+    const u64 xxh_original=rsx_texture_hash_xxh3(bytes,sizeof(bytes));
     for (u32 i=0; i<sizeof(bytes); ++i) {
         bytes[i]^=0x80;
         assert(rsx_texture_hash(bytes,sizeof(bytes))!=original);
+        assert(rsx_texture_hash_xxh3(bytes,sizeof(bytes))!=xxh_original);
         bytes[i]^=0x80;
     }
     // Hash tails at a protected boundary: no overread for short/unaligned data.
     u8* boundary=VirtualAlloc(NULL,8192,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
     assert(boundary); DWORD old; assert(VirtualProtect(boundary+4096,4096,PAGE_NOACCESS,&old));
     memset(boundary,0x73,4096);
-    for (u32 n=0; n<128; ++n) (void)rsx_texture_hash(boundary+4096-n,n);
+    for (u32 n=0; n<=4096; ++n) {
+        (void)rsx_texture_hash(boundary+4096-n,n);
+        (void)rsx_texture_hash_xxh3(boundary+4096-n,n);
+    }
     VirtualFree(boundary,0,MEM_RELEASE);
     rsx_dsp_texture t = {0}; t.format = 0x86; t.width = t.height = 64;
     t.dimension = 2; t.mipmaps = 7; t.remap = 0xAAE4;
@@ -217,7 +222,7 @@ static void fetch_tests(void)
         puts("SINT16 batch: every signed value/lane matches; protected tails do not overread");
     }
     rsx_vertex_remap remap={0};
-    for (u32 trial=0; trial<128; ++trial) {
+    for (u32 trial=0; trial<256; ++trial) {
         rsx_vertex_ref input[64], actual[64], expected[64]; u32 map[64], used=0;
         for (u32 i=0; i<64; ++i) {
             input[i].vertex_id=trial%4==0?i:trial%4==1?(i*13)%17:trial%4==2?(i*13)%17*100003:(i*13)%17;
@@ -226,13 +231,71 @@ static void fetch_tests(void)
             if (j==used) expected[used++]=input[i]; map[i]=j;
         }
         memcpy(actual,input,sizeof(input)); u32 unique=0;
-        assert(rsx_vertex_remap_build(&remap,actual,64,&unique));
+        assert(rsx_vertex_remap_build_ex(&remap,actual,64,&unique,(trial/4)%2));
         assert(unique==used && memcmp(actual,expected,used*sizeof(*actual))==0);
         for (u32 i=0; i<64; ++i) assert(rsx_vertex_remap_index(&remap,i)==map[i]);
         if (trial==64) remap.generation=UINT_MAX; // generation wrap after dense/sparse reuse
     }
     rsx_vertex_remap_destroy(&remap);
     puts("Vertex remap matches ordered reference: ascending/dense/sparse/mixed bases and generation wrap");
+}
+static void reference_batch_tests(void)
+{
+    rsx_vertex_layout_plan layout; rsx_vertex_layout_plan_init(&layout,0);
+    g.guest_ptr=resolve;
+    batch_t arrays[2]={{UINT_MAX-2,5},{7,4}}, indices[2]={{0,9},{3,4}};
+    for (unsigned wide=0; wide<2; ++wide) for (unsigned restart=0; restart<2; ++restart)
+    for (unsigned flags=0; flags<4; ++flags) {
+        memset(&g.rsx,0,sizeof(g.rsx));
+        g.rsx.regs[0x181C/4]=128;
+        g.rsx.regs[0x1820/4]=wide?0:0x10;
+        g.rsx.regs[0x173C/4]=23;
+        g.rsx.regs[0x1DAC/4]=restart;
+        g.rsx.regs[0x1DB0/4]=wide?UINT_MAX:65535;
+        const u32 input[]={7,2,2,wide?UINT_MAX:65535,3,8,wide?UINT_MAX:65535,5,7};
+        for (u32 i=0; i<9; ++i) for (unsigned b=0; b<(wide?4:2); ++b)
+            guest[128+i*(wide?4:2)+b]=(u8)(input[i]>>((wide?3:1)-b)*8);
+        rsx_vertex_ref expected[32], unique[32]; u32 map[32],cuts[8];
+        u32 count=0, used=0, ncuts=0;
+        for (u32 b=0; b<2; ++b) for (u32 i=0; i<arrays[b].count; ++i)
+            expected[count++]=(rsx_vertex_ref){arrays[b].first+i,0};
+        for (u32 b=0; b<2; ++b) for (u32 i=0; i<indices[b].count; ++i) {
+            const u32 id=input[indices[b].first+i];
+            if (restart && id==(wide?UINT_MAX:65535)) { cuts[ncuts++]=count; continue; }
+            expected[count++]=(rsx_vertex_ref){id,23};
+        }
+        for (u32 i=0; i<count; ++i) {
+            u32 j=0; for (; j<used; ++j) if (!memcmp(&expected[i],&unique[j],sizeof(*unique))) break;
+            if (j==used) unique[used++]=expected[i]; map[i]=j;
+        }
+        dc_reset(); dc.arr=arrays; dc.n_arr=2; dc.idx=indices; dc.n_idx=2;
+        g_ld_cpu_work=flags;
+        fetch_batches_hoisted(&layout,1);
+        assert(dc.fetch_ok && dc.n_source_refs==count && dc.n_refs==used);
+        assert(!memcmp(dc.refs,unique,used*sizeof(*unique)));
+        assert(dc.n_cuts==ncuts && !memcmp(dc.cuts,cuts,ncuts*sizeof(*cuts)));
+        for (u32 i=0; i<count; ++i) assert(rsx_vertex_remap_index(&dc.ref_remap,i)==map[i]);
+        /* A bad source range remains fatal in both paths. */
+        dc_reset(); dc.n_idx=1; indices[0].first=100000;
+        fetch_batches_hoisted(&layout,1); assert(!dc.fetch_ok); indices[0].first=0;
+    }
+    dc.arr=dc.idx=NULL; dc_reset(); g_ld_cpu_work=0;
+    assert(!reserve_compact_refs(UINT_MAX));
+    puts("Reference batches: bulk/legacy agree with ordered oracle, 16/32-bit indices, restart cuts, wrap and bad ranges");
+    rsx_dsp_texture t={0}; t.dimension=2; t.width=t.height=1; t.format=0xBE; t.pitch=4;
+    for (unsigned old=0; old<2; ++old) for (unsigned next=0; next<2; ++next)
+    for (unsigned mutation=0; mutation<2; ++mutation) {
+        texcache_t e={0}; int readable;
+        e.content_hash=texture_content_hash_kind(&t,&readable,old); e.content_hash_kind=old;
+        assert(readable); if (mutation) guest[3]^=0x80;
+        g_ld_cpu_work=next*4;
+        const u64 hash=texture_content_hash(&t,&readable);
+        assert(texture_cached_content_changed(&e,&t,hash,&readable)==mutation);
+        if (!mutation) assert(e.content_hash==hash && e.content_hash_kind==next);
+        if (mutation) guest[3]^=0x80;
+    }
+    g_ld_cpu_work=0;
+    puts("Texture hash switching: unchanged content stays cached; mutation remains visible in either algorithm");
 }
 static void bias_tests(void)
 {
@@ -332,6 +395,7 @@ int main(void)
 {
     cache_tests();
     fetch_tests();
+    reference_batch_tests();
     IDXGIFactory4* factory; IDXGIAdapter* warp;
     OK(CreateDXGIFactory1(&IID_IDXGIFactory4,(void**)&factory));
     OK(factory->lpVtbl->EnumWarpAdapter(factory,&IID_IDXGIAdapter,(void**)&warp));
