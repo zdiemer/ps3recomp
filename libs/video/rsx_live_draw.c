@@ -102,6 +102,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
+#include "rsx_color_clear.h"
 #include "rsx_vertex_formats.h"
 #include <sys/stat.h>
 
@@ -304,6 +305,7 @@ typedef struct {
     int                        depth_cleared;
     zdepth_t                   zdepths[MAX_SURFACES];
     u32                        n_zdepths;
+    rsx_color_clear             color_clear;
 
     ID3D12DescriptorHeap*      srv_cpu_heap;
     ID3D12DescriptorHeap*      srv_heap;
@@ -6030,11 +6032,13 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
     /* LD_DRAW_DUMP=<dir> [LD_DRAW_DUMP_EVERY=k, default 10]: in the first
      * complete frame after the gate opens, read back each k-th draw's target BEFORE it is recorded,
      * named by frame-relative index -- bisects which draw changes a surface. */
-    { static const char* dir = (const char*)-1; static u32 every, frame = ~0u, idx, capture_frame = ~0u;
+    { static const char* dir = (const char*)-1; static u32 every, frame = ~0u, idx, armed_frame = ~0u, capture_frame = ~0u;
       if (dir == (const char*)-1) { dir = getenv("LD_DRAW_DUMP");
           const char* e = getenv("LD_DRAW_DUMP_EVERY"); every = e ? (u32)atoi(e) : 10; if (!every) every = 10; }
       if (frame != g_ld_frames) { frame = g_ld_frames; idx = 0; }
-      if (dir && capture_frame == ~0u) capture_frame = frame + 1u;
+      if (dir && armed_frame == ~0u) armed_frame = frame;
+      /* Presentation can advance the counter more than once between draws. */
+      if (dir && capture_frame == ~0u && frame != armed_frame) capture_frame = frame;
       if (dir && target < g.n_surfaces && capture_frame == frame &&
           (idx % every) == 0) {
           char path[MAX_PATH * 2];
@@ -6798,8 +6802,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
       static const char* trace_gate = (const char*)-1;
       if (trace_gate == (const char*)-1) trace_gate = getenv("LD_TRACE_SURFACE_GATE");
       int trace_open = 1;
-      if (trace_gate && trace_surf && tn < 3 && target < g.n_surfaces &&
-          g.surfaces[target].offset == trace_surf) {
+      if (trace_gate && tn < 3 &&
+          ((tk && live_legacy_pso_key() == tk) ||
+           (trace_surf && target < g.n_surfaces && g.surfaces[target].offset == trace_surf))) {
           FILE* gate = fopen(trace_gate, "rb"); trace_open = gate != NULL;
           if (gate) fclose(gate);
       }
@@ -7174,6 +7179,32 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                             g.surfaces[sampled].w, g.surfaces[sampled].h);
             }
             slots[u] = SRV_SURFACE_BASE + sampled;
+            /* Inspect the actual GPU source of a selected draw, rather than
+             * stale guest VRAM at the same address. Inert without a key. */
+            { static u64 inspect_key = UINT64_MAX;
+              static u32 captures[SRV_TABLE_SIZE];
+              if (inspect_key == UINT64_MAX) {
+                  const char* e = getenv("LD_TRACE_TEXTURES");
+                  inspect_key = e ? _strtoui64(e, NULL, 16) : 0;
+              }
+              if (inspect_key && captures[u] < 3 &&
+                  inspect_key == live_legacy_pso_key()) {
+                  const char* gate_path = getenv("LD_TRACE_SURFACE_GATE");
+                  struct stat gate_stat;
+                  const char* dir = getenv("LD_HLSL_DUMP");
+                  if (dir && (!gate_path || stat(gate_path, &gate_stat) == 0)) {
+                      char path[MAX_PATH * 2];
+                      snprintf(path, sizeof(path), "%s/texture_%u_%u_%08X.ppm",
+                               dir, u, ++captures[u], g.surfaces[sampled].offset);
+                      fprintf(stderr, "[texture-trace] frame=%u unit=%u declared=%ux%u "
+                              "surface=%d actual=%ux%u generation=%llu\n", g_ld_frames,
+                              u, t.width, t.height, sampled, g.surfaces[sampled].w,
+                              g.surfaces[sampled].h,
+                              (unsigned long long)g.surfaces[sampled].last_draw_generation);
+                      ld_dump_surface_ppm(path, &g.surfaces[sampled]);
+                  }
+              }
+            }
             g_ld_bind_surf++;
             int seen = 0;
             for (u32 k = 0; k < n_surf_used; k++) if (surf_used[k] == (u32)sampled) seen = 1;
@@ -7573,6 +7604,10 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         fflush(s_csv_file);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
+    const D3D12_RECT clear_rect = rsx_clear_rect(g.surfaces[target].w, g.surfaces[target].h,
+        rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL), rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL),
+        g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] || g.rsx.seen[M_SCISSOR_VERTICAL >> 2]);
+    if (clear_rect.left >= clear_rect.right || clear_rect.top >= clear_rect.bottom) return;
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A)) {
         const u32 c = rsx_dsp_clear_color(&g.rsx);
         float col[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
@@ -7588,8 +7623,11 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         { static int ct = -1;
           if (ct < 0) ct = getenv("LD_CLEAR_TEST") ? 1 : 0;
           if (ct) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; } }
-        g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, 0, NULL);
-        ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
+        HRESULT clear_hr = rsx_color_clear_record(&g.color_clear, g.dev, g.list, rtv,
+            g.surfaces[target].fmt, g.surfaces[target].w, g.surfaces[target].h,
+            &clear_rect, (mask >> 4) & 15u, col);
+        if (SUCCEEDED(clear_hr)) ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
+        else fprintf(stderr, "[live-clear] failed mask=%02X hr=%08lX\n", mask, (unsigned long)clear_hr);
     }
     if ((mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) && g.depth) {
         rsx_dsp_surface sf;
@@ -7610,7 +7648,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
             const float cd = (float)(zs >> 8) / 16777215.0f;
             g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
-                clear_flags, zs ? cd : 1.0f, (UINT8)(zs & 0xFFu), 0, NULL);
+                clear_flags, cd, (UINT8)(zs & 0xFFu), 1, &clear_rect);
         }
         if (zslot) {
             g.zdepths[zslot - 1].cleared = 1;
@@ -10118,6 +10156,7 @@ void rsx_live_draw_shutdown(void)
         g.depth_snapshot_rootsig->lpVtbl->Release(
             g.depth_snapshot_rootsig);
     if (g.rootsig_x) g.rootsig_x->lpVtbl->Release(g.rootsig_x);
+    rsx_color_clear_release(&g.color_clear);
     if (g.swap) g.swap->lpVtbl->Release(g.swap);
     if (g_ld_info_queue) {
         g_ld_info_queue->lpVtbl->Release(g_ld_info_queue);
