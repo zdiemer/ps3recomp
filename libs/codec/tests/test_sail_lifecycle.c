@@ -15,6 +15,13 @@ void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t ea, uint64_t v, int w) { (void)ea; (void)v; (void)w; }
 
 static unsigned calls, boot_completed;
+static unsigned host_starts, host_stops;
+static void host_playback(u32 player, const char* uri, int started, void* user)
+{
+    assert(player == 0x1000 && user == (void*)0x1234);
+    assert(!strcmp(uri,"x-cell-fs:///intro.pam"));
+    if (started) host_starts++; else host_stops++;
+}
 static void callback(uint32_t opd, uint64_t user, uint64_t event, uint64_t value,
                      uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
@@ -52,7 +59,22 @@ int main(void)
     assert(vm_base[0x7FFF] == 0xCD && vm_base[0x8008] == 0xCD && vm_base[0x8018] == 0xCD);
     assert(cellSailPlayerGetParameter(0x1000, 25, 0, 0x8010) < 0);
     assert(cellSailPlayerSetParameter(0x1000, 36, 0, 0) < 0);
+    const char* uri="x-cell-fs:///intro.pam";
+    memcpy(vm_base+0x9000,uri,strlen(uri)+1);
+    assert(cellSailPlayerCreateDescriptor(0x1000,0,0,(char*)0x9000,
+                                         (CellSailDescriptorHandle*)0x8800)==CELL_OK);
+    u32 desc=vm_read32(0x8800);
+    assert(cellSailPlayerAddDescriptor(0x2000,desc)<0);
+    assert(cellSailPlayerAddDescriptor(0x1000,desc)==CELL_OK);
+    cellSail_set_host_playback_callback(host_playback,(void*)0x1234);
+    assert(cellSailPlayerStart(0x1000)==CELL_OK);
+    assert(host_starts==1 && host_stops==0);
+    assert(cellSailPlayerStop(0x1000)==CELL_OK);
+    assert(host_stops==1);
+    assert(cellSailPlayerCloseStream(0x1000)==CELL_OK && host_stops==2);
     assert(cellSailPlayerFinalize(0x1000) == CELL_OK);
+    assert(host_stops==3);
+    cellSail_set_host_playback_callback(0,0);
     assert(cellSailPlayerBoot(0x1000, 0) < 0);
     for (u32 i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
         assert(cellSailPlayerInitialize(0x1000 + i * 0x400, 1, 0x2000, 0x4000,
