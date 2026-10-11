@@ -37,6 +37,7 @@
 #include "ppu_recomp.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
+#include "../spu/spu_overlay_registry.h"
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #ifndef _WIN32
@@ -3418,6 +3419,12 @@ extern "C" uint32_t ppu_load_elf(const char* path)
         if (p_memsz > p_filesz)
             memset(vm_base + (uint32_t)p_vaddr + (uint32_t)p_filesz, 0, (size_t)(p_memsz - p_filesz));
         g_ppu_image_ranges.push_back({p_vaddr, p_vaddr + (p_memsz > p_filesz ? p_memsz : p_filesz)});
+        /* Embedded PIC modules are DMA-loaded later by guest SPU workers.
+         * Match their complete executable segments to compiled translations;
+         * binding carries no title addresses or initial-instruction guesses. */
+        if (p_vaddr <= UINT32_MAX && p_filesz <= UINT32_MAX &&
+            p_vaddr + p_filesz <= 0x100000000ULL)
+            spu_overlay_bind_embedded((uint32_t)p_vaddr, vm_base + (uint32_t)p_vaddr, (uint32_t)p_filesz);
         loaded++;
     }
     free(file);

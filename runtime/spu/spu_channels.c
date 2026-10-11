@@ -1680,7 +1680,25 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
     spu_ovl_dump(ctx, ea, lsa, ls, size);
     spu_code_note_overwrite(ctx, ea, lsa, size);
     uint32_t bound_span = 0;
-    int bound_image = spu_overlay_lookup_bound(ea, &bound_span);
+    /* Guest copies can relocate PIC modules into reusable heap staging buffers.
+     * Match the entire compiled segment, even when DMA includes padding. */
+    uint32_t offset = 0;
+    int matched = 0, bound_image;
+    while ((bound_image = spu_overlay_match_loaded_range(ls, size, lsa, &offset, &bound_span)) != 0) {
+        for (unsigned slot = 0; slot < 4; ++slot) {
+            if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa + offset)
+                continue;
+            ctx->resident_code[slot].lsa = lsa + offset;
+            ctx->resident_code[slot].size = bound_span;
+            ctx->resident_code[slot].source_ea = ea + offset;
+            ctx->resident_code[slot].image_id = bound_image;
+            matched = 1;
+            break;
+        }
+        offset += bound_span;
+    }
+    if (matched) return;
+    bound_image = spu_overlay_lookup_bound_at(ea, lsa, &bound_span);
     if (bound_image && (uint64_t)lsa + bound_span <= SPU_LS_SIZE) {
         for (unsigned slot = 0; slot < 4; ++slot) {
             if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)

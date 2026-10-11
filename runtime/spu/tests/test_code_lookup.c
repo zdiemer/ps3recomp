@@ -47,6 +47,12 @@ int main(void)
     spu_code_note_overwrite(ctx, 0x90000, 0x1080, 128);
     assert(spu_lookup_resident(ctx, 0x1000) == task);
     assert(spu_lookup_resident(ctx, 0x2000) == second);
+    /* A staging buffer can change contents without changing its source EA.
+     * A complete reload must be identified again before restoring ownership. */
+    ctx->resident_code[0].image_id = 2;
+    spu_code_note_overwrite(ctx, 0x50000, 0x1000, 0x100);
+    assert(spu_lookup_resident(ctx, 0x1000) == task);
+    assert(spu_lookup_resident(ctx, 0x2000) == second);
     free(ctx);
     puts("SPU resident code lookup tests passed.");
     return 0;
