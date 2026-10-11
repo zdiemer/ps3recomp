@@ -1531,6 +1531,15 @@ void cellGcm_rsx_process_fifo(void)
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
 }
 
+/* Diagnostic query for the FIFO consumer thread, before its idle wait. A
+ * nonempty FIFO can also be blocked on a semaphore; it does not imply that
+ * queued commands are executable. This does not consume or publish work. */
+int cellGcm_fifo_has_queued_work(void)
+{
+    if (!s_gcm_context_ea && !s_gcm_syscall_mode) return 0;
+    return s_fifo_getoff != vm_read32(GCM_CONTROL_GUEST_ADDR);
+}
+
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
