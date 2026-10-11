@@ -2,6 +2,30 @@
 #include "cellSpurs.h"
 #include "../../runtime/ppu/ppu_memory.h"
 
+/* Shared with the SDK's SPU queue routines: W0 pop, W1 push, W2 entry size,
+ * W3 depth; the next quadword starts with the 64-bit buffer EA and ends with
+ * direction. The old initializer put size at +0x10 and buffer at +0x18:
+ * Haze's consumer consequently issued size=0, EA=0x0000001000000080. */
+s32 _cellSpursQueueInitialize(u64 spurs_ea, u64 taskset_ea, u64 queue_ea,
+                            u64 buffer_ea, u32 size, u32 depth, u32 direction)
+{
+    (void)spurs_ea;
+    u32 q = (u32)queue_ea, buffer = (u32)buffer_ea;
+    if (!q || !buffer) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if ((q & 127u) || (buffer & 15u)) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (!size || (size & 15u) || !depth || depth > 0x3FFFFFFFu || direction > 2 ||
+        (u64)buffer + (u64)size * depth > 0x100000000ull)
+        return CELL_SPURS_TASK_ERROR_INVAL;
+
+    memset(vm_base + q, 0, 128);
+    vm_write32(q + 0x08, size);
+    vm_write32(q + 0x0C, depth);
+    vm_write64(q + 0x10, buffer_ea);
+    vm_write32(q + 0x1C, direction);
+    vm_write64(q + 0x70, taskset_ea);
+    return CELL_OK;
+}
+
 void spu_lockline_lock(void);
 void spu_lockline_unlock(void);
 
