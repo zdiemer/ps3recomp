@@ -940,7 +940,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
 
-            printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
+            if (ps3_log_verbose()) printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
                    " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
                    s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
                    context_ea, task_lsp[0], task_lsp[1], task_lsp[2], task_lsp[3]);
