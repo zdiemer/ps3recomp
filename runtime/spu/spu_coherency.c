@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -81,14 +82,10 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
  * one missed event on the very first reservation of the run. */
 static int s_coh_armed;
 
-/* Every live virtual context may retain a reservation between scheduling
- * quanta; physical SPU count is not a bound on this set. All access is under
- * the lock-line lock. Nodes are removed before their context's lifetime ends. */
-typedef struct spu_coh_entry {
-    spu_context* ctx;
-    struct spu_coh_entry* next;
-} spu_coh_entry;
-static spu_coh_entry* s_coh_ctxs;
+/* Compact live set, always accessed under the lock-line lock. Async jobs may
+ * outnumber physical SPUs, so an eight-entry ceiling can lose real holders. */
+static spu_context** s_coh_ctxs;
+static size_t s_coh_count, s_coh_capacity;
 
 unsigned long g_spu_lr_raise = 0;
 
@@ -99,17 +96,20 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     s_coh_armed = 1;
 
     if (!ctx) return;
-    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
-        if (entry->ctx == ctx) return;
-    spu_coh_entry* entry = (spu_coh_entry*)malloc(sizeof(*entry));
-    if (!entry) {
-        fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
-        fflush(stderr);
-        abort(); /* A missed holder loses invalidation events, including ABA. */
+    /* Search the whole live set before inserting. Filling an early hole
+     * before finding an existing later entry registered the same object twice;
+     * unregister then left a dangling pointer after its first removal. */
+    for (size_t i = 0; i < s_coh_count; i++) {
+        if (s_coh_ctxs[i] == ctx) return;
     }
-    entry->ctx = ctx;
-    entry->next = s_coh_ctxs;
-    s_coh_ctxs = entry;
+    if (s_coh_count == s_coh_capacity) {
+        size_t capacity = s_coh_capacity ? s_coh_capacity * 2 : 8;
+        if (capacity < s_coh_capacity || capacity > SIZE_MAX / sizeof(*s_coh_ctxs)) abort();
+        spu_context** holders = (spu_context**)realloc(s_coh_ctxs, capacity * sizeof(*holders));
+        if (!holders) { fputs("[spu-coh] cannot retain reservation holders\n",stderr); abort(); }
+        s_coh_ctxs = holders; s_coh_capacity = capacity;
+    }
+    s_coh_ctxs[s_coh_count++] = ctx;
 }
 
 /* Drop a context from the reserving set.
@@ -131,13 +131,9 @@ void spu_coh_unregister(spu_context* ctx)
      * (or its whole async thread) was gone. GH3 at -O2 crashed that way in
      * spu_coh_notify_write, reading a freed thread stack. */
     spu_lockline_lock();
-    for (spu_coh_entry** link = &s_coh_ctxs; *link; link = &(*link)->next) {
-        if ((*link)->ctx != ctx) continue;
-        spu_coh_entry* entry = *link;
-        *link = entry->next;
-        free(entry);
-        break;
-    }
+    for (size_t i = 0; i < s_coh_count;)
+        if (s_coh_ctxs[i] == ctx) s_coh_ctxs[i] = s_coh_ctxs[--s_coh_count];
+        else ++i;
     spu_lockline_unlock();
 }
 
@@ -150,19 +146,15 @@ void spu_coh_unregister(spu_context* ctx)
 void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 {
     spu_lockline_lock();
-    for (spu_coh_entry** link = &s_coh_ctxs; *link;) {
-        spu_coh_entry* entry = *link;
-        uintptr_t c = (uintptr_t)entry->ctx;
+    for (size_t i = 0; i < s_coh_count;) {
+        uintptr_t c = (uintptr_t)s_coh_ctxs[i];
         if (c >= lo && c < hi) {
             static int _n = 0;
             if (_n++ < 16)
                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
-                        (void*)c, entry->ctx->image_id);
-            *link = entry->next;
-            free(entry);
-        } else {
-            link = &entry->next;
-        }
+                        (void*)c, s_coh_ctxs[i]->image_id);
+            s_coh_ctxs[i] = s_coh_ctxs[--s_coh_count];
+        } else ++i;
     }
     spu_lockline_unlock();
 }
@@ -187,8 +179,8 @@ int spu_coh_is_reserved(uint32_t addr)
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
-    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
-        spu_context* c = entry->ctx;
+    for (size_t i = 0; i < s_coh_count; i++) {
+        spu_context* c = s_coh_ctxs[i];
         if (!c || (const void*)c == self) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
             c->event_status |= SPU_EVENT_LR;
@@ -202,8 +194,8 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
-    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
-        spu_context* c = entry->ctx;
+    for (size_t i = 0; i < s_coh_count; i++) {
+        spu_context* c = s_coh_ctxs[i];
         if (!c) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
             c->event_status |= SPU_EVENT_LR;
