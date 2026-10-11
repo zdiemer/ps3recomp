@@ -556,7 +556,7 @@ class SPULifter:
                     func.body_lines.append(f"    spu_trace_pc(ctx, 0x{insn.addr:X});")
                 func.body_lines.append(f"    {c}")
                 if self.trace and insn.mnemonic not in _NO_RT_WRITE:
-                    rt_idx = insn.raw & 0x7F
+                    rt_idx = _dest_reg(insn)
                     func.body_lines.append(f"    spu_trace_rt(ctx, {rt_idx});")
             last_insn = insn
 
