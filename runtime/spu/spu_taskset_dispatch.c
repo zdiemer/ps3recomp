@@ -3,6 +3,7 @@
  * race a guest PUTLLC. Image lookup and host thread creation happen unlocked. */
 #include "spu_workload.h"
 #include "spu_coherency.h"
+#include "../ps3_log.h"
 #include "../../libs/spurs/spurs_taskset.h"
 #include <stdio.h>
 #include <string.h>
@@ -80,7 +81,8 @@ void spu_taskset_start_ready(uint32_t ea)
             spu_taskset_release(ea, task); /* leave guest ready state for retry */
             continue;
         }
-        fprintf(stderr, "[taskset] scheduled task %u of 0x%08X elf=0x%08X\n", task, ea, elf);
+        if (ps3_log_verbose())
+            fprintf(stderr, "[taskset] scheduled task %u of 0x%08X elf=0x%08X\n", task, ea, elf);
     }
 }
 

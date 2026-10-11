@@ -33,6 +33,7 @@
 
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
+#include "../ps3_log.h"
 #include "ppu_recomp.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
@@ -3749,11 +3750,10 @@ extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
 
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
-    /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
-     * (stderr); with a redirected block-buffered stdout, printf lines sat in
-     * the buffer for minutes and were LOST when the run was killed -- which
-     * made "the log line is absent" unusable as evidence. */
-    setvbuf(stdout, NULL, _IONBF, 0);
+    /* Preserve the host runner's buffering in quiet runs. Unbuffered Windows
+     * stdio can issue a pipe write for each character and stall task dispatch.
+     * Verbose diagnostics retain the immediate-output behavior. */
+    if (ps3_log_verbose()) setvbuf(stdout, NULL, _IONBF, 0);
 
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
     uint32_t code = 0, toc = 0;

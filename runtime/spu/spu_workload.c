@@ -17,6 +17,7 @@
 #else
 #include <pthread.h>
 #include <errno.h>
+#include <time.h>
 #include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
 #endif
 
@@ -191,7 +192,7 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
         return 0;
     }
 
-    fprintf(stderr,
+    if (ps3_log_verbose()) fprintf(stderr,
         "[spu_workload] dispatch HIT fp=0x%016llX entry=0x%05X args=0x%08X image=%d -> running\n",
         (unsigned long long)fp, entry, args_ea, image_id);
 
@@ -317,8 +318,23 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
     return slot;
 }
 
+static uint64_t spu_job_clock_ms(void)
+{
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+#endif
+}
+
 static void spu_async_run(spu_async_job* j)
 {
+    /* Opt-in wall times distinguish taskset-lock contention, image setup and
+     * actual lifted execution. Persistent tasks report only when they exit. */
+    const int timing = getenv("SPU_JOB_TIMING") != NULL;
+    const uint64_t job_start = timing ? spu_job_clock_ms() : 0;
     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
      * back to a fresh per-dispatch LS when disabled / no taskset. */
     spu_ts_ls_slot* ts_slot = NULL;
@@ -515,9 +531,9 @@ static void spu_async_run(spu_async_job* j)
                  * both audio tasks run task 1's descriptor). */
                 if (j->taskset_ea) {
                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
-                    fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                    if (ps3_log_verbose()) { fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
                             "taskset=0x%08X task=%u\n", j->image_id,
-                            j->taskset_ea, j->taskid); fflush(stderr);
+                            j->taskset_ea, j->taskid); fflush(stderr); }
                 }
             }
             /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
@@ -603,8 +619,18 @@ static void spu_async_run(spu_async_job* j)
                 #undef RDBE32
             }
             spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
+            const uint64_t execute_start = timing ? spu_job_clock_ms() : 0;
             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0, 0);
+            if (timing) {
+                const uint64_t end = spu_job_clock_ms();
+                fprintf(stderr, "[spu-job-time] image=%d taskset=%08X task=%u "
+                        "setup_ms=%llu run_ms=%llu end_ms=%llu\n",
+                        j->image_id, j->taskset_ea, j->taskid,
+                        (unsigned long long)(execute_start - job_start),
+                        (unsigned long long)(end - execute_start),
+                        (unsigned long long)end);
+            }
             /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
              * the kernel re-enters it when work is signaled. Our HLE runs it once,
              * so it polls the (concurrently PPU-updated) eaContext, finds no work,
@@ -655,7 +681,7 @@ static void spu_async_run(spu_async_job* j)
                   FILE* f = fopen(path, "wb");
                   if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
                       fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
-            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+            if (rc || ps3_log_verbose()) fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
             spu_serial_release();
             if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
@@ -1117,7 +1143,7 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
         if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
     }
 
-    fprintf(stderr,
+    if (ps3_log_verbose()) fprintf(stderr,
         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
         (unsigned long long)fp, args_ea, image_id);
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
