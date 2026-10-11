@@ -96,7 +96,7 @@ static u32 s_current_display_buffer_id = 0;
  * the ticker, which presents the accumulated batch BEFORE draining further --
  * presenting on a raw flip-count change raced the drain and showed empty or
  * mixed batches (wave: black flashes, layout flicker). */
-static volatile int s_flip_pending = 0;
+static atomic_int s_flip_pending = 0;
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
 #define GCM_FLIP_MARKER 0xFEAD0100u
 /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
@@ -105,9 +105,7 @@ static volatile int s_flip_pending = 0;
 
 int cellGcm_take_flip_pending(void)
 {
-    int v = s_flip_pending;
-    s_flip_pending = 0;
-    return v;
+    return atomic_exchange_explicit(&s_flip_pending, 0, memory_order_acquire);
 }
 
 
@@ -1194,8 +1192,7 @@ int cellGcm_take_flip_pending_synced(void)
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
     u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
     if (get != put) return 0;   /* frame not fully drained yet */
-    s_flip_pending = 0;
-    return 1;
+    return cellGcm_take_flip_pending();
 }
 
 /* ---- fence (SET_REFERENCE) observability ---------------------------------
@@ -1693,8 +1690,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
                 s_current_display_buffer_id = w & 7u;
-                s_flip_pending = 1;
                 s_flip_request_count++;
+                atomic_store_explicit(&s_flip_pending, 1, memory_order_release);
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
             }
@@ -2315,8 +2312,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
      * the drain does this half when it reaches it (see the 0xFEAD case). */
     if (!in_fifo) {
         s_current_display_buffer_id = bufferId;
-        s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
         s_flip_request_count++;
+        atomic_store_explicit(&s_flip_pending, 1, memory_order_release);
     }
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
@@ -2415,6 +2412,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_request_count++;
     s_last_flip_time = get_timestamp_ns();
+    atomic_store_explicit(&s_flip_pending, 1, memory_order_release);
 
     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
      * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer

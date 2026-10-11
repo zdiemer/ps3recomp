@@ -582,7 +582,7 @@ static HANDLE g_ld_present_thread_handle = NULL;
 #endif
 
 static void ld_present_measure_dump(void);
-#if defined(YZ_PERF_PROFILE)
+#if defined(YZ_PERF_PROFILE) && defined(YZ_SPU_PROFILE)
 extern void spu_perf_window_begin(u32 guest_frame);
 extern void spu_perf_window_dump(u32 guest_frame);
 extern void spu_perf_frame_sample_record(u32 guest_frame);
@@ -678,7 +678,7 @@ static void ld_present_measure_record(u32 guest_frame)
             }
         }
         const int game_present = guest_frame == g_ld_frames + 1u;
-#if defined(YZ_PERF_PROFILE)
+#if defined(YZ_PERF_PROFILE) && defined(YZ_SPU_PROFILE)
         if (sample_present && game_present &&
             guest_frame >= sample_start && guest_frame <= sample_end)
             spu_perf_frame_sample_record(guest_frame);
@@ -687,13 +687,13 @@ static void ld_present_measure_record(u32 guest_frame)
             yz_ppu_perf_window_begin(guest_frame);
         else if (sample_present && game_present && guest_frame == sample_end) {
             yz_ppu_perf_window_dump(guest_frame);
-#if defined(YZ_PERF_PROFILE)
+#if defined(YZ_PERF_PROFILE) && defined(YZ_SPU_PROFILE)
             spu_perf_frame_sample_dump(sample_start, sample_end);
 #endif
         }
     }
 #endif
-#if defined(YZ_PERF_PROFILE)
+#if defined(YZ_PERF_PROFILE) && defined(YZ_SPU_PROFILE)
     if (guest_frame == 1578u)
         spu_perf_window_begin(guest_frame);
     else if (guest_frame == 1582u)
@@ -8382,10 +8382,10 @@ double rsx_live_draw_get_present_fps(void)
             (double)(newest->qpc - oldest->qpc) /
             (double)g_ld_qpc_frequency;
         /*
-         * Keep at least a 15-second view and about 30 intervals when possible;
-         * cap at 30 seconds so sub-1-FPS operation still updates usefully.
+         * Show recent performance. A 15-second average carried fast menu
+         * frames into gameplay and hid stalls behind a misleading FPS value.
          */
-        if (elapsed >= 30.0 || (elapsed >= 15.0 && intervals >= 30u))
+        if (elapsed >= 2.0 || (elapsed >= 1.0 && intervals >= 10u))
             break;
     }
 
