@@ -328,9 +328,10 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
  * EAs (the generic adapter would pass them raw and the C sysPrxForUser impl
  * deref'd them as host pointers -> AV during cellSpurs init). A no-op wait is
  * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
- * handshakes, not long-term blocking. sys_lwcond_t is 8 bytes: +0x00 u32
- * lwmutex EA, +0x04 u32 lwcond queue id. Titles read +0x00 themselves (an
- * lwcond whose lwmutex reads 0 is treated as invalid). */
+ * handshakes, not long-term blocking. The retail sys_lwcond_t is 8 bytes:
+ * +0x00 lwmutex EA (be32), +0x04 lwcond_queue id. Writing a 64-bit pointer
+ * overruns the object and corrupts adjacent guest state (Haze stores its
+ * physics allocator callback immediately after this condition variable). */
 static void sys_lwcond_create(ppu_context* ctx)
 {
     static uint32_t s_lwcond_id = 0x4C000000u;
