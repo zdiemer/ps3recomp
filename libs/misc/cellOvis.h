@@ -1,8 +1,7 @@
 /*
- * ps3recomp - cellOvis HLE
+ * ps3recomp - cellOvis SPU overlay staging
  *
- * System overlay notifications. Stub — init/term work,
- * overlay operations are no-ops.
+ * Retail ELF staging APIs are implemented; legacy convenience APIs are stubs.
  */
 
 #ifndef PS3RECOMP_CELL_OVIS_H
@@ -15,7 +14,10 @@
 extern "C" {
 #endif
 
-/* Error codes */
+/* Retail overlay error codes. Legacy convenience APIs below are separate. */
+#define CELL_OVIS_ERROR_INVAL 0x80410402
+#define CELL_OVIS_ERROR_ABORT 0x8041040C
+#define CELL_OVIS_ERROR_ALIGN 0x80410416
 #define CELL_OVIS_ERROR_NOT_INITIALIZED     0x80410701
 #define CELL_OVIS_ERROR_ALREADY_INITIALIZED 0x80410702
 #define CELL_OVIS_ERROR_INVALID_ARGUMENT    0x80410703
@@ -27,7 +29,8 @@ typedef u32 CellOvisHandle;
 s32 cellOvisInit(void);
 s32 cellOvisTerm(void);
 
-s32 cellOvisGetOverlayTableSize(const char* filePath, u32* tableSize);
+s32 cellOvisGetOverlayTableSize(u32 elf);
+s32 cellOvisInitializeOverlayTable(u32 table, u32 elf);
 s32 cellOvisCreateOverlay(const void* table, u32 tableSize, CellOvisHandle* handle);
 s32 cellOvisDestroyOverlay(CellOvisHandle handle);
 
