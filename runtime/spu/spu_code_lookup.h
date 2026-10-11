@@ -4,7 +4,26 @@
 #include "spu_context.h"
 
 typedef void (*spu_code_fn)(spu_context*);
+#ifdef __cplusplus
+extern "C" {
+#endif
 extern spu_code_fn spu_lookup(uint32_t addr, int image_id);
+#ifdef __cplusplus
+}
+#endif
+
+static inline void spu_code_note_overwrite(spu_context* ctx, uint32_t ea,
+                                            uint32_t lsa, uint32_t size)
+{
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!ctx->resident_code[i].image_id) continue;
+        uint32_t base = ctx->resident_code[i].lsa;
+        uint32_t end = base + ctx->resident_code[i].size;
+        if (lsa < end && (uint64_t)lsa + size > base &&
+            (lsa < base || ea != ctx->resident_code[i].source_ea + (lsa - base)))
+            ctx->resident_code[i].image_id = 0;
+    }
+}
 
 /* Every execution path must resolve the bytes currently resident at the PC.
  * A bounded overlay owns its entire span, including entries not lifted: a

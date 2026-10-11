@@ -300,6 +300,14 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     int _halted = 0;
     { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
       _halted = spu_run_with_halt(entry, &ctx); }               /* run with halt pad   */
+    { const char* image = getenv("SPU_JOB_TRACE_IMG");
+      if (image && atoi(image) == image_id) {
+          fprintf(stderr, "[spu-job-return] img=%d halted=%d status=%X stop=%X "
+                  "pc=%05X lr=%05X r3=%08X code=%d\n", image_id, _halted,
+                  (unsigned)ctx.status, (unsigned)ctx.stop_code,
+                  ctx.pc & SPU_LS_MASK, ctx.gpr[0]._u32[0] & SPU_LS_MASK,
+                  ctx.gpr[3]._u32[0], ctx.resident_code[0].image_id);
+      } }
     /* Raw-worker run summary (env SPU_WORKER_TRACE). A worker that produces no
      * outbound word leaves the PPU blocked in sys_event_queue_receive forever,
      * and the difference between "parked at its idle poll" and "fell over after

@@ -8,8 +8,7 @@
  *   - spu_indirect_branch : resolves ctx->pc to a lifted spu_func_* via a
  *     registry that generated code populates by calling spu_recomp_register().
  *
- * The MFC engine state is kept per spu_context here (spu_context.h does not
- * embed one), in a small lazily-populated registry.
+ * Each spu_context owns a lazily allocated MFC engine, released on job exit.
  */
 
 #include "spu_dma.h"
@@ -140,7 +139,8 @@ void spu_halt(spu_context* ctx)
 {
     /* Optional bounded fault artifact: one full LS/register snapshot, only at
      * a real halt assertion. Register words use guest big-endian byte order. */
-    if (ctx->status == SPU_STATUS_STOPPED_BY_HALT) {
+    if (ctx->status == SPU_STATUS_STOPPED_BY_HALT ||
+        ((ctx->pc & SPU_LS_MASK) == 0 && getenv("SPU_HALT_DUMP_AT_ZERO"))) {
         const char* prefix = getenv("SPU_HALT_DUMP");
         const char* filter = getenv("SPU_HALT_DUMP_IMG");
         static volatile LONG claimed;
@@ -1587,14 +1587,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
     spu_ovl_dump(ctx, ea, lsa, ls, size);
-    for (unsigned slot = 0; slot < 4; ++slot) {
-        if (!ctx->resident_code[slot].image_id) continue;
-        uint32_t base = ctx->resident_code[slot].lsa;
-        uint32_t end = base + ctx->resident_code[slot].size;
-        if (lsa < end && lsa + size > base &&
-            (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)))
-            ctx->resident_code[slot].image_id = 0;
-    }
+    spu_code_note_overwrite(ctx, ea, lsa, size);
     uint32_t bound_span = 0;
     int bound_image = spu_overlay_lookup_bound(ea, &bound_span);
     if (bound_image && (uint64_t)lsa + bound_span <= SPU_LS_SIZE) {
@@ -2678,6 +2671,24 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
       if (s_ti == -2) { const char* e = getenv("SPU_TRACE_IMG");
                         s_ti = e ? atoll(e) : -1; }
       if (s_ti >= 0 && ctx->image_id != (int)s_ti) { s_trace_suppress = 1; return; } }
+    /* Reserve the trace budget for later invocations of a repeated task.
+     * SPU_TRACE_ENTRY_PC names its entry; SPU_TRACE_SKIP_RUNS skips N launches.
+     * A host thread runs one task, so its selected launch stays thread-local. */
+    { static long s_skip = -1;
+      static uint32_t s_entry;
+      static volatile LONG s_runs;
+      static SPU_THREAD_LOCAL long t_run;
+      if (s_skip < 0) {
+          const char* n = getenv("SPU_TRACE_SKIP_RUNS");
+          const char* p = getenv("SPU_TRACE_ENTRY_PC");
+          s_skip = n && p ? strtol(n, 0, 0) : 0;
+          s_entry = p ? (uint32_t)strtoul(p, 0, 0) : 0;
+          if (s_skip < 0) s_skip = 0;
+      }
+      if (s_skip) {
+          if (pc == s_entry) t_run = InterlockedIncrement(&s_runs);
+          if (t_run <= s_skip) { s_trace_suppress = 1; return; }
+      } }
     s_trace_suppress = 0;
     if (s_trace_left < 0) {
         if (s_trace_left == -1) {

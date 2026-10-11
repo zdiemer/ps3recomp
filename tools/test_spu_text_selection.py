@@ -3,6 +3,7 @@ import unittest
 import struct
 
 from find_spu_functions import pick_text, collect_lifecycle_targets, detect_functions
+from build_spu_workloads import overlay_code_span
 
 
 def segment(off, vaddr, size, flags=5, kind=1, memsz=None):
@@ -11,6 +12,12 @@ def segment(off, vaddr, size, flags=5, kind=1, memsz=None):
 
 
 class TextSelectionTests(unittest.TestCase):
+    def test_overlay_code_ownership_excludes_writable_tail(self):
+        self.assertEqual(overlay_code_span(0x3080, 0x1AFC0, 0x17100), 0x14080)
+        self.assertEqual(overlay_code_span(0x3080, 0x1AFC0), 0x1AFC0)
+        for end in (0x3080, 0x3081, 0x20000):
+            with self.assertRaises(ValueError):
+                overlay_code_span(0x3080, 0x1AFC0, end)
     def test_overlay_entry_called_only_by_resident_segment(self):
         data = bytearray(0x120)
         data[:6] = b"\x7fELF\x01\x02"

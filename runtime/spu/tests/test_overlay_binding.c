@@ -32,6 +32,16 @@ int main(void)
     assert(spu_overlay_lookup_bound(0x20000, &span) == 0);
     spu_overlay_bind(0xFFFFFFF0, a, sizeof a);
     assert(spu_overlay_lookup_bound(0xFFFFFFF0, &span) == 0);
+    /* Writable data is part of content identity, but not code ownership. */
+    spu_overlay_register_fingerprint_range(fingerprint(a, 96), 96, 64, 47);
+    spu_overlay_bind(0x40000, a, 96);
+    assert(spu_overlay_lookup_bound(0x40000, &span) == 47 && span == 64);
+    a[80] = 42;
+    spu_overlay_bind(0x50000, a, 96);
+    assert(spu_overlay_lookup_bound(0x50000, &span) == 0);
+    spu_overlay_register_fingerprint_range(fingerprint(a, 96), 96, 97, 48);
+    spu_overlay_bind(0x60000, a, 96);
+    assert(spu_overlay_lookup_bound(0x60000, &span) == 0);
     puts("SPU overlay content, relocation and staging reuse checks passed");
     return 0;
 }

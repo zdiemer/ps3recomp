@@ -927,7 +927,9 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
              * signals with has to be the same number. */
             if (taskId) vm_write32((u32)(uintptr_t)taskId, i);
             (void)taskId_h;
-            taskset->taskCount++;
+            /* This is a retail BE taskset, not the legacy host struct.
+             * taskCount's native offset +4 is part of CSTS_RUNNING: writing
+             * a host counter there corrupts the task 32..63 running bits. */
 
             /* Register the task in the REAL BE taskset: writes task_info[slot]
              * (args/elf/context/ls_pattern) + sets enabled+ready bits so the PM's

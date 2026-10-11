@@ -7,6 +7,10 @@ extern "C" {
 /* Register compiled content at startup; bind its relocated PPU staging span
  * after cellOvis has copied it. No title addresses or short signatures required. */
 void spu_overlay_register_fingerprint(uint64_t fingerprint, uint32_t span, int image_id);
+/* Content identity covers the whole segment; code ownership can end before
+ * its writable data tail. code_span is relative to the segment's LS base. */
+void spu_overlay_register_fingerprint_range(uint64_t fingerprint, uint32_t span,
+                                             uint32_t code_span, int image_id);
 void spu_overlay_bind(uint32_t ea, const uint8_t* bytes, uint32_t span);
 int spu_overlay_lookup_bound(uint32_t ea, uint32_t* span);
 #ifdef __cplusplus
