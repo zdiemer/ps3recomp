@@ -72,6 +72,17 @@ typedef struct rsx_vertex_fetch_plan {
     u32 inline_stride;                       /* decoded once, at _init      */
 } rsx_vertex_fetch_plan;
 
+/* Single-consumer cache. Every hit compares the complete mapped source spans
+ * and reference list, including data replaced at the same guest address. */
+typedef struct rsx_vertex_payload_cache {
+    void* entries;
+    u64 bytes, hits, misses, bypasses, compared_bytes;
+} rsx_vertex_payload_cache;
+int rsx_vertex_fetch_cached(rsx_vertex_payload_cache* cache,
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs,
+    u32 count, u8* out);
+void rsx_vertex_payload_cache_clear(rsx_vertex_payload_cache* cache);
+
 /* Deterministic ascending-register layout; each selected register remains a
  * float4 and retains its original ATTR semantic index. */
 void rsx_vertex_layout_plan_init(

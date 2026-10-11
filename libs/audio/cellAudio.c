@@ -345,6 +345,14 @@ static void audio_backend_shutdown(void)
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
     if (!s_wasapi_render) return;
+    /* Silence only the device submission. Mixing, event notifications and the
+     * device clock still run normally, and AUDIO_WAV captures the original mix. */
+    static int muted = -1;
+    if (muted < 0) {
+        const char* setting = getenv("AUDIO_MUTE");
+        muted = setting && *setting == '1';
+        if (muted) fprintf(stderr, "[cellAudio] device output muted; mixing/capture active\n");
+    }
 
     UINT32 padding = 0;
     s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
@@ -360,7 +368,8 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     HRESULT hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
     if (SUCCEEDED(hr) && buf) {
         memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
-        s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples, 0);
+        s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples,
+            muted ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
     }
 }
 

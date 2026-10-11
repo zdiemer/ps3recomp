@@ -96,6 +96,30 @@ static void cache_tests(void)
     texture_cache_unlink(3001); assert(g.textures[3002].hash_next == 3001);
     texture_cache_unlink(3002); assert(g.texture_buckets[3] == 3001);
     memset(g.textures,0,sizeof(g.textures)); memset(g.texture_buckets,0,sizeof(g.texture_buckets));
+    // A failed decode after saturation must be cached too, with one retry per
+    // later frame. Otherwise every draw rescans all 4096 LRU candidates.
+    g.n_textures=MAX_TEXTURES;
+    for (u32 i=0; i<MAX_TEXTURES; ++i) {
+        t.offset=i*128; t.format=0x86; t.width=t.height=64; t.dimension=2;
+        texcache_t* e=&g.textures[i];
+        e->offset=t.offset; e->format=t.format; e->width=e->height=64;
+        e->dimension=2; e->mipmaps=t.mipmaps; e->remap=t.remap&0xFFFF;
+        e->last_use_serial=i+1;
+        texture_cache_link(i,texture_cache_bucket(&t));
+    }
+    t.offset=0x01E30000; t.format=0xB2; t.width=t.height=2048; t.pitch=4096;
+    const u64 failures=g_ld_texture_decode_fail, evictions=g_ld_texture_cache_evictions;
+    for (u32 i=0; i<1000; ++i) assert(texture_srv_slot(&t)==SRV_WHITE);
+    assert(g_ld_texture_decode_fail==failures+1);
+    assert(g_ld_texture_cache_evictions==evictions+1);
+    assert(texture_cache_find(&t,texture_cache_bucket(&t))!=UINT32_MAX);
+    ++g_ld_frames;
+    for (u32 i=0; i<1000; ++i) assert(texture_srv_slot(&t)==SRV_WHITE);
+    assert(g_ld_texture_decode_fail==failures+2);
+    assert(g_ld_texture_cache_evictions==evictions+1);
+    memset(g.textures,0,sizeof(g.textures)); memset(g.texture_buckets,0,sizeof(g.texture_buckets));
+    g.n_textures=0; g_ld_frames=0;
+    puts("Full texture cache: failed descriptor retained; retry bounded to once per frame");
 }
 static void fetch_tests(void)
 {
@@ -123,6 +147,75 @@ static void fetch_tests(void)
             assert(memcmp(scalar,batch,sizeof(batch))==0);
         }
     puts("Batch vertex fetch matches scalar: types, sizes, divisors, disabled attributes, 20-bit wrap");
+    {
+        rsx_vertex_payload_cache cache={0};
+        for (u32 a=0; a<3; ++a) {
+            p.attr[a].desc.frequency=0; p.attr[a].desc.type=a==1?0:RSX_VTX_TYPE_FLOAT;
+            p.attr[a].desc.size=4; p.attr[a].elem_size=16;
+        }
+        rsx_vertex_fetch_plan_prepare(&p,refs,64);
+        assert(rsx_vertex_fetch_cached(&cache,&p,refs,64,batch));
+        assert(cache.misses==1 && cache.hits==0);
+        assert(rsx_vertex_fetch_cached(&cache,&p,refs,64,batch));
+        assert(cache.hits==1);
+        for (u32 i=0; i<128; ++i) {
+            guest[i]^=0x80; // Same guest EA, different contents.
+            const u64 misses=cache.misses;
+            assert(rsx_vertex_fetch_cached(&cache,&p,refs,64,batch));
+            assert(cache.misses==misses+1);
+            for (u32 j=0; j<64; ++j) assert(rsx_vertex_fetch_one(&p,&refs[j],scalar+j*48));
+            assert(!memcmp(scalar,batch,sizeof(batch)));
+            guest[i]^=0x80;
+        }
+        // Changing references, format, defaults, or fallback divisors must also
+        // agree with the independent scalar resolver, never reuse stale output.
+        for (u32 trial=0; trial<128; ++trial) {
+            refs[trial%64].vertex_id=trial%8;
+            p.attr[0].desc.type=1+trial%7;
+            p.attr[0].elem_size=rsx_vertex_attrib_size(p.attr[0].desc.type,4);
+            p.attr[1].default_value[0]=(float)trial;
+            p.attr[2].desc.frequency=trial%3;
+            rsx_vertex_fetch_plan_prepare(&p,refs,64);
+            assert(rsx_vertex_fetch_cached(&cache,&p,refs,64,batch));
+            for (u32 j=0; j<64; ++j) assert(rsx_vertex_fetch_one(&p,&refs[j],scalar+j*48));
+            assert(!memcmp(scalar,batch,sizeof(batch)));
+        }
+        assert(cache.bytes<=128ull*1024*1024);
+        rsx_vertex_payload_cache_clear(&cache);
+        assert(!cache.entries && !cache.bytes);
+        puts("Vertex cache: full-span mutation, reused EA, references, formats, defaults, divisors match scalar");
+    }
+    {
+        rsx_vertex_fetch_plan exact={0}; rsx_vertex_ref ref={0};
+        rsx_vertex_layout_plan_init(&exact.layout,1);
+        exact.attr[0].desc.type=RSX_VTX_TYPE_SINT16;
+        exact.attr[0].stable_base=guest;
+        for (u32 size=1; size<=4; ++size) {
+            exact.attr[0].desc.size=size;
+            for (u32 word=0; word<=65535; ++word) {
+                for (u32 lane=0; lane<size; ++lane) {
+                    const u16 v=(u16)(word+lane*17011);
+                    guest[lane*2]=(u8)(v>>8); guest[lane*2+1]=(u8)v;
+                }
+                float expected[4], actual[4];
+                assert(rsx_vertex_decode_element(RSX_VTX_TYPE_SINT16,size,guest,expected));
+                assert(rsx_vertex_fetch_many(&exact,&ref,1,(u8*)actual));
+                assert(memcmp(actual,expected,sizeof(actual))==0);
+            }
+        }
+        u8* page=VirtualAlloc(NULL,8192,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+        assert(page); DWORD old;
+        assert(VirtualProtect(page+4096,4096,PAGE_NOACCESS,&old));
+        for (u32 size=1; size<=4; ++size) {
+            exact.attr[0].desc.size=size;
+            exact.attr[0].stable_base=page+4096-size*2;
+            memset((void*)exact.attr[0].stable_base,0xA5,size*2);
+            float actual[4];
+            assert(rsx_vertex_fetch_many(&exact,&ref,1,(u8*)actual));
+        }
+        VirtualFree(page,0,MEM_RELEASE);
+        puts("SINT16 batch: every signed value/lane matches; protected tails do not overread");
+    }
     rsx_vertex_remap remap={0};
     for (u32 trial=0; trial<128; ++trial) {
         rsx_vertex_ref input[64], actual[64], expected[64]; u32 map[64], used=0;

@@ -85,6 +85,17 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <stdio.h>
 #include <stdlib.h>
 
+static rsx_vertex_payload_cache g_ld_vertex_cache;
+static int g_ld_vertex_cache_enabled=-1;
+static int ld_vertex_cache_enabled(void)
+{
+    if (g_ld_vertex_cache_enabled<0) {
+        const char* option=getenv("RSX_VERTEX_CACHE");
+        g_ld_vertex_cache_enabled=option && *option=='1';
+    }
+    return g_ld_vertex_cache_enabled;
+}
+
 #if defined(YZ_PERF_CLEAN)
 #define LD_DIAG_ENABLED(name) 0
 #else
@@ -2595,6 +2606,18 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     const u32 i = texture_cache_find(t, bucket);
     if (i != UINT32_MAX) {
         texcache_t* entry = &g.textures[i];
+        /* Failed decodes need a cache identity too. Retry at most once per
+         * frame so transient unmapped data can recover, without a full LRU
+         * scan and decode attempt at every binding of an unsupported format. */
+        if (!entry->tex && entry->last_hash_frame != g_ld_frames) {
+            entry->last_hash_frame=g_ld_frames;
+            entry->tex=decode_guest_texture_profiled(t,remap);
+            if (entry->tex) {
+                int readable=0;
+                entry->content_hash=texture_content_hash(t,&readable);
+                write_texture_srv(i,entry);
+            } else ++g_ld_texture_decode_fail;
+        }
         if (refresh_enabled && entry->tex &&
             entry->last_hash_frame != g_ld_frames) {
             int readable = 0;
@@ -2690,7 +2713,6 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                 g.textures[index].last_use_serial)
                 index = i;
         evicted = g.textures[index].tex;
-        g_ld_texture_cache_evictions++;
         if (g_ld_texture_cache_full <= 16 ||
             (g_ld_texture_cache_full & (g_ld_texture_cache_full - 1)) == 0)
             fprintf(stderr,
@@ -2718,20 +2740,19 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         replacement.content_hash = texture_content_hash(t, &readable);
     }
     replacement.tex = decode_guest_texture_profiled(t, remap);
+    /* Commit negative entries even when full. Previously this branch kept the
+     * old LRU entry on failure, so the same descriptor missed forever. */
+    texcache_t* entry = &g.textures[index];
+    if (cache_was_full) {
+        texture_cache_unlink(index);
+        ++g_ld_texture_cache_evictions;
+    }
+    if (evicted) retire_texture(evicted);
+    *entry = replacement;
+    texture_cache_link(index, bucket);
     if (replacement.tex) {
-        texcache_t* entry = &g.textures[index];
-        if (cache_was_full)
-            texture_cache_unlink(index);
-        if (evicted)
-            retire_texture(evicted);
-        *entry = replacement;
-        texture_cache_link(index, bucket);
         write_texture_srv(index, entry);
     } else {
-        if (!cache_was_full) {
-            g.textures[index] = replacement;
-            texture_cache_link(index, bucket);
-        }
         g_ld_texture_decode_fail++;
         if (g_ld_texture_decode_fail <= 16 ||
             (g_ld_texture_decode_fail & (g_ld_texture_decode_fail - 1)) == 0)
@@ -5169,7 +5190,9 @@ static void fetch_batches_hoisted(
         static int scalar = -1;
         if (scalar < 0) scalar = getenv("RSX_SCALAR_VERTEX_FETCH") != NULL;
         if (!scalar) {
-            dc.fetch_ok = rsx_vertex_fetch_many(&dc.fetch_plan,dc.refs,dc.n_refs,dc.compact_verts);
+            dc.fetch_ok = ld_vertex_cache_enabled()
+                ? rsx_vertex_fetch_cached(&g_ld_vertex_cache,&dc.fetch_plan,dc.refs,dc.n_refs,dc.compact_verts)
+                : rsx_vertex_fetch_many(&dc.fetch_plan,dc.refs,dc.n_refs,dc.compact_verts);
         } else for (u32 i = 0; i < dc.n_refs; i++) {
             u8* destination = layout->stride
                 ? dc.compact_verts + (u64)i * layout->stride : NULL;
@@ -9127,6 +9150,22 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
 void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
+    if (g_ld_frames%60==0) {
+        static const char* control=(const char*)-1;
+        if (control==(const char*)-1) control=getenv("RSX_VERTEX_CACHE_FILE");
+        if (control) {
+            FILE* file=fopen(control,"r"); unsigned enabled;
+            if (file) {
+                if (fscanf(file,"%u",&enabled)==1 && enabled<=1)
+                    g_ld_vertex_cache_enabled=(int)enabled;
+                fclose(file);
+            }
+            fprintf(stderr,"[vertex-cache] frame=%u enabled=%d hits=%llu misses=%llu bypass=%llu storage_mb=%.3f compared_mb=%.3f\n",
+                g_ld_frames,ld_vertex_cache_enabled(),g_ld_vertex_cache.hits,g_ld_vertex_cache.misses,
+                g_ld_vertex_cache.bypasses,g_ld_vertex_cache.bytes/(1024.0*1024),
+                g_ld_vertex_cache.compared_bytes/(1024.0*1024));
+        }
+    }
 
     /* LD_SURF_DUMP=<dir>: dump EVERY live surface once, with its non-black
      * count, at LD_SURF_DUMP_FRAME (default 1200).
@@ -10234,6 +10273,7 @@ void rsx_live_draw_present(u32 buffer_id)
 void rsx_live_draw_shutdown(void)
 {
     if (!g.ready) return;
+    rsx_vertex_payload_cache_clear(&g_ld_vertex_cache);
     ld_vertex_diag_emit("shutdown", 1);
     ld_present_measure_dump();
     /* let the GPU drain, then release. (Best-effort; process teardown also

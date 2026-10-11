@@ -1616,13 +1616,18 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
+static uint32_t vm_read32_slow(uint64_t a, void* caller);
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
     if (!vm_memory_probes() && (uint32_t)a >= 0x10000u &&
         !spu_raw_is_reg((uint32_t)a) && (uint32_t)a != VM_HLE_INJECT_BASE+0x2008u) {
         uint32_t v; memcpy(&v,vm_base+(uint32_t)a,4); return __builtin_bswap32(v);
     }
-    ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
-    if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
+    return vm_read32_slow(a,__builtin_return_address(0));
+}
+static uint32_t vm_read32_slow(uint64_t a, void* caller)
+{
+    ppu_rwatch_hit((uint32_t)a, 4, caller);
+    if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, caller);
     /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
      * cannot be served out of memory. Everything else in the window the SPU
      * thread keeps current, so it falls through to the plain load. */
@@ -1734,17 +1739,22 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0;
       } }
       else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap32(v); }
+static uint64_t vm_read64_slow(uint64_t a, void* caller);
 uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0;
     if (!vm_memory_probes() && (uint32_t)a >= 0x10000u) {
         uint64_t v; memcpy(&v,vm_base+(uint32_t)a,8); return __builtin_bswap64(v);
     }
+    return vm_read64_slow(a,__builtin_return_address(0));
+}
+static uint64_t vm_read64_slow(uint64_t a, void* caller)
+{
     vm_hotmap((uint32_t)a,8);
-    if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 8, __builtin_return_address(0)); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
+    if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 8, caller); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read64 0x%08X\n", (uint32_t)a); }
 #endif
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
-      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD64] spinning on 0x%08X (=0x%016llX) guest-fn=0x%08X\n", (uint32_t)a, (unsigned long long)__builtin_bswap64(v), ppu_prof_resolve_host(__builtin_return_address(0))); n=0;
+      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD64] spinning on 0x%08X (=0x%016llX) guest-fn=0x%08X\n", (uint32_t)a, (unsigned long long)__builtin_bswap64(v), ppu_prof_resolve_host(caller)); n=0;
 #ifdef _WIN32
         { static int64_t wa=-2; if(wa==-2){const char*e=getenv("PPU_SPINBT"); wa=e?(int64_t)strtoul(e,0,0):-1;}
           if(wa>=0 && (uint32_t)a==(uint32_t)wa){ static int once=0; if(!once){ once=1;
