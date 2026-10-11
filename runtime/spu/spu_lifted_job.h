@@ -19,6 +19,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 #if defined(_WIN32) && defined(YZ_PERF_PROFILE)
 #include <windows.h>
 #endif
@@ -176,7 +179,8 @@ static inline uint64_t spu_abi_cycles(const spu_abi_profile* profile)
     return 0;
 }
 
-static inline int32_t spu_run_lifted_job_abi_profiled(spu_lifted_entry_fn entry,
+static inline int32_t spu_run_lifted_job_abi_in_context(spu_context* ctx,
+                                             spu_lifted_entry_fn entry,
                                              uint8_t* local_store,
                                              uint32_t args_ea,
                                              int image_id,
@@ -187,18 +191,17 @@ static inline int32_t spu_run_lifted_job_abi_profiled(spu_lifted_entry_fn entry,
 {
     if (!entry) return -1;
     const uint64_t profile_begin = spu_abi_cycles(profile);
-    spu_context ctx;
-    spu_context_init(&ctx, 0);
+    spu_context_init(ctx, 0);
     { static int s_cl = -1;
       if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
       if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d\n",
-                          (void*)&ctx, image_id); fflush(stderr); } }
-    ctx.image_id = image_id;     /* select this image's indirect-branch table */
+                          (void*)ctx, image_id); fflush(stderr); } }
+    ctx->image_id = image_id;     /* select this image's indirect-branch table */
     if (opts) {
-        ctx.spu_id              = opts->spu_id;
-        ctx.spu_group_id        = opts->group_id;
-        ctx.park_on_empty_inmbox = opts->park_on_empty;
-        if (opts->inmbox_val) spu_channel_write(&ctx.ch_in_mbox, opts->inmbox_val);
+        ctx->spu_id              = opts->spu_id;
+        ctx->spu_group_id        = opts->group_id;
+        ctx->park_on_empty_inmbox = opts->park_on_empty;
+        if (opts->inmbox_val) spu_channel_write(&ctx->ch_in_mbox, opts->inmbox_val);
         /* Publish the LIVE context for the duration of the run so the PPU side
          * (sys_spu_thread_write_spu_mb) can poke this worker's mailbox and wake
          * it where it stands, instead of restarting it from its entry.
@@ -210,20 +213,20 @@ static inline int32_t spu_run_lifted_job_abi_profiled(spu_lifted_entry_fn entry,
          * init and consumes the next command as though it were a startup
          * parameter. */
         extern void spu_thread_publish_ctx(uint32_t tid, void* c);
-        if (opts->spu_id) spu_thread_publish_ctx(opts->spu_id, &ctx);
+        if (opts->spu_id) spu_thread_publish_ctx(opts->spu_id, ctx);
     }
     /* Initialize the SPU stack pointer to the top of local store (the SPU ABI
      * expects r1 = top-16, 16-byte aligned, with a NULL back-chain). Without
      * this it is 0 from spu_context_init, so the first `r1 -= frame` wraps
      * negative -> garbage stack -> null function pointers -> branch to LS 0. */
-    ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;   /* 0x3FFF0 for a 256KB LS */
-    if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);  /* job's LS in */
+    ctx->gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;   /* 0x3FFF0 for a 256KB LS */
+    if (local_store) memcpy(ctx->ls, local_store, SPU_LS_SIZE);  /* job's LS in */
     /* A SpursTasksetContext at LS 0x2700 (built by spurs_pm_build_context) writes
      * syscallAddr=0xA70 at STC_SYSCALL_ADDR (0x27C4). That sentinel means "this is
      * a generic SPURS taskset task" (LBP's audio SPEEX/MultiStream tasks) -- flOw
      * jobs never plant it, so keying off it cannot change their behaviour. */
-    #define _LB(o) (((uint32_t)ctx.ls[(o)]<<24)|((uint32_t)ctx.ls[(o)+1]<<16)| \
-                    ((uint32_t)ctx.ls[(o)+2]<<8)|ctx.ls[(o)+3])
+    #define _LB(o) (((uint32_t)ctx->ls[(o)]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)| \
+                    ((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
     int taskset_ctx = (_LB(0x27C4) == 0xA70u);
     if (spurs_task_abi) {
         if (r3_override) {
@@ -245,11 +248,11 @@ static inline int32_t spu_run_lifted_job_abi_profiled(spu_lifted_entry_fn entry,
              *
              * A substituted eaContext remains the fallback below, for a task
              * whose real argument this runtime never captured. */
-            ctx.gpr[3]._u32[0] = r3_override[0];   /* 0x40-marker handle       */
-            ctx.gpr[3]._u32[1] = r3_override[1];   /* task control block EA    */
-            ctx.gpr[3]._u32[2] = r3_override[2];   /* queue/lock EA            */
-            ctx.gpr[3]._u32[3] = r3_override[3];
-            if (!taskset_ctx && !ctx.gpr[3]._u32[1]) ctx.gpr[3]._u32[1] = args_ea;
+            ctx->gpr[3]._u32[0] = r3_override[0];   /* 0x40-marker handle       */
+            ctx->gpr[3]._u32[1] = r3_override[1];   /* task control block EA    */
+            ctx->gpr[3]._u32[2] = r3_override[2];   /* queue/lock EA            */
+            ctx->gpr[3]._u32[3] = r3_override[3];
+            if (!taskset_ctx && !ctx->gpr[3]._u32[1]) ctx->gpr[3]._u32[1] = args_ea;
         } else if (image_id == 22) {
             /* cri_mpv leaf (func_00003E68) gate is `rotmai(r3.word0, 112) == 64`
              * = an ARITHMETIC RIGHT-SHIFT BY 16 then ceqi 64, i.e. it wants
@@ -258,19 +261,19 @@ static inline int32_t spu_run_lifted_job_abi_profiled(spu_lifted_entry_fn entry,
              * path (func_00003ED8, which DMAs the video job); else it halts
              * (func_00003ED0). NOTE: r3.word0 = 0x40 (my earlier misread) shifts
              * to 0 and FAILS the gate -> no decode, no DMA. Use 0x00400000. */
-            ctx.gpr[3]._u32[0] = 0x00400000u;   /* >>16 == 64 -> cri real decode path */
-            ctx.gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
+            ctx->gpr[3]._u32[0] = 0x00400000u;   /* >>16 == 64 -> cri real decode path */
+            ctx->gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
         } else if (taskset_ctx) {
             /* Generic SPURS task (RPCS3 spursTasksetStartTask): r3 = the task's
              * 16-byte CellSpursTaskArgument (TaskInfo.args, DMA'd to LS 0x2780 by
              * spurs_pm_build_context), passed by value -- NOT the cri 0x40 marker. */
-            ctx.gpr[3]._u32[0] = _LB(0x2780);
-            ctx.gpr[3]._u32[1] = _LB(0x2784);
-            ctx.gpr[3]._u32[2] = _LB(0x2788);
-            ctx.gpr[3]._u32[3] = _LB(0x278C);
+            ctx->gpr[3]._u32[0] = _LB(0x2780);
+            ctx->gpr[3]._u32[1] = _LB(0x2784);
+            ctx->gpr[3]._u32[2] = _LB(0x2788);
+            ctx->gpr[3]._u32[3] = _LB(0x278C);
         } else {
-            ctx.gpr[3]._u32[0] = 0x00400000u;   /* 0x40 marker (>>16==64), DMA tag 0 */
-            ctx.gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
+            ctx->gpr[3]._u32[0] = 0x00400000u;   /* 0x40 marker (>>16==64), DMA tag 0 */
+            ctx->gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
         }
     } else {
         /* RAW SPU THREAD (opts set): sys_spu_thread_argument is FOUR u64s
@@ -290,11 +293,11 @@ static inline int32_t spu_run_lifted_job_abi_profiled(spu_lifted_entry_fn entry,
                 const uint8_t* p_ = vm_base + args_ea + i * 8;
                 uint32_t hi = ((uint32_t)p_[0]<<24)|((uint32_t)p_[1]<<16)|((uint32_t)p_[2]<<8)|p_[3];
                 uint32_t lo = ((uint32_t)p_[4]<<24)|((uint32_t)p_[5]<<16)|((uint32_t)p_[6]<<8)|p_[7];
-                ctx.gpr[3 + i]._u32[0] = lo;
-                ctx.gpr[3 + i]._u32[1] = hi;
+                ctx->gpr[3 + i]._u32[0] = lo;
+                ctx->gpr[3 + i]._u32[1] = hi;
             }
         } else {
-            ctx.gpr[3]._u32[0] = args_ea;                       /* simple-job arg -> r3 */
+            ctx->gpr[3]._u32[0] = args_ea;                       /* simple-job arg -> r3 */
         }
     }
     /* The r3_override path already carries the game's 0x0040xxxx marker (which
@@ -309,32 +312,32 @@ static inline int32_t spu_run_lifted_job_abi_profiled(spu_lifted_entry_fn entry,
     if (spurs_task_abi && (image_id == 22 || taskset_ctx)) {
         uint32_t spurs_lo = _LB(0x2764);
         if (spurs_lo) {
-            ctx.gpr[4]._u32[0] = _LB(0x2768);  /* args hi (d0) */
-            ctx.gpr[4]._u32[1] = _LB(0x276C);  /* args lo      */
-            ctx.gpr[4]._u32[2] = _LB(0x2760);  /* spurs hi (d1)*/
-            ctx.gpr[4]._u32[3] = spurs_lo;     /* spurs lo = CellSpurs EA */
+            ctx->gpr[4]._u32[0] = _LB(0x2768);  /* args hi (d0) */
+            ctx->gpr[4]._u32[1] = _LB(0x276C);  /* args lo      */
+            ctx->gpr[4]._u32[2] = _LB(0x2760);  /* spurs hi (d1)*/
+            ctx->gpr[4]._u32[3] = spurs_lo;     /* spurs lo = CellSpurs EA */
         }
     }
     #undef _LB
     if (taskset_ctx && getenv("SPURS_TASKSET_TRACE")) {
         fprintf(stderr, "[taskset] run image=%d r3=%08X %08X %08X %08X "
                 "r4=%08X %08X %08X %08X\n", image_id,
-                ctx.gpr[3]._u32[0], ctx.gpr[3]._u32[1], ctx.gpr[3]._u32[2], ctx.gpr[3]._u32[3],
-                ctx.gpr[4]._u32[0], ctx.gpr[4]._u32[1], ctx.gpr[4]._u32[2], ctx.gpr[4]._u32[3]);
+                ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1], ctx->gpr[3]._u32[2], ctx->gpr[3]._u32[3],
+                ctx->gpr[4]._u32[0], ctx->gpr[4]._u32[1], ctx->gpr[4]._u32[2], ctx->gpr[4]._u32[3]);
         fflush(stderr);
     }
     int _halted = 0;
     const uint64_t profile_ready = spu_abi_cycles(profile);
     { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
-      _halted = spu_run_with_halt(entry, &ctx); }               /* run with halt pad   */
+      _halted = spu_run_with_halt(entry, ctx); }               /* run with halt pad   */
     const uint64_t profile_executed = spu_abi_cycles(profile);
     { const char* image = getenv("SPU_JOB_TRACE_IMG");
       if (image && atoi(image) == image_id) {
           fprintf(stderr, "[spu-job-return] img=%d halted=%d status=%X stop=%X "
                   "pc=%05X lr=%05X r3=%08X code=%d\n", image_id, _halted,
-                  (unsigned)ctx.status, (unsigned)ctx.stop_code,
-                  ctx.pc & SPU_LS_MASK, ctx.gpr[0]._u32[0] & SPU_LS_MASK,
-                  ctx.gpr[3]._u32[0], ctx.resident_code[0].image_id);
+                  (unsigned)ctx->status, (unsigned)ctx->stop_code,
+                  ctx->pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                  ctx->gpr[3]._u32[0], ctx->resident_code[0].image_id);
       } }
     /* Raw-worker run summary (env SPU_WORKER_TRACE). A worker that produces no
      * outbound word leaves the PPU blocked in sys_event_queue_receive forever,
@@ -343,11 +346,11 @@ static inline int32_t spu_run_lifted_job_abi_profiled(spu_lifted_entry_fn entry,
     if (opts && getenv("SPU_WORKER_TRACE")) {
         fprintf(stderr, "[worker] spu=0x%X halted=%d steps=%llu status=0x%X pc=0x%05X "
                 "inmbox(n=%u) outmbox(n=%u v=0x%08X) outintr(n=%u v=0x%08X)\n",
-                ctx.spu_id, _halted, (unsigned long long)ctx.steps, (unsigned)ctx.status,
-                (unsigned)(ctx.pc & SPU_LS_MASK),
-                (unsigned)ctx.ch_in_mbox.count,
-                (unsigned)ctx.ch_out_mbox.count, ctx.ch_out_mbox.value,
-                (unsigned)ctx.ch_out_intr_mbox.count, ctx.ch_out_intr_mbox.value);
+                ctx->spu_id, _halted, (unsigned long long)ctx->steps, (unsigned)ctx->status,
+                (unsigned)(ctx->pc & SPU_LS_MASK),
+                (unsigned)ctx->ch_in_mbox.count,
+                (unsigned)ctx->ch_out_mbox.count, ctx->ch_out_mbox.value,
+                (unsigned)ctx->ch_out_intr_mbox.count, ctx->ch_out_intr_mbox.value);
         fflush(stderr);
     }
 
@@ -357,23 +360,23 @@ static inline int32_t spu_run_lifted_job_abi_profiled(spu_lifted_entry_fn entry,
      * blocked in sys_event_queue_receive. Same one-per-RUN rule the
      * interpreter path uses -- one event per WRITE oversupplies the queue.
      * Jobs (opts == NULL) keep their old behaviour exactly. */
-    if (opts && !spu_channel_has_data(&ctx.ch_out_intr_mbox) &&
-        spu_channel_has_data(&ctx.ch_out_mbox)) {
+    if (opts && !spu_channel_has_data(&ctx->ch_out_intr_mbox) &&
+        spu_channel_has_data(&ctx->ch_out_mbox)) {
         extern void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
         if (g_spu_out_mbox_hook)
-            g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, ctx.ch_out_mbox.value);
+            g_spu_out_mbox_hook(ctx->spu_group_id, ctx->spu_id, 1, ctx->ch_out_mbox.value);
     }
     if (opts && opts->spu_id) {
         extern void spu_thread_publish_ctx(uint32_t tid, void* c);
-        spu_thread_publish_ctx(opts->spu_id, 0);   /* run over: ctx is a stack local */
+        spu_thread_publish_ctx(opts->spu_id, 0);   /* run over: ctx may be stack or heap storage */
     }
-    /* ctx is a stack local that may have taken a lock-line reservation; left
+    /* The context may have taken a lock-line reservation; left
      * in the reserver set it is walked by the next PPU store to that line.
      * GH3's Havok task returning is what first hit it. */
-    spu_coh_unregister(&ctx);
-    if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
+    spu_coh_unregister(ctx);
+    if (local_store) memcpy(local_store, ctx->ls, SPU_LS_SIZE);  /* LS back out */
     { extern void spu_mfc_release(spu_context*);
-      spu_mfc_release(&ctx); }
+      spu_mfc_release(ctx); }
     if (profile) {
         const uint64_t profile_end = spu_abi_cycles(profile);
         profile->prepare_cycles = profile_ready - profile_begin;
@@ -382,6 +385,48 @@ static inline int32_t spu_run_lifted_job_abi_profiled(spu_lifted_entry_fn entry,
     }
     return 0;
 }
+
+/* Separate storage wrappers keep the large stack frame out of the heap path.
+ * The context is still initialized from scratch on every invocation. */
+#ifdef _MSC_VER
+#define SPU_ABI_STORAGE_NOINLINE __declspec(noinline)
+#else
+#define SPU_ABI_STORAGE_NOINLINE __attribute__((noinline))
+#endif
+static SPU_ABI_STORAGE_NOINLINE int32_t spu_run_lifted_job_abi_profiled(spu_lifted_entry_fn entry,
+                                             uint8_t* local_store,
+                                             uint32_t args_ea, int image_id,
+                                             int spurs_task_abi,
+                                             const uint32_t* r3_override,
+                                             const spu_run_opts* opts,
+                                             spu_abi_profile* profile)
+{
+    spu_context ctx;
+    return spu_run_lifted_job_abi_in_context(&ctx, entry, local_store, args_ea,
+        image_id, spurs_task_abi, r3_override, opts, profile);
+}
+#undef SPU_ABI_STORAGE_NOINLINE
+
+#ifdef _WIN32
+static inline int32_t spu_run_lifted_job_abi_heap(spu_lifted_entry_fn entry,
+                                             uint8_t* local_store,
+                                             uint32_t args_ea, int image_id,
+                                             int spurs_task_abi,
+                                             const uint32_t* r3_override,
+                                             const spu_run_opts* opts,
+                                             spu_abi_profile* profile)
+{
+    if (!entry) return -1;
+    spu_context* ctx = (spu_context*)_aligned_malloc(sizeof(spu_context), 16);
+    if (!ctx) return spu_run_lifted_job_abi_profiled(entry, local_store, args_ea,
+        image_id, spurs_task_abi, r3_override, opts, profile);
+    int32_t result = spu_run_lifted_job_abi_in_context(ctx, entry, local_store,
+        args_ea, image_id, spurs_task_abi, r3_override, opts, profile);
+    /* The inner ABI unregisters coherency and releases MFC state first. */
+    _aligned_free(ctx);
+    return result;
+}
+#endif
 
 static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
                                              uint8_t* local_store,
