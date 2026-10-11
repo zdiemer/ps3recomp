@@ -18,6 +18,7 @@
 #include "spu_lockstep.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "spu_overlay_registry.h"
+#include "spu_code_lookup.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1401,7 +1402,7 @@ int spu_have_function(uint32_t addr)
  * spu_fn_registry.c before the registry was consolidated into this TU. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
-    return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
+    return (spu_lifted_fn)spu_lookup_resident(ctx, lsa);
 }
 
 /* ---- Swappable code overlays (see spu_context.resident_ovl) --------------
@@ -2163,23 +2164,7 @@ void spu_indirect_branch(spu_context* ctx)
     /* The launched task owns the shared task-code region: resolve it there FIRST
      * so a co-resident task at the same LS base cannot shadow it. (resident_task
      * is 0 outside the region, so this only ever fires for genuine task code.) */
-    spu_fn fn = NULL;
-    int code_owner = 0;
-    for (unsigned slot = 0; slot < 4; ++slot) {
-        if (ctx->resident_code[slot].image_id && ctx->pc >= ctx->resident_code[slot].lsa &&
-            ctx->pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
-            code_owner = ctx->resident_code[slot].image_id;
-            fn = spu_lookup(ctx->pc, code_owner);
-            break;
-        }
-    }
-    if (!code_owner && ctx->resident_task)
-        fn = spu_lookup(ctx->pc, ctx->resident_task);
-    /* Resident overlay next: streamed code overwrote that LS range, so its lift
-     * is the truth there -- the base image's stale bytes at the same addresses
-     * may also be registered (historical junk lifts) and must lose. */
-    if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
-    if (!code_owner && !fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    spu_fn fn = spu_lookup_resident(ctx, ctx->pc);
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second

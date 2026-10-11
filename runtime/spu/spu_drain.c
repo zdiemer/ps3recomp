@@ -6,6 +6,7 @@
  * functions (not macros) means the SPU_DRAIN/SPU_RET call sites are already in
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
+#include "spu_code_lookup.h"
 #include <setjmp.h>
 
 /* See spu_context.h `irq_frame`. */
@@ -458,8 +459,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         }
         {
             uint32_t pc = ctx->pc & SPU_LS_MASK;
-            spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
-            if (!fn) fn = spu_lookup(pc, ctx->image_id);
+            spu_drain_fn fn = spu_lookup_resident(ctx, pc);
             if (fn) {
                 { static int _n = 0; if (_n++ < 8)
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
