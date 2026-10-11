@@ -311,7 +311,7 @@ s32 _cellSpursQueueInitialize(u64 spurs_ea, u64 taskset_ea, u64 queue_ea,
                             u64 buffer_ea, u32 size, u32 depth, u32 direction);
 s32 cellSpursQueueSize(u64 queue_ea, u64 size_out_ea);
 s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking);
-s32 cellSpursQueuePopBody(u64 queue_ea, u64 data_ea, u32 isBlocking);
+s32 cellSpursQueuePopBody(u64 queue_ea, u64 data_ea, u32 isPeek, u32 isBlocking);
 s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                 u32 size, u32 depth, u32 direction);
 s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea);

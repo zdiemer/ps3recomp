@@ -7,10 +7,23 @@ uint8_t* vm_base;
 int g_resv_store_active = 0;
 uint32_t g_ww_lo = 0, g_ww_hi = 0;
 static int locked;
+#ifdef _WIN32
+static SRWLOCK test_queue_lock = SRWLOCK_INIT;
+#endif
 static int notifications, signals;
 static u32 signalled_task;
-void spu_lockline_lock(void) { assert(!locked); locked = 1; }
-void spu_lockline_unlock(void) { assert(locked); locked = 0; }
+void spu_lockline_lock(void) {
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&test_queue_lock);
+#endif
+    assert(!locked); locked = 1;
+}
+void spu_lockline_unlock(void) {
+    assert(locked); locked = 0;
+#ifdef _WIN32
+    ReleaseSRWLockExclusive(&test_queue_lock);
+#endif
+}
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 int spu_coh_is_reserved(uint32_t ea) { (void)ea; return 0; }
 void spu_coh_notify_write(uint32_t ea) { assert(locked && ea == 0x100); ++notifications; }
@@ -30,6 +43,18 @@ static void expect_size(u32 head, u32 tail, u32 depth, u32 expected)
     assert(!locked);
 }
 
+#ifdef _WIN32
+static DWORD WINAPI delayed_producer(void* ignored)
+{
+    (void)ignored;
+    Sleep(40);
+    spu_lockline_lock();
+    memset(vm_base + 0x400, 0xB7, 16);
+    queue_write_index(vm_base + 0x104, 1);
+    spu_lockline_unlock();
+    return 0;
+}
+#endif
 int main(void)
 {
     /* Literal retail values catch facility/offset mistakes shared by callers. */
@@ -58,13 +83,17 @@ int main(void)
     assert(cellSpursQueuePushBody(0x100, 0x300, 0) == CELL_OK);
     assert(!memcmp(vm_base + 0x400, vm_base + 0x300, 16) && vm_read32(0x104) == 1);
     assert(notifications == 1 && signals == 0);
-    assert(cellSpursQueuePopBody(0x100, 0x300, 0) == CELL_SPURS_TASK_ERROR_PERM);
+    assert(cellSpursQueuePopBody(0x100, 0x300, 0, 0) == CELL_SPURS_TASK_ERROR_PERM);
     /* Pop only on SPU->PPU queues. */
     vm_write32(0x11C, 1);
     memset(vm_base + 0x300, 0, 16);
-    assert(cellSpursQueuePopBody(0x100, 0x300, 0) == CELL_OK);
+    int before_peek = notifications;
+    assert(cellSpursQueuePopBody(0x100, 0x300, 1, 0) == CELL_OK);
+    assert(vm_base[0x300] == 0x69 && vm_read32(0x100) == 0);
+    assert(notifications == before_peek);
+    assert(cellSpursQueuePopBody(0x100, 0x300, 0, 0) == CELL_OK);
     assert(vm_base[0x300] == 0x69 && vm_read32(0x100) == 1);
-    assert(cellSpursQueuePopBody(0x100, 0x300, 0) == CELL_SPURS_TASK_ERROR_AGAIN);
+    assert(cellSpursQueuePopBody(0x100, 0x300, 0, 0) == CELL_SPURS_TASK_ERROR_AGAIN);
     vm_write32(0x11C, 2);
     vm_write32(0x100, 15); vm_write32(0x104, 15);
     vm_base[0x120] = 2; vm_base[0x121] = 7; vm_base[0x122] = 9;
@@ -76,7 +105,7 @@ int main(void)
     assert(cellSpursQueuePushBody(0x100, 0x300, 0) == CELL_SPURS_TASK_ERROR_AGAIN);
     assert(vm_read32(0x104) == 8);
     vm_write32(0x100, 0); vm_write32(0x104, ~1u);
-    assert(cellSpursQueuePushBody(0x100, 0x300, 0) == CELL_SPURS_TASK_ERROR_AGAIN);
+    assert(cellSpursQueuePushBody(0x100, 0x300, 0) == CELL_SPURS_TASK_ERROR_BUSY);
     expect_size(0, 0, 8, 0);       /* empty */
     expect_size(0, 8, 8, 8);       /* full */
     expect_size(14, 2, 8, 4);      /* wrap around twice-depth boundary */
@@ -95,6 +124,18 @@ int main(void)
     vm_write32(0x100, 0);
     vm_write32(0x104, 9);
     assert(cellSpursQueueSize(0x100, 0x200) == CELL_SPURS_TASK_ERROR_INVAL);
+#ifdef _WIN32
+    vm_write32(0x100, 0); vm_write32(0x104, 0); vm_write32(0x11C, 1);
+    HANDLE producer = CreateThread(NULL, 0, delayed_producer, NULL, 0, NULL);
+    assert(producer);
+    /* r5=0, r6=1 must actually wait, not return AGAIN from a try-pop. */
+    ULONGLONG started = GetTickCount64();
+    assert(cellSpursQueuePopBody(0x100, 0x300, 0, 1) == CELL_OK);
+    assert(GetTickCount64() - started >= 20);
+    assert(vm_base[0x300] == 0xB7 && vm_read32(0x100) == 1);
+    assert(WaitForSingleObject(producer, 1000) == WAIT_OBJECT_0);
+    CloseHandle(producer);
+#endif
     free(vm_base);
     return 0;
 }

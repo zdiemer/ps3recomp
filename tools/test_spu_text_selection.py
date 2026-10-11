@@ -1,7 +1,7 @@
 """SPU startup segment regression tests; no game binaries are needed."""
 import unittest
 
-from find_spu_functions import pick_text
+from find_spu_functions import pick_text, collect_lifecycle_targets
 
 
 def segment(off, vaddr, size, flags=5, kind=1, memsz=None):
@@ -10,6 +10,18 @@ def segment(off, vaddr, size, flags=5, kind=1, memsz=None):
 
 
 class TextSelectionTests(unittest.TestCase):
+    def test_single_constructor_between_sentinels(self):
+        data = bytes.fromhex("ffffffff 00020190 00000000")
+        section = dict(name=".ctors", off=0, size=len(data))
+        self.assertEqual(collect_lifecycle_targets(data, [section]), {0x20190})
+
+    def test_invalid_lifecycle_extent_ignored(self):
+        data = bytes.fromhex("00020190")
+        sections = [dict(name=".ctors", off=0, size=8),
+                    dict(name=".dtors", off=0, size=3),
+                    dict(name=".data", off=0, size=4)]
+        self.assertEqual(collect_lifecycle_targets(data, sections), set())
+
     def test_entry_in_second_segment(self):
         phs = [segment(0x100, 0x3000, 16), segment(0x180, 0x20080, 0x163B0)]
         self.assertEqual(pick_text(phs, 0x200F0), (0x180, 0x20080, 0x163B0))

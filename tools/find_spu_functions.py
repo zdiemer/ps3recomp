@@ -605,6 +605,27 @@ def find_end(start, insns_by_addr, sorted_starts, code_end):
     return min(next_start, code_end)
 
 
+def collect_lifecycle_targets(buf, shs):
+    """ELF constructor/destructor arrays may contain a single indirect callee.
+
+    Unlike heuristic pointer tables, named lifecycle sections are authoritative
+    even when there is only one entry between the CRT's sentinel words.
+    The caller filters addresses against the selected executable segment.
+    """
+    targets = set()
+    for sh in shs:
+        if sh.get("name") not in (".ctors", ".dtors", ".init_array", ".fini_array"):
+            continue
+        off, size = sh["off"], sh["size"]
+        if off < 0 or size % 4 or off + size > len(buf):
+            continue
+        for pos in range(off, off + size, 4):
+            addr = be_u32(buf, pos)
+            if addr not in (0, 0xFFFFFFFF):
+                targets.add(addr)
+    return targets
+
+
 def detect_functions(buf, base_override=None, verbose=True, raw=False):
     if raw:
         # A raw local-store image: a SPURS job binary, which the title loads
@@ -656,7 +677,8 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
               | collect_jump_table_targets(insns, code, code_start, code_end)
               | collect_ila_continuation_targets(insns, code_start, code_end)
               | collect_duff_targets(insns, code_start, code_end)
-              | fptr_targets):
+              | fptr_targets
+              | collect_lifecycle_targets(buf, elf["shs"])):
         if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
             seed_starts.add(t)
     if fptr_targets and verbose:
