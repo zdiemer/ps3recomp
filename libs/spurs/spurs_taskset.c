@@ -30,20 +30,62 @@ void spurs_taskset_init(uint32_t taskset_ea, uint32_t spurs_ea, uint64_t args,
     vm_write32(taskset_ea + CSTS_EVENT_FLAG_ID2, evf2);
 }
 
-/* Register a task: write task_info[taskId] (args/elf/context/ls_pattern) and mark the
- * task enabled + ready so the PM's SELECT_TASK picks it. arg/ls_pattern may be NULL. */
+/* Caller holds the lock-line lock. Coherent vm_write* would acquire it again;
+ * write the descriptor directly, in guest byte order, then notify reservations. */
+static void task_store32(uint32_t ea, uint32_t value)
+{
+    value = ps3_bswap32(value);
+    memcpy(vm_base + ea, &value, sizeof value);
+}
+static void task_store64(uint32_t ea, uint64_t value)
+{
+    value = ps3_bswap64(value);
+    memcpy(vm_base + ea, &value, sizeof value);
+}
+static void task_publish_locked(uint32_t taskset_ea, uint32_t taskId, uint64_t elf_ea,
+                                 uint64_t context, const uint32_t arg[4],
+                                 const uint32_t ls_pattern[4])
+{
+    uint32_t ti = spurs_taskset_taskinfo_ea(taskset_ea, taskId);
+    for (int i = 0; i < 4; i++) task_store32(ti + TI_ARGS + i * 4, arg ? arg[i] : 0);
+    task_store64(ti + TI_ELF, elf_ea);
+    task_store64(ti + TI_CONTEXT, context);
+    for (int i = 0; i < 4; i++)
+        task_store32(ti + TI_LS_PATTERN + i * 4, ls_pattern ? ls_pattern[i] : 0);
+    const uint8_t mask = (uint8_t)(0x80u >> (taskId & 7));
+    vm_base[taskset_ea + CSTS_ENABLED + taskId / 8] |= mask;
+    vm_base[taskset_ea + CSTS_READY + taskId / 8] |= mask;
+    spu_coh_notify_write(ti);
+    if ((ti & ~127u) != ((ti + TI_SIZE - 1) & ~127u))
+        spu_coh_notify_write(ti + TI_SIZE - 1);
+    spu_coh_notify_write(taskset_ea);
+}
+
 void spurs_taskset_add_task(uint32_t taskset_ea, uint32_t taskId, uint64_t elf_ea,
                             uint64_t context, const uint32_t arg[4],
                             const uint32_t ls_pattern[4])
 {
-    uint32_t ti = spurs_taskset_taskinfo_ea(taskset_ea, taskId);
-    for (int i = 0; i < 4; i++) vm_write32(ti + TI_ARGS + i * 4, arg ? arg[i] : 0);
-    vm_write64(ti + TI_ELF, elf_ea);
-    vm_write64(ti + TI_CONTEXT, context);
-    for (int i = 0; i < 4; i++)
-        vm_write32(ti + TI_LS_PATTERN + i * 4, ls_pattern ? ls_pattern[i] : 0);
-    spurs_bitset_set(taskset_ea + CSTS_ENABLED, taskId);
-    spurs_bitset_set(taskset_ea + CSTS_READY,   taskId);
+    if (taskId >= 128) return;
+    spu_lockline_lock();
+    task_publish_locked(taskset_ea, taskId, elf_ea, context, arg, ls_pattern);
+    spu_lockline_unlock();
+}
+
+uint32_t spurs_taskset_create_task(uint32_t taskset_ea, uint64_t elf_ea,
+                                  uint64_t context, const uint32_t arg[4],
+                                  const uint32_t ls_pattern[4])
+{
+    uint32_t task = 128;
+    spu_lockline_lock();
+    for (uint32_t i = 0; i < 128; ++i) {
+        if (!(vm_base[taskset_ea + CSTS_ENABLED + i / 8] & (0x80u >> (i & 7)))) {
+            task = i;
+            task_publish_locked(taskset_ea, i, elf_ea, context, arg, ls_pattern);
+            break;
+        }
+    }
+    spu_lockline_unlock();
+    return task;
 }
 
 /* Set the taskset's on-task-exit handler EA (CellSpursTaskset.x78). */
