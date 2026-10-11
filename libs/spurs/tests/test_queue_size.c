@@ -32,6 +32,13 @@ static void expect_size(u32 head, u32 tail, u32 depth, u32 expected)
 
 int main(void)
 {
+    /* Literal retail values catch facility/offset mistakes shared by callers. */
+    assert(CELL_SPURS_TASK_ERROR_AGAIN == 0x80410901u);
+    assert(CELL_SPURS_TASK_ERROR_INVAL == 0x80410902u);
+    assert(CELL_SPURS_TASK_ERROR_PERM == 0x80410909u);
+    assert(CELL_SPURS_TASK_ERROR_ALIGN == 0x80410910u);
+    assert(CELL_SPURS_TASK_ERROR_NULL_POINTER == 0x80410911u);
+    assert(CELL_SPURS_TASK_ERROR_FAULT == 0x8041090Du);
     vm_base = (uint8_t*)calloc(1, 0x1000);
     assert(vm_base);
     /* The SPU consumer loads its size from W2 and its 64-bit EA from W4/W5.
