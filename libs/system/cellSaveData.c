@@ -52,6 +52,20 @@
  * -----------------------------------------------------------------------*/
 
 static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
+static int s_strict_load_errors;
+
+s32 cellSaveData_set_root_path(const char* path)
+{
+    if (!path || !*path || strlen(path) >= sizeof(s_save_root))
+        return CELL_SAVEDATA_ERROR_PARAM;
+    strcpy(s_save_root, path);
+    return CELL_OK;
+}
+
+void cellSaveData_set_strict_load_errors(int enabled)
+{
+    s_strict_load_errors = enabled != 0;
+}
 
 /* Ensure directory (and parents) exist */
 static void ensure_dirs(const char* path)
@@ -1281,7 +1295,7 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
      * compat return until that is understood -- it was dropped once already
      * in the fold merge and cost a boot regression. */
     s32 r = savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
-    return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
+    return r == CELL_SAVEDATA_ERROR_NODATA && !s_strict_load_errors ? CELL_OK : r;
 }
 
 s32 cellSaveDataDelete2(u32 container)
@@ -1407,7 +1421,7 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
     /* Same as cellSaveDataAutoLoad2 above, including flОw's first-boot compat
      * return (it calls this old non-_2 variant). */
     s32 r = savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
-    return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
+    return r == CELL_SAVEDATA_ERROR_NODATA && !s_strict_load_errors ? CELL_OK : r;
 }
 
 s32 cellSaveDataDelete(u32 version, const char* dirName,

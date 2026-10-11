@@ -16,6 +16,10 @@ extern "C" {
 
 /* Configure committed callback scratch before guest execution. */
 s32 cellSaveData_set_scratch_region(u32 base, u32 size);
+/* Configure before guest execution; the caller owns the persistent directory. */
+s32 cellSaveData_set_root_path(const char* path);
+/* Preserve NODATA instead of the legacy AutoLoad compatibility success. */
+void cellSaveData_set_strict_load_errors(int enabled);
 
 /* ---------------------------------------------------------------------------
  * Constants
