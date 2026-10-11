@@ -28,6 +28,14 @@ extern "C" {
 /* Constants */
 #define CELL_SAIL_PLAYER_MAX    4
 
+/* Host lifecycle observer, registered before guest threads start. URI is a
+ * temporary host string; copy it inside the callback if retaining it. This
+ * reports lifecycle only, not successful decoding or rendered media frames. */
+typedef void (*CellSailHostPlaybackCallback)(u32 player, const char* uri,
+                                             int started, void* user);
+void cellSail_set_host_playback_callback(CellSailHostPlaybackCallback callback,
+                                          void* user);
+
 /* Player state */
 #define CELL_SAIL_PLAYER_STATE_CLOSED     0
 #define CELL_SAIL_PLAYER_STATE_INITIALIZED 1

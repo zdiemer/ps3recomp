@@ -19,6 +19,15 @@
 
 static int s_initialized = 0;
 
+static CellSailHostPlaybackCallback s_host_playback;
+static void* s_host_playback_user;
+void cellSail_set_host_playback_callback(CellSailHostPlaybackCallback callback,
+                                          void* user)
+{
+    s_host_playback = callback;
+    s_host_playback_user = user;
+}
+
 typedef struct {
     int in_use;
     s32 state;
@@ -37,6 +46,7 @@ static struct {
     s32 legacy_mode;
     u32 max_audio, max_video, max_user, spurs_ea;
     u64 parameters[36][2];
+    char uri[512];
 }
     s_sail_players[CELL_SAIL_PLAYER_MAX];
 
@@ -83,6 +93,13 @@ static int sail_player_slot(u32 self_ea)
         if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea)
             return i;
     return -1;
+}
+
+static void sail_host_playback(int slot, int started)
+{
+    if (slot >= 0 && s_host_playback)
+        s_host_playback(s_sail_players[slot].self_ea,
+                       s_sail_players[slot].uri, started, s_host_playback_user);
 }
 
 /* Lifecycle */
@@ -138,6 +155,7 @@ s32 cellSailPlayerDestroy(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_host_playback(_sp, 0);
     s_sail_players[_sp].in_use = 0;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_CLOSED;
     return CELL_OK;
@@ -224,6 +242,7 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_host_playback(_sp, 0);
     sail_call(_sp, SAIL_CALL_CLOSE_STREAM, SAIL_ST_CLOSE_TRANSITION, SAIL_ST_CLOSED);
     return CELL_OK;
 }
@@ -243,6 +262,7 @@ s32 cellSailPlayerStart(CellSailPlayerHandle handle)
      * movie (Midway's logo AVIs) watches for. */
     sail_notify(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_STOP_TRANSITION);
     sail_notify(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_OPENED);
+    sail_host_playback(_sp, 1);
     return CELL_OK;
 }
 
@@ -252,6 +272,7 @@ s32 cellSailPlayerStop(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_host_playback(_sp, 0);
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
     sail_call(_sp, SAIL_CALL_STOP, SAIL_ST_STOP_TRANSITION, SAIL_ST_OPENED);
     return CELL_OK;
@@ -436,10 +457,13 @@ s32 cellSailPlayerDestroyDescriptor(CellSailPlayerHandle handle,
 s32 cellSailPlayerAddDescriptor(CellSailPlayerHandle handle,
                                   CellSailDescriptorHandle desc)
 {
-    (void)handle;
     printf("[cellSail] AddDescriptor(player=%u, desc=%u)\n", handle, desc);
-    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
+    int slot = sail_player_slot(handle);
+    if (slot < 0 || desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use ||
+        s_descs[desc].player != handle)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    snprintf(s_sail_players[slot].uri, sizeof(s_sail_players[slot].uri),
+             "%s", s_descs[desc].uri);
     return CELL_OK;
 }
 
@@ -561,6 +585,7 @@ s32 cellSailPlayerFinalize(u32 pSelf)
 {
     int slot = sail_player_slot(pSelf);
     if (slot < 0) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_host_playback(slot, 0);
     memset(&s_sail_players[slot], 0, sizeof s_sail_players[slot]);
     return CELL_OK;
 }
