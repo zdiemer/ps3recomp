@@ -359,6 +359,16 @@ static void reference_batch_tests(void)
 }
 static void bias_tests(void)
 {
+    rsx_dispatch_init(&g.rsx, NULL);
+    assert(rsx_dsp_reg(&g.rsx, 0x1D78) == 1u);
+    render_state_t decoded;
+    decode_render_state(&decoded);
+    assert(decoded.depth_clip == 1u);
+    const u64 clip_key = ld_hash_structural_render_state(&decoded, 123u);
+    rsx_dispatch_method(&g.rsx, 0x1D78, 0u);
+    decode_render_state(&decoded);
+    assert(decoded.depth_clip == 0u);
+    assert(ld_hash_structural_render_state(&decoded, 123u) != clip_key);
     // Coplanar overlay: LESS fails without bias, negative bias brings it forward.
     D3D12_HEAP_PROPERTIES hp={0}; hp.Type=D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd={0}; rd.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -394,12 +404,15 @@ static void bias_tests(void)
     OK(D3DCompile(r,strlen(r),NULL,NULL,NULL,"main","ps_5_0",0,0,&red,NULL));
     OK(D3DCompile(b,strlen(b),NULL,NULL,NULL,"main","ps_5_0",0,0,&green,NULL));
     ID3D12Resource* rb=buffer(D3D12_HEAP_TYPE_READBACK);
-    for (int mode=0; mode<6; ++mode) {
+    for (int mode=0; mode<14; ++mode) {
         if (mode==3) {
             D3D12_FEATURE_DATA_D3D12_OPTIONS16 feature={0};
             if (FAILED(g.dev->lpVtbl->CheckFeatureSupport(g.dev,D3D12_FEATURE_D3D12_OPTIONS16,
-                    &feature,sizeof(feature))) || !feature.DynamicDepthBiasSupported) break;
+                    &feature,sizeof(feature))) || !feature.DynamicDepthBiasSupported) { mode=5; continue; }
             OK(g.list->lpVtbl->QueryInterface(g.list,&IID_ID3D12GraphicsCommandList9,(void**)&g_ld_bias_list));
+        }
+        if (mode==6 && g_ld_bias_list) {
+            g_ld_bias_list->lpVtbl->Release(g_ld_bias_list); g_ld_bias_list=NULL;
         }
         OK(g.alloc->lpVtbl->Reset(g.alloc)); OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd={0}; pd.pRootSignature=sig;
@@ -412,7 +425,22 @@ static void bias_tests(void)
         apply_render_state(&pd,&state);
         ID3D12PipelineState *base,*overlay;
         OK(g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev,&pd,&IID_ID3D12PipelineState,(void**)&base));
-        state.depth_write=0; float units=mode%3==1?-64.0f:mode%3==2?64.0f:0;
+        state.depth_write=0; float units=mode<6 ? (mode%3==1?-64.0f:mode%3==2?64.0f:0) : 0;
+        ID3DBlob* clip_vs = NULL;
+        if (mode>=6) {
+            const char* z = mode<8 ? "-0.25" : mode<10 ? "1.25" : "0.25";
+            char shader[256];
+            snprintf(shader,sizeof(shader),
+                "float4 main(uint id:SV_VertexID):SV_Position { float2 p=float2((id<<1)&2,id&2); return float4(p*2-1,%s,%s); }",
+                z, mode>=12 ? "-1" : "1");
+            OK(D3DCompile(shader,strlen(shader),NULL,NULL,NULL,"main","vs_5_0",0,0,&clip_vs,NULL));
+            pd.VS.pShaderBytecode=clip_vs->lpVtbl->GetBufferPointer(clip_vs);
+            pd.VS.BytecodeLength=clip_vs->lpVtbl->GetBufferSize(clip_vs);
+            rsx_dispatch_method(&g.rsx,0x1D78,(u32)mode&1u);
+            decode_render_state(&decoded);
+            state.depth_clip=decoded.depth_clip;
+            state.depth_func=0x207; /* isolate clipping from depth rejection */
+        }
         memcpy(&state.bias_units,&units,4); apply_render_state(&pd,&state);
         pd.PS.pShaderBytecode=green->lpVtbl->GetBufferPointer(green); pd.PS.BytecodeLength=green->lpVtbl->GetBufferSize(green);
         OK(g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev,&pd,&IID_ID3D12PipelineState,(void**)&overlay));
@@ -441,8 +469,11 @@ static void bias_tests(void)
         assert(WaitForSingleObject(g.fence_event,10000)==WAIT_OBJECT_0);
         u8* bytes; OK(rb->lpVtbl->Map(rb,0,NULL,(void**)&bytes));
         u8* pixel=bytes+8*256+8*4;
-        assert(pixel[0]==(mode%3==1?0:255) && pixel[1]==(mode%3==1?255:0));
+        const int overlay_visible = mode<6 ? mode%3==1 :
+            mode<10 ? !(mode&1) : mode<12;
+        assert(pixel[0]==(overlay_visible?0:255) && pixel[1]==(overlay_visible?255:0));
         rb->lpVtbl->Unmap(rb,0,NULL); overlay->lpVtbl->Release(overlay); base->lpVtbl->Release(base);
+        if (clip_vs) clip_vs->lpVtbl->Release(clip_vs);
     }
     if (g_ld_bias_list) { g_ld_bias_list->lpVtbl->Release(g_ld_bias_list); g_ld_bias_list=NULL; }
     rb->lpVtbl->Release(rb); sig->lpVtbl->Release(sig); root_blob->lpVtbl->Release(root_blob);
@@ -450,6 +481,7 @@ static void bias_tests(void)
     color->lpVtbl->Release(color); depth->lpVtbl->Release(depth); g.depth=NULL;
     rtv->lpVtbl->Release(rtv); dsv->lpVtbl->Release(dsv);
     puts("Coplanar decal GPU readback: zero/positive bias occluded, negative bias visible");
+    puts("Guest depth clip reset/state/key and GPU readback: near/far clipped only when requested; valid depths preserved; negative W always clipped");
 }
 int main(void)
 {
