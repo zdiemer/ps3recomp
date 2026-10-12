@@ -83,6 +83,7 @@ static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_sur
 static volatile long g_ld_ps1_vram_ready = 0;
 #include "rsx_restart_cuts.h"
 #include "rsx_vertex_compact.h"
+#include "rsx_vertex_pull.h"
 #include "rsx_vp_decompiler.h"
 #include "rsx_vp_program_cache.h"
 
@@ -4554,6 +4555,69 @@ static void ld_vp_cached_info(const u8* code, u32 bytes, rsx_vp_program_info* ou
 #endif
 }
 
+static rsx_vertex_pull_payload g_ld_pull_payload;
+static int g_ld_pull_active, g_ld_pull_enabled=-1;
+static u64 g_ld_pull_draws, g_ld_pull_vertices, g_ld_pull_bytes, g_ld_pull_bypasses;
+static void ld_pull_summary(void);
+static void ld_pull_update(void)
+{
+    static const char* control;
+    static ULONGLONG next;
+    const ULONGLONG now=GetTickCount64();
+    int changed=0;
+    if (g_ld_pull_enabled<0) {
+        const char* option=getenv("RSX_GPU_VERTEX_PULL");
+        g_ld_pull_enabled=option && *option=='1';
+        control=getenv("RSX_GPU_VERTEX_PULL_FILE"); changed=1;
+    }
+    if (control && now>=next) {
+        next=now+100;
+        FILE* file=fopen(control,"r"); unsigned enabled;
+        if (file) {
+            if (fscanf(file,"%u",&enabled)==1 && enabled<=1 && (int)enabled!=g_ld_pull_enabled) {
+                g_ld_pull_enabled=(int)enabled; changed=1;
+            }
+            fclose(file);
+        }
+    }
+    if (changed) {
+        ld_pull_summary();
+        LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+        fprintf(stderr,"[gpu-vertex-pull-mode] enabled=%d qpc=%lld\n",g_ld_pull_enabled,qpc.QuadPart);
+    }
+}
+static void ld_pull_summary(void)
+{
+    LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+    fprintf(stderr,"[gpu-vertex-pull-summary] enabled=%d qpc=%lld prepared_draws=%llu vertices=%llu upload_bytes=%llu bypasses=%llu\n",
+        g_ld_pull_enabled,qpc.QuadPart,g_ld_pull_draws,g_ld_pull_vertices,g_ld_pull_bytes,g_ld_pull_bypasses);
+}
+#if defined(YZ_PERF_PROFILE)
+/* Cumulative counters paired by QPC with the renderer stage CSV. Keep these
+ * out of ordinary measurements; subtraction retains all frames in a window. */
+static void ld_pull_profile(u32 frame, LONGLONG qpc)
+{
+    static FILE* csv;
+    static int initialized;
+    if (!initialized) {
+        initialized=1;
+        const char* output=getenv("RSX_PROFILE_CSV");
+        if (output && *output) {
+            char path[4096];
+            const int n=snprintf(path,sizeof path,"%s.geometry.csv",output);
+            if (n>0 && n<sizeof path) csv=fopen(path,"wb");
+            if (csv) fprintf(csv,"frame,qpc,enabled,prepared_draws,vertices,raw_upload_bytes,bypasses,total_vertex_upload_bytes\n");
+        }
+    }
+    if (csv) {
+        fprintf(csv,"%u,%lld,%d,%llu,%llu,%llu,%llu,%llu\n",frame,qpc,
+            g_ld_pull_enabled,g_ld_pull_draws,g_ld_pull_vertices,g_ld_pull_bytes,
+            g_ld_pull_bypasses,g_ld_profile.total.vertex_upload_bytes);
+        if ((frame&63u)==0) fflush(csv);
+    }
+}
+#endif
+
 static ID3D12PipelineState* build_pso(
     const char* vs_hlsl, const char* ps_hlsl, const render_state_t* rs,
     const rsx_vertex_layout_plan* masked_layout, int packed_offsets)
@@ -4699,8 +4763,8 @@ static ID3D12PipelineState* build_pso(
         err = NULL;
     }
     D3D12_INPUT_ELEMENT_DESC il[16];
-    const u32 input_count =
-        masked_layout ? masked_layout->count : RSX_DSP_NUM_VERTEX_ATTR;
+    const u32 input_count = g_ld_pull_active ? 0 :
+        (masked_layout ? masked_layout->count : RSX_DSP_NUM_VERTEX_ATTR);
     for (u32 slot = 0; slot < input_count; slot++) {
         const u32 attr =
             masked_layout ? masked_layout->attrs[slot] : slot;
@@ -4982,6 +5046,10 @@ static ID3D12PipelineState* get_pso(
         key = ld_hash_structural_render_state(&rs, key);
     else
         key = fnv1a(&rs, sizeof(rs), key);
+    if (g_ld_pull_active) {
+        const u32 tag=0x31555047u; /* GPU1: raw vertex shader input */
+        key=fnv1a(&tag,sizeof tag,key);
+    }
 #if defined(YZ_PERF_PROFILE)
     { static int variants = -1;
       if (variants < 0) variants = getenv("RSX_PROFILE_LIGHT") == NULL;
@@ -5064,12 +5132,14 @@ static ID3D12PipelineState* get_pso(
     const LONGLONG decompile_begin = ld_profile_qpc();
 #endif
     rsx_vp_set_branch_base(rsx_dsp_vp_start(&g.rsx));
-    const int vi = masked_layout
+    int vi = masked_layout
         ? rsx_vp_decompile_compact_ex(
             vp_uc, vp_instrs * 16, vtex_mask, masked_layout->mask,
             vs_hlsl, sizeof(vs_hlsl))
         : rsx_vp_decompile_ex(
             vp_uc, vp_instrs * 16, vtex_mask, vs_hlsl, sizeof(vs_hlsl));
+    if (vi>0 && g_ld_pull_active &&
+        !rsx_vertex_pull_wrap(vs_hlsl,sizeof vs_hlsl,masked_layout?masked_layout->mask:0xFFFFu)) vi=-1;
     u32 decompiled_constant_count = 0;
     int fi;
     if (ld_fp_constants_buffered()) {
@@ -5680,6 +5750,16 @@ static void fetch_batches_hoisted(
     stage_begin = ld_profile_qpc();
 #endif
     if (packed_payload) {
+        if (g_ld_pull_enabled>0 && ld_vertex_mask_signature() && !ld_geometry_cache_enabled() &&
+            rsx_vertex_pull_pack(&g_ld_pull_payload,&dc.fetch_plan,dc.refs,dc.n_refs,VERT_BUFFER_SIZE)) {
+            g_ld_pull_active=1; dc.n_verts=dc.n_refs;
+            ++g_ld_pull_draws; g_ld_pull_vertices+=dc.n_refs; g_ld_pull_bytes+=g_ld_pull_payload.bytes;
+#if defined(YZ_PERF_PROFILE)
+            g_ld_profile.total.vertex_decode_qpc += ld_profile_qpc()-stage_begin;
+#endif
+            return;
+        }
+        if (g_ld_pull_enabled>0) ++g_ld_pull_bypasses;
         ld_geom_prepare();
         const u64 required = (u64)dc.n_refs * layout->stride;
         if (!reserve_compact_vertices(required)) {
@@ -5743,6 +5823,14 @@ static const float* dc_vertex_attr(
     if (!ld_vertex_compact_payload())
         return dc.verts[vertex].a[attr];
     const s8 slot = dc.layout.slot_by_attr[attr];
+    if (g_ld_pull_active && slot>=0 && vertex<dc.n_verts) {
+        float decoded[16*4];
+        if (rsx_vertex_fetch_one(&dc.fetch_plan,&dc.refs[vertex],(u8*)decoded)) {
+            memcpy(fallback,decoded+(u32)slot*4,16); return fallback;
+        }
+        memcpy(fallback,dc.fetch_plan.attr[attr].default_value,16);
+        return fallback;
+    }
     if (slot >= 0 && vertex < dc.n_verts)
         return (const float*)(
             dc.compact_verts + (u64)vertex * dc.layout.stride +
@@ -5762,6 +5850,8 @@ static const float* dc_vertex_attr_canonical(
     if (!ld_vertex_compact_payload())
         return dc.verts[vertex].a[attr];
     const s8 slot = dc.layout.slot_by_attr[attr];
+    if (g_ld_pull_active && slot>=0 && vertex<dc.n_verts)
+        return dc_vertex_attr(vertex,attr,fallback);
     if (slot >= 0 && vertex < dc.n_verts)
         return (const float*)(
             dc.compact_verts + (u64)vertex * dc.layout.stride +
@@ -6069,6 +6159,7 @@ static void ld_profile_present(u32 frame)
         previous_ticks=blit_ticks; previous_pixels=blit_pixels; previous_row_pixels=blit_row_pixels;
         if ((frame & 63u) == 0) fflush(csv);
     }
+    ld_pull_profile(frame,now);
     g_ld_profile.measured_frames++;
     g_ld_profile.total_frame_ms += frame_ms;
     if (compile_free) {
@@ -7510,6 +7601,7 @@ static void write_topology_indices(u32 prim, u32* indices)
 
 static void sink_end_impl(void* user, const rsx_dispatch* r)
 {
+    g_ld_pull_active=0;
     (void)user; (void)r;
     if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) return;
     if (!dc.n_packets) { g_ld_stats.groups_empty++; return; }
@@ -7602,9 +7694,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     const u32 vertex_stride =
         ld_vertex_compact_payload() ? used_layout.stride : VERT_STRIDE;
     const u32 uploaded_vertices = indexed ? dc.n_verts : n_tri;
-    const void* vertex_data = ld_vertex_compact_payload()
+    const void* vertex_data = g_ld_pull_active ? (const void*)g_ld_pull_payload.data : ld_vertex_compact_payload()
         ? (const void*)dc.compact_verts : (const void*)dc.verts;
-    const u64 draw_vb_bytes = (u64)uploaded_vertices * vertex_stride;
+    const u64 draw_vb_bytes = g_ld_pull_active ? g_ld_pull_payload.bytes : (u64)uploaded_vertices * vertex_stride;
     const u64 draw_ib_bytes = indexed ? (u64)n_tri * sizeof(u32) : 0;
     const u64 vb_capacity = VERT_BUFFER_SIZE;
     if (draw_vb_bytes > vb_capacity || draw_ib_bytes > INDEX_BUFFER_SIZE) {
@@ -8383,6 +8475,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             isfinite(units)?units:0,0,isfinite(factor)?factor:0);
     }
     g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.rootsig_x);
+    if (g_ld_pull_active)
+        g.list->lpVtbl->SetGraphicsRootShaderResourceView(g.list,5,
+            g.vb->lpVtbl->GetGPUVirtualAddress(g.vb)+g.vb_used);
     g.list->lpVtbl->SetGraphicsRootConstantBufferView(
         g.list, 0, g.cb->lpVtbl->GetGPUVirtualAddress(g.cb) + g.cb_used);
     if (ld_fp_constants_buffered())
@@ -8715,7 +8810,7 @@ static int make_root_signature(void)
     vrange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     vrange.NumDescriptors = RSX_DSP_NUM_VERTEX_TEXTURES;
     vrange.BaseShaderRegister = 16;
-    D3D12_ROOT_PARAMETER xp[5] = {0};
+    D3D12_ROOT_PARAMETER xp[6] = {0};
     xp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     xp[0].Descriptor.ShaderRegister = 0;
     xp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -8734,6 +8829,9 @@ static int make_root_signature(void)
     xp[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     xp[4].Descriptor.ShaderRegister = 1;
     xp[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    xp[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    xp[5].Descriptor.ShaderRegister = 20;
+    xp[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     D3D12_STATIC_SAMPLER_DESC vsmp[RSX_DSP_NUM_VERTEX_TEXTURES] = {0};
     for (u32 i = 0; i < RSX_DSP_NUM_VERTEX_TEXTURES; i++) {
         vsmp[i].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -8745,7 +8843,7 @@ static int make_root_signature(void)
         vsmp[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     }
     D3D12_ROOT_SIGNATURE_DESC rsd = {0};
-    rsd.NumParameters = 5; rsd.pParameters = xp;
+    rsd.NumParameters = 6; rsd.pParameters = xp;
     rsd.NumStaticSamplers = RSX_DSP_NUM_VERTEX_TEXTURES;
     rsd.pStaticSamplers = vsmp;
     rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -9486,6 +9584,7 @@ double rsx_live_draw_get_present_fps(void)
 
 void rsx_live_draw_dump_present_samples(void)
 {
+    ld_pull_summary();
     ld_present_measure_dump();
     ld_texture_watch_summary();
     ld_geometry_cache_summary();
@@ -9937,6 +10036,7 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
 void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
+    ld_pull_update();
     if (!ld_refresh_display_state()) return;
     if (g_ld_frames%60==0) {
         static const char* clear_control=(const char*)-1;
@@ -11188,6 +11288,10 @@ void rsx_live_draw_shutdown(void)
     }
     rsx_vertex_payload_cache_clear(&g_ld_vertex_cache);
     ld_vertex_diag_emit("shutdown", 1);
+    ld_pull_summary();
+    free(g_ld_pull_payload.data);
+    memset(&g_ld_pull_payload,0,sizeof g_ld_pull_payload);
+    g_ld_pull_active=0;
     ld_present_measure_dump();
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
