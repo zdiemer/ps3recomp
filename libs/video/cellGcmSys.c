@@ -946,7 +946,84 @@ static void nv3089_engine_wrote(u32 dst_pitch, u32 x0, u32 y0, u32 x1, u32 y1)
                                 x1 - x0, y1 - y0);
 }
 
-static void nv3089_blit(void)
+/* Keep overlapping copies and diagnostic scalar-store hooks on the original
+ * pixel path. Disjoint images can gather a row, then publish it through the
+ * existing coherent block writer instead of checking reservations per pixel. */
+static int nv3089_copy_rows(u32 src, u32 dst, u32 bpp)
+{
+    const u32 width=s_nv3089.out_sz & 0xFFFF, height=s_nv3089.out_sz >> 16;
+    const u32 ox=s_nv3089.out_pt & 0xFFFF, oy=s_nv3089.out_pt >> 16;
+    const u32 cx=s_nv3089.clip_pt & 0xFFFF, cy=s_nv3089.clip_pt >> 16;
+    const u32 cw=s_nv3089.clip_sz & 0xFFFF, ch=s_nv3089.clip_sz >> 16;
+    const u32 pitch=s_nv3089.in_fmt & 0xFFFF, dpitch=s_gcm2d.pitch >> 16;
+    const u32 u=s_nv3089.in_uv & 0xFFFF, v=s_nv3089.in_uv >> 16;
+    if (!vm_base || !width || !height || !pitch || !dpitch ||
+            (bpp!=1 && bpp!=2 && bpp!=4) || g_resv_store_active) return 0;
+    u32 x0=cx>ox ? cx-ox : 0, y0=cy>oy ? cy-oy : 0;
+    u32 x1=width, y1=height;
+    if (cw && (u64)cx+cw<(u64)ox+x1) x1=cx+cw>ox ? cx+cw-ox : 0;
+    if (ch && (u64)cy+ch<(u64)oy+y1) y1=cy+ch>oy ? cy+ch-oy : 0;
+    if (x0>=x1 || y0>=y1) return 1;
+    const u64 sx0=(((u64)u<<8)+(u64)x0*s_nv3089.ds_dx)>>20;
+    const u64 sx1=(((u64)u<<8)+(u64)(x1-1)*s_nv3089.ds_dx)>>20;
+    const u64 sy0=(((u64)v<<8)+(u64)y0*s_nv3089.dt_dy)>>20;
+    const u64 sy1=(((u64)v<<8)+(u64)(y1-1)*s_nv3089.dt_dy)>>20;
+    const u64 first_src=(u64)src+sy0*pitch+sx0*bpp;
+    const u64 end_src=(u64)src+sy1*pitch+(sx1+1)*bpp;
+    const u64 first_dst=(u64)dst+(oy+y0)*(u64)dpitch+(ox+x0)*(u64)bpp;
+    const u64 end_dst=(u64)dst+(oy+y1-1)*(u64)dpitch+(ox+x1)*(u64)bpp;
+    if (end_src>0x100000000ull || end_dst>0x100000000ull ||
+            (first_src<end_dst && first_dst<end_src) ||
+            (g_ww_hi>g_ww_lo && first_dst<g_ww_hi && g_ww_lo<end_dst)) return 0;
+    static u8* row;
+    static size_t capacity;
+    const size_t bytes=(size_t)(x1-x0)*bpp;
+    if (bytes>capacity) {
+        u8* grown=(u8*)realloc(row,bytes);
+        if (!grown) return 0;
+        row=grown; capacity=bytes;
+    }
+    for (u32 y=y0; y<y1; ++y) {
+        const u64 sy=(((u64)v<<8)+(u64)y*s_nv3089.dt_dy)>>20;
+        const u8* source=vm_base+src+sy*pitch;
+        const u8* copy=source+sx0*bpp;
+        if (s_nv3089.ds_dx!=0x100000u) {
+            for (u32 x=x0; x<x1; ++x) {
+                const u64 sx=(((u64)u<<8)+(u64)x*s_nv3089.ds_dx)>>20;
+                memcpy(row+(size_t)(x-x0)*bpp,source+sx*bpp,bpp);
+            }
+            copy=row;
+        }
+        vm_memcpy_to((u32)((u64)dst+(oy+y)*(u64)dpitch+(ox+x0)*(u64)bpp),copy,bytes);
+    }
+    return 1;
+}
+
+static int nv3089_rows_enabled(void)
+{
+    static const char* control=(const char*)-1;
+    static int enabled=1;
+    static uint64_t next;
+    if (control==(const char*)-1) control=getenv("GCM_ROW_BLIT_MODE_FILE");
+    const u64 now=control ? get_timestamp_ns() : 0;
+    if (control && now>=next) {
+        next=now+100000000;
+        FILE* file=fopen(control,"r"); unsigned flags;
+        if (file) {
+            if (fscanf(file,"%u",&flags)==1 && flags<=255) enabled=(flags&128u)!=0;
+            fclose(file);
+        }
+    }
+    return enabled;
+}
+
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+static u64 s_blit_ticks, s_blit_pixels, s_blit_row_pixels;
+void cellGcmGetBlitProfile(u64* ticks, u64* pixels, u64* row_pixels)
+{ *ticks=s_blit_ticks; *pixels=s_blit_pixels; *row_pixels=s_blit_row_pixels; }
+#endif
+
+static void nv3089_blit_impl(void)
 {
     u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
     u32 out_x = s_nv3089.out_pt & 0xFFFF, out_y = s_nv3089.out_pt >> 16;
@@ -1091,6 +1168,12 @@ static void nv3089_blit(void)
              : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
     u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
     if (bpp == 4) nv3089_engine_read(in_pitch, out_w, out_h);
+    if (!rsx_draw_engine_enabled() && nv3089_rows_enabled() && nv3089_copy_rows(src,dst,bpp)) {
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+        s_blit_row_pixels+=(u64)out_w*out_h;
+#endif
+        return;
+    }
     for (u32 y = 0; y < out_h; y++) {
         u32 dy = out_y + y;
         if (dy < cy0 || dy >= cy1) continue;
@@ -1119,6 +1202,20 @@ static void nv3089_blit(void)
       if (cap && _n < cap) { _n++;
         printf("[NV3089] %ux%u fmt=0x%X src=0x%08X(pitch %u) -> dst=0x%08X(pitch %u) at %u,%u\n",
                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
+}
+
+static void nv3089_blit(void)
+{
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+    LARGE_INTEGER begin,end;
+    QueryPerformanceCounter(&begin);
+    nv3089_blit_impl();
+    QueryPerformanceCounter(&end);
+    s_blit_ticks+=(u64)(end.QuadPart-begin.QuadPart);
+    s_blit_pixels+=(u64)(s_nv3089.out_sz & 0xFFFF)*(s_nv3089.out_sz >> 16);
+#else
+    nv3089_blit_impl();
+#endif
 }
 
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
