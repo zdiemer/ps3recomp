@@ -323,7 +323,8 @@ static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
 /* EA the ticker's RSX drain has consumed up to. Exposed so the wrap callback can
  * wait for the RSX to catch up before recycling the ring (else the frame's
  * just-written commands are lost). Updated in cellGcm_rsx_process_fifo. */
-volatile u32 g_gcm_fifo_drained_ea = 0;
+atomic_uint g_gcm_fifo_drained_ea = 0;
+#include "gcm_fifo_wait.h"
 /* A guest callback owns the context until both wrap acknowledgments arrive. */
 static atomic_uint s_fifo_recycle_active = 0;
 
@@ -2345,7 +2346,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
     }
 
-    g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
+    gcm_fifo_publish_drained_ea(gcm_io2ea(s_fifo_getoff));
     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
      * the walker actually is. A probe, not a fix -- it removes the back-pressure
      * a title uses to avoid overwriting commands the GPU has not read. It exists
@@ -2382,9 +2383,12 @@ static u32 gcm_ea2io(u32 ea)
 static void gcm_fifo_wait_for_ea(u32 expected)
 {
     unsigned spins = 0;
-    while (g_gcm_fifo_drained_ea != expected) {
+    const int native_wait = gcm_fifo_native_wait_enabled();
+    u32 observed;
+    while ((observed = atomic_load_explicit(&g_gcm_fifo_drained_ea,
+                                             memory_order_acquire)) != expected) {
         if (s_gcm_kick_ev && !(spins & 31u)) SetEvent(s_gcm_kick_ev);
-        Sleep(1);
+        gcm_fifo_wait_for_publication(observed, native_wait);
         if (++spins == 2000) {
             static unsigned warned;
             if (warned++ < 4)
