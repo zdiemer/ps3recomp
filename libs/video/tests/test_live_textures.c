@@ -5,6 +5,8 @@
 static u8 guest[2048];
 static u8* watch_guest;
 static int watch_fail_after = -1;
+static u32 geometry_source_shift;
+static int geometry_late_index_write;
 uint8_t* vm_base = guest;
 uint32_t vm_read32(uint64_t address)
 {
@@ -18,7 +20,10 @@ static const u8* resolve(void* user, u32 location, u32 offset, u32 size)
     if (watch_guest) {
         if (watch_fail_after == 0) return NULL;
         if (watch_fail_after > 0) --watch_fail_after;
-        return (u64)offset + size <= 65536 ? watch_guest + offset : NULL;
+        if (geometry_late_index_write && offset==4096) {
+            watch_guest[5121]=7; geometry_late_index_write=0;
+        }
+        return (u64)offset + size + geometry_source_shift <= 65536 ? watch_guest + offset + geometry_source_shift : NULL;
     }
     return (u64)offset + size <= sizeof(guest) ? guest + offset : NULL;
 }
@@ -934,6 +939,106 @@ static void native_texture_watch_cache_tests(void)
     g.n_textures=0; g_ld_cpu_work=saved_flags; g_ld_frames=saved_frame;
     puts("Native texture tracking: audited skips, shared-page writes, hash switches, failed refresh retry and disabled-mode fallback passed");
 }
+typedef struct {
+    u32 n_refs,n_verts,n_source_refs,n_cuts,remapped;
+    rsx_vertex_ref refs[128]; u32 map[128],cuts[128]; u8 vertices[128*32];
+} geometry_snapshot;
+static void geometry_read(const rsx_vertex_layout_plan* layout, int enabled, geometry_snapshot* out)
+{
+    static batch_t indices={0,64};
+    dc_reset(); dc.idx=&indices; dc.n_idx=1;
+    g_ld_geometry_cache_enabled=enabled;
+    fetch_batches_hoisted(layout,1); assert(dc.fetch_ok);
+    memset(out,0,sizeof(*out));
+    out->n_refs=dc.n_refs; out->n_verts=dc.n_verts; out->n_source_refs=dc.n_source_refs;
+    out->n_cuts=dc.n_cuts; out->remapped=(u32)dc.refs_remapped;
+    assert(dc.n_refs<=128 && dc.n_source_refs<=128 && dc.n_cuts<=128 && (u64)dc.n_verts*layout->stride<=sizeof(out->vertices));
+    memcpy(out->refs,dc.refs,dc.n_refs*sizeof(*dc.refs));
+    if (dc.refs_remapped) memcpy(out->map,dc.ref_remap.occurrence_to_unique,dc.n_source_refs*sizeof(u32));
+    if (dc.n_cuts) memcpy(out->cuts,dc.cuts,dc.n_cuts*sizeof(u32));
+    memcpy(out->vertices,dc.compact_verts,(size_t)dc.n_verts*layout->stride);
+}
+static void native_geometry_cache_tests(void)
+{
+    watch_guest=VirtualAlloc(NULL,65536,MEM_RESERVE|MEM_COMMIT|MEM_WRITE_WATCH,PAGE_READWRITE);
+    assert(watch_guest && rsx_live_draw_set_texture_write_watch(watch_guest,65536));
+    g.guest_ptr=resolve; g.guest_user=NULL;
+    memset(&g.rsx,0,sizeof(g.rsx)); g.rsx.current_primitive=PRIM_TRIANGLE_STRIP;
+    g.rsx.regs[0x1740/4]=RSX_VTX_TYPE_FLOAT|(4u<<4)|(16u<<8);
+    g.rsx.regs[0x1680/4]=4096; g.rsx.regs[0x181C/4]=8192; g.rsx.regs[0x1820/4]=0x10;
+    for (u32 i=0;i<512;++i) watch_guest[4096+i]=(u8)(i*37+19);
+    for (u32 i=0;i<64;++i) watch_guest[8192+i*2+1]=(u8)(i%16);
+    rsx_vertex_layout_plan layout; rsx_vertex_layout_plan_init(&layout,3);
+    geometry_snapshot original,cached;
+    g_ld_cpu_work=1283; g_ld_vertex_cache_enabled=0; g_geom_validate=0;
+    geometry_read(&layout,0,&original); geometry_read(&layout,1,&cached);
+    assert(!memcmp(&original,&cached,sizeof(original)));
+    u64 hits=g_geom_stats.hits;
+    geometry_read(&layout,1,&cached); assert(g_geom_stats.hits==hits+1);
+    assert(!memcmp(&original,&cached,sizeof(original)));
+    u32 random=0x9e3779b9;
+    for (u32 trial=0;trial<512;++trial) {
+        random=random*1664525u+1013904223u;
+        watch_guest[4096+random%512]^=(u8)(random>>24);
+        watch_guest[8192+(trial%64)*2+1]=(u8)(random%16);
+        const u32 type=1+trial%7, size=1+trial%4, frequency=trial%5;
+        g.rsx.regs[0x1740/4]=type|(size<<4)|(16u<<8)|(frequency<<16);
+        g.rsx.regs[0x173C/4]=(trial%2)?0x100001:0;
+        g.rsx.regs[0x1FC0/4]=trial%2;
+        g.rsx.regs[(0x1C00+16)/4]=random; // disabled ATTR1 default identity
+        g.rsx.regs[0x1DAC/4]=trial%3==0; g.rsx.regs[0x1DB0/4]=15;
+        g_ld_cpu_work=(trial%2)?1283:1281;
+        geometry_read(&layout,0,&original);
+        geometry_read(&layout,1,&cached); assert(!memcmp(&original,&cached,sizeof(original)));
+        geometry_read(&layout,1,&cached); assert(!memcmp(&original,&cached,sizeof(original)));
+        if (trial%8==0) {
+            watch_guest[4096]^=0x20;
+            u64 stamp; assert(rsx_texture_write_watch_stamp(&g_texture_watch,watch_guest+4096,1,&stamp,NULL));
+            geometry_read(&layout,0,&original); geometry_read(&layout,1,&cached);
+            assert(!memcmp(&original,&cached,sizeof(original)));
+        }
+    }
+    // The same page can hold indices and attributes. A write after index
+    // gathering but before attribute decode must invalidate the next draw.
+    ld_geometry_cache_clear();
+    memset(&g.rsx,0,sizeof(g.rsx)); g.rsx.current_primitive=PRIM_TRIANGLES;
+    g.rsx.regs[0x1740/4]=RSX_VTX_TYPE_FLOAT|(4u<<4)|(16u<<8);
+    g.rsx.regs[0x1680/4]=4096; g.rsx.regs[0x181C/4]=5120; g.rsx.regs[0x1820/4]=0x10;
+    for (u32 i=0;i<64;++i) { watch_guest[5120+i*2]=0; watch_guest[5121+i*2]=(u8)(i%16); }
+    geometry_late_index_write=1;
+    geometry_read(&layout,1,&cached); assert(!geometry_late_index_write);
+    const u64 misses=g_geom_stats.misses;
+    geometry_read(&layout,1,&cached); assert(g_geom_stats.misses==misses+1 && cached.refs[0].vertex_id==7);
+    geometry_read(&layout,0,&original); assert(!memcmp(&original,&cached,sizeof(original)));
+    // A resolver remap is a new source even if both native page epochs match.
+    memcpy(watch_guest+16384,watch_guest,16384); watch_guest[16384+4096]^=0x40;
+    u64 stamp; assert(rsx_texture_write_watch_stamp(&g_texture_watch,watch_guest,65536,&stamp,NULL));
+    geometry_read(&layout,1,&cached);
+    geometry_source_shift=16384;
+    geometry_read(&layout,0,&original); geometry_read(&layout,1,&cached);
+    assert(!memcmp(&original,&cached,sizeof(original)));
+    geometry_source_shift=0;
+    // Allocation/source failures and mode switches retain ordinary fallback.
+    watch_fail_after=0; dc_reset(); static batch_t bad={0,64}; dc.idx=&bad; dc.n_idx=1;
+    fetch_batches_hoisted(&layout,1); assert(!dc.fetch_ok); watch_fail_after=-1;
+    geometry_read(&layout,0,&original); geometry_read(&layout,1,&cached);
+    assert(!memcmp(&original,&cached,sizeof(original)));
+    // Validate real production hits, then deliberately corrupt only cached
+    // output: the independent full path must detect it and disable reuse.
+    g_geom_validate=1;
+    geometry_read(&layout,1,&cached); assert(g_geom_stats.audits && !g_geom_stats.failures);
+    ld_geom_entry* entry=g_geom_draw.entry; assert(entry && entry->storage);
+    ((u8*)ld_geom_payload(entry))[0]^=1;
+    geometry_read(&layout,1,&cached); assert(g_geom_cache_failed && g_geom_stats.failures==1);
+    assert(!memcmp(&original,&cached,sizeof(original)));
+    geometry_read(&layout,1,&cached); assert(!memcmp(&original,&cached,sizeof(original)));
+    ld_geometry_cache_clear(); memset(&g_geom_stats,0,sizeof(g_geom_stats));
+    g_geom_cache_failed=0; g_geom_validate=-1; g_ld_geometry_cache_enabled=-1; g_ld_vertex_cache_enabled=-1;
+    dc.idx=NULL; dc_reset(); g_ld_cpu_work=1283;
+    rsx_texture_write_watch_destroy(&g_texture_watch);
+    VirtualFree(watch_guest,0,MEM_RELEASE); watch_guest=NULL;
+    puts("Native geometry cache: 512 mutation/layout/divisor/restart cases, shared epochs, late index writes, remaps, fallback and independent hit auditing passed");
+}
 int main(void)
 {
     shadow_sampler_tests();
@@ -942,6 +1047,7 @@ int main(void)
     fetch_tests();
     reference_batch_tests();
     native_texture_watch_cache_tests();
+    native_geometry_cache_tests();
     topology_copy_tests();
     topology_copy_benchmark();
     IDXGIFactory4* factory; IDXGIAdapter* warp;
