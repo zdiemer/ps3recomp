@@ -227,6 +227,10 @@ static void fetch_tests(void)
                 assert(rsx_vertex_decode_element(RSX_VTX_TYPE_SINT16,size,guest,expected));
                 assert(rsx_vertex_fetch_many(&exact,&ref,1,(u8*)actual));
                 assert(memcmp(actual,expected,sizeof(actual))==0);
+                for (unsigned modes=1;modes<=3;++modes) {
+                    assert(rsx_vertex_fetch_many_mode(&exact,&ref,1,(u8*)actual,modes));
+                    assert(!memcmp(actual,expected,sizeof(actual)));
+                }
             }
         }
         u8* page=VirtualAlloc(NULL,8192,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
@@ -237,7 +241,8 @@ static void fetch_tests(void)
             exact.attr[0].stable_base=page+4096-size*2;
             memset((void*)exact.attr[0].stable_base,0xA5,size*2);
             float actual[4];
-            assert(rsx_vertex_fetch_many(&exact,&ref,1,(u8*)actual));
+            for (unsigned modes=0;modes<=3;++modes)
+                assert(rsx_vertex_fetch_many_mode(&exact,&ref,1,(u8*)actual,modes));
         }
         VirtualFree(page,0,MEM_RELEASE);
         puts("SINT16 batch: every signed value/lane matches; protected tails do not overread");

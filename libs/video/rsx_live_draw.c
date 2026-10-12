@@ -5525,8 +5525,9 @@ static void fetch_batches_hoisted(
         if (!scalar) {
             dc.fetch_ok = ld_vertex_cache_enabled()
                 ? rsx_vertex_fetch_cached(&g_ld_vertex_cache,&dc.fetch_plan,dc.refs,dc.n_refs,dc.compact_verts)
-                : rsx_vertex_fetch_many_ex(&dc.fetch_plan,dc.refs,dc.n_refs,dc.compact_verts,
-                    (g_ld_cpu_work & 256u) != 0);
+                : rsx_vertex_fetch_many_mode(&dc.fetch_plan,dc.refs,dc.n_refs,dc.compact_verts,
+                    ((g_ld_cpu_work & 256u) ? RSX_VERTEX_BATCH_FLOAT_BYTE : 0u) |
+                    ((g_ld_cpu_work & 2048u) ? RSX_VERTEX_BATCH_SINT16 : 0u));
         } else for (u32 i = 0; i < dc.n_refs; i++) {
             u8* destination = layout->stride
                 ? dc.compact_verts + (u64)i * layout->stride : NULL;
@@ -9717,7 +9718,7 @@ void rsx_live_draw_present(u32 buffer_id)
         if (work_control) {
             FILE* file=fopen(work_control,"r"); unsigned flags;
             if (file) {
-                if (fscanf(file,"%u",&flags)==1 && flags<=2047 && flags!=g_ld_cpu_work) {
+                if (fscanf(file,"%u",&flags)==1 && flags<=4095 && flags!=g_ld_cpu_work) {
                     g_ld_cpu_work=flags;
                     fprintf(stderr,"[cpu-work] frame=%u flags=%u\n",g_ld_frames,flags);
                 }
