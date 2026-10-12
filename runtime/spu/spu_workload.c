@@ -701,7 +701,7 @@ static void spu_async_run(spu_async_job* j)
 #endif
             spu_abi_profile abi_profile = {0};
             int32_t rc;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
             if (j->heap_context)
                 rc = spu_run_lifted_job_abi_heap(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0, 0,
@@ -1239,6 +1239,8 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
     unsigned execution_mode = spu_execution_mode();
     j->heap_context = (execution_mode & 32u)!=0;
     j->byte_ops_simd = (execution_mode & 64u)!=0;
+#elif defined(__EMSCRIPTEN__)
+    j->heap_context = 1;
 #endif
     j->taskset_ea = taskset_ea; j->taskid = taskid;
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
@@ -1320,7 +1322,15 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     int prc = EINVAL;
-    if (pthread_attr_setstacksize(&attr, 256u << 20) == 0)
+#ifdef __EMSCRIPTEN__
+    /* Wasm stacks consume linear memory immediately. Keep job contexts on
+     * the heap and bound each detached worker's stack, including successors
+     * started before the previous worker has returned to the browser. */
+    const size_t stack_bytes = 16u << 20;
+#else
+    const size_t stack_bytes = 256u << 20;
+#endif
+    if (pthread_attr_setstacksize(&attr, stack_bytes) == 0)
         prc = pthread_create(&th, &attr, spu_async_thread, j);
     pthread_attr_destroy(&attr);
     /* A host that will not reserve that much still gets the thread, on the

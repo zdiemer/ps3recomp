@@ -408,7 +408,7 @@ static SPU_ABI_STORAGE_NOINLINE int32_t spu_run_lifted_job_abi_profiled(spu_lift
 }
 #undef SPU_ABI_STORAGE_NOINLINE
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
 static inline int32_t spu_run_lifted_job_abi_heap(spu_lifted_entry_fn entry,
                                              uint8_t* local_store,
                                              uint32_t args_ea, int image_id,
@@ -418,13 +418,21 @@ static inline int32_t spu_run_lifted_job_abi_heap(spu_lifted_entry_fn entry,
                                              spu_abi_profile* profile)
 {
     if (!entry) return -1;
+#ifdef _WIN32
     spu_context* ctx = (spu_context*)_aligned_malloc(sizeof(spu_context), 16);
+#else
+    spu_context* ctx = (spu_context*)aligned_alloc(16, sizeof(spu_context));
+#endif
     if (!ctx) return spu_run_lifted_job_abi_profiled(entry, local_store, args_ea,
         image_id, spurs_task_abi, r3_override, opts, profile);
     int32_t result = spu_run_lifted_job_abi_in_context(ctx, entry, local_store,
         args_ea, image_id, spurs_task_abi, r3_override, opts, profile);
     /* The inner ABI unregisters coherency and releases MFC state first. */
+#ifdef _WIN32
     _aligned_free(ctx);
+#else
+    free(ctx);
+#endif
     return result;
 }
 #endif
