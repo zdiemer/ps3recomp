@@ -246,7 +246,7 @@ static unsigned spu_execution_mode(void)
         s_execution_next_check = now + 100;
         FILE* file = fopen(s_execution_control, "r"); unsigned flags;
         if (file) {
-            if (fscanf(file, "%u", &flags) == 1 && flags <= 127 &&
+            if (fscanf(file, "%u", &flags) == 1 && flags <= 255 &&
                     s_execution_mode != (flags & 96u)) {
                 s_execution_mode = flags & 96u;
                 fprintf(stderr, "[spu-execution] heap_context=%d byte_ops_simd=%d\n",

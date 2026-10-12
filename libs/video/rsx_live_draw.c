@@ -5445,12 +5445,17 @@ static void ld_profile_present(u32 frame)
                 "flush_ms,fence_wait_ms,decompile_ms,vs_compile_ms,ps_compile_ms,"
                 "create_pso_ms,texture_decode_ms,draws,vertices,texture_upload_bytes,"
                 "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
-                "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work\n");
+                "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work,"
+                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels\n");
         }
     }
     if (csv) {
+        extern void cellGcmGetBlitProfile(u64*,u64*,u64*);
+        static u64 previous_ticks,previous_pixels,previous_row_pixels;
+        u64 blit_ticks,blit_pixels,blit_row_pixels;
+        cellGcmGetBlitProfile(&blit_ticks,&blit_pixels,&blit_row_pixels);
         fprintf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u\n", frame, now, frame_ms,
+            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
@@ -5474,7 +5479,11 @@ static void ld_profile_present(u32 frame)
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_refs_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_remap_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_plan_qpc)),
-            ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_decode_qpc)),g_ld_cpu_work);
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_decode_qpc)),g_ld_cpu_work,
+            ld_profile_ticks_ms(blit_ticks-previous_ticks),
+            (unsigned long long)(blit_pixels-previous_pixels),
+            (unsigned long long)(blit_row_pixels-previous_row_pixels));
+        previous_ticks=blit_ticks; previous_pixels=blit_pixels; previous_row_pixels=blit_row_pixels;
         if ((frame & 63u) == 0) fflush(csv);
     }
     g_ld_profile.measured_frames++;
@@ -9135,7 +9144,7 @@ void rsx_live_draw_present(u32 buffer_id)
         if (work_control) {
             FILE* file=fopen(work_control,"r"); unsigned flags;
             if (file) {
-                if (fscanf(file,"%u",&flags)==1 && flags<=127 && flags!=g_ld_cpu_work) {
+                if (fscanf(file,"%u",&flags)==1 && flags<=255 && flags!=g_ld_cpu_work) {
                     g_ld_cpu_work=flags;
                     fprintf(stderr,"[cpu-work] frame=%u flags=%u\n",g_ld_frames,flags);
                 }
