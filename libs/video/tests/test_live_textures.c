@@ -51,6 +51,25 @@ static void copy_source(ID3D12Resource* tex)
     bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     g.list->lpVtbl->ResourceBarrier(g.list,1,&bar);
 }
+/* Copy the complete depth plane: partial depth-resource copies are illegal. */
+static u32 read_depth(ID3D12Resource* tex, ID3D12Resource* rb, u32 offset)
+{
+    D3D12_RESOURCE_DESC desc; tex->lpVtbl->GetDesc(tex,&desc);
+    D3D12_TEXTURE_COPY_LOCATION src={0},dst={0};
+    src.pResource=tex; src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.pResource=rb; dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    g.dev->lpVtbl->GetCopyableFootprints(g.dev,&desc,0,1,offset,&dst.PlacedFootprint,NULL,NULL,NULL);
+    D3D12_RESOURCE_BARRIER bar={0}; bar.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bar.Transition.pResource=tex; bar.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bar.Transition.StateBefore=D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    bar.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list,1,&bar);
+    g.list->lpVtbl->CopyTextureRegion(g.list,&dst,0,0,0,&src,NULL);
+    bar.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bar.Transition.StateAfter=D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    g.list->lpVtbl->ResourceBarrier(g.list,1,&bar);
+    return dst.PlacedFootprint.Footprint.RowPitch;
+}
 static void cache_tests(void)
 {
     u8 bytes[1024]; memset(bytes,0x5A,sizeof(bytes));
@@ -560,12 +579,41 @@ static void resolution_tests(void)
         atlas_bar.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
         g.list->lpVtbl->ResourceBarrier(g.list,1,&atlas_bar);
         read_subresource(g.surfaces[atlas].tex,0,rb,65536,DXGI_FORMAT_R8G8B8A8_UNORM,atlas_w,atlas_h);
+        /* Actual opening-scene Z16 register payload, including the old
+         * interpretation as a negative control. Verify scissor scaling too. */
+        g.depth=g.zdepths[atlas_z-1].tex;
+        rsx_dispatch_method(&g.rsx,0x0214,0x6000);
+        rsx_dispatch_method(&g.rsx,0x0208,8|(1u<<5));
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_HORIZONTAL,4u<<16);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_VERTICAL,4u<<16);
+        rsx_dispatch_method(&g.rsx,M_ZSTENCIL_CLEAR,0x0000FFFF);
+        g_ld_depth_clear=0; sink_clear(NULL,&g.rsx,RSX_CLEAR_DEPTH);
+        const u32 old_depth_pitch=read_depth(g.depth,rb,131072);
+        g_ld_depth_clear=1; sink_clear(NULL,&g.rsx,RSX_CLEAR_DEPTH);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_HORIZONTAL,(2u<<16)|1u);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_VERTICAL,(2u<<16)|1u);
+        rsx_dispatch_method(&g.rsx,M_ZSTENCIL_CLEAR,0xABCD8000);
+        sink_clear(NULL,&g.rsx,RSX_CLEAR_DEPTH);
+        rsx_dispatch_method(&g.rsx,M_ZSTENCIL_CLEAR,0x1234567A);
+        sink_clear(NULL,&g.rsx,RSX_CLEAR_STENCIL); // must preserve depth
+        const u32 new_depth_pitch=read_depth(g.depth,rb,196608);
         rsx_dispatch_method(&g.rsx,0x0194,0xFEED0000);
         rsx_dispatch_method(&g.rsx,0x0200,8u<<16); // surface clip
         rsx_dispatch_method(&g.rsx,0x0204,8u<<16);
         rsx_dispatch_method(&g.rsx,0x0208,8); // A8R8G8B8
         rsx_dispatch_method(&g.rsx,0x020C,32);
         rsx_dispatch_method(&g.rsx,0x0210,0x1000);
+        rsx_dispatch_method(&g.rsx,0x0214,0x3000);
+        rsx_dispatch_method(&g.rsx,0x0208,8|(2u<<5));
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_HORIZONTAL,8u<<16);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_VERTICAL,8u<<16);
+        rsx_dispatch_method(&g.rsx,M_ZSTENCIL_CLEAR,0xFFFFFF5A);
+        sink_clear(NULL,&g.rsx,RSX_CLEAR_DEPTH|RSX_CLEAR_STENCIL);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_HORIZONTAL,(3u<<16)|2u);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_VERTICAL,(4u<<16)|1u);
+        rsx_dispatch_method(&g.rsx,M_ZSTENCIL_CLEAR,0x400000A5);
+        sink_clear(NULL,&g.rsx,RSX_CLEAR_DEPTH|RSX_CLEAR_STENCIL);
+        const u32 scene_depth_pitch=read_depth(g.zdepths[zslot-1].tex,rb,262144);
         rsx_dispatch_method(&g.rsx,M_SCISSOR_HORIZONTAL,8u<<16);
         rsx_dispatch_method(&g.rsx,M_SCISSOR_VERTICAL,8u<<16);
         rsx_dispatch_method(&g.rsx,0x1D90,0xFF0000FF); // blue
@@ -595,6 +643,16 @@ static void resolution_tests(void)
             const int inside=x>=atlas_w/4 && x<3*atlas_w/4 && y>=atlas_h/4 && y<3*atlas_h/4;
             const u8* pixel=bytes+65536+y*256+x*4;
             assert(pixel[0]==0 && pixel[1]==(inside?255:0) && pixel[2]==0 && pixel[3]==255);
+            float old_depth,new_depth;
+            memcpy(&old_depth,bytes+131072+y*old_depth_pitch+x*4,4);
+            memcpy(&new_depth,bytes+196608+y*new_depth_pitch+x*4,4);
+            assert(fabsf(old_depth-255.0f/16777215.0f)<1e-7f);
+            assert(fabsf(new_depth-(inside?32768.0f/65535.0f:1.0f))<1e-7f);
+        }
+        for(u32 y=0;y<sf->h;++y)for(u32 x=0;x<sf->w;++x) {
+            const int inside=x>=2*sf->w/8 && x<5*sf->w/8 && y>=sf->h/8 && y<5*sf->h/8;
+            float depth; memcpy(&depth,bytes+262144+y*scene_depth_pitch+x*4,4);
+            assert(fabsf(depth-(inside?4194304.0f/16777215.0f:1.0f))<1e-7f);
         }
         rb->lpVtbl->Unmap(rb,0,NULL);
         for(u32 i=0;i<g.n_surfaces;++i)g.surfaces[i].tex->lpVtbl->Release(g.surfaces[i].tex);
@@ -603,6 +661,7 @@ static void resolution_tests(void)
             g.zdepths[i].snapshot->lpVtbl->Release(g.zdepths[i].snapshot);
         }
         memset(g.surfaces,0,sizeof(g.surfaces)); memset(g.zdepths,0,sizeof(g.zdepths));
+        g.depth=NULL;
     }
     g.n_surfaces=g.n_zdepths=0; g.ready=0; memset(&g_ld_resolution,0,sizeof(g_ld_resolution));
     rsx_color_clear_release(&g.color_clear);
@@ -610,6 +669,7 @@ static void resolution_tests(void)
     g.srv_cpu_heap->lpVtbl->Release(g.srv_cpu_heap); g.dsv_heap->lpVtbl->Release(g.dsv_heap);
     g.rtv_heap=g.srv_cpu_heap=g.dsv_heap=NULL;
     puts("Custom resolution GPU readbacks: native, 1.5x, 2x, fractional asymmetric targets and independent shadow atlases; masked scissor clears, guest address bounds, depth dimensions and GPU blits passed.");
+    puts("Z16/Z24S8 GPU clears: far depth, partial scissor, unused high Z16 bits, stencil-only depth preservation and legacy negative control passed at six resolutions.");
 }
 static void graphics_sampler_tests(void)
 {
