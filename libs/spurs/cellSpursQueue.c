@@ -2,6 +2,8 @@
 #include "cellSpurs.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../runtime/platform/win32_compat.h"
+#include "spurs_queue_profile.h"
+#include "spurs_queue_wait.h"
 
 /* Shared with the SDK's SPU queue routines: W0 pop, W1 push, W2 entry size,
  * W3 depth; the next quadword starts with the 64-bit buffer EA and ends with
@@ -62,8 +64,13 @@ static s32 queue_transfer(u64 queue_ea, u64 data_ea, u32 blocking, int push, u32
     if (blocking > 1 || peek > 1 || queue_ea > UINT32_MAX || data_ea > UINT32_MAX)
         return CELL_SPURS_TASK_ERROR_INVAL;
 
+    QUEUE_PROFILE_BEGIN();
+    int native_wait = blocking && queue_native_wait_enabled();
+    int queue_watch = -1;
     for (;;) {
+        QUEUE_PROFILE_LOCK_BEGIN();
         spu_lockline_lock();
+        QUEUE_PROFILE_LOCK_END();
         u32 head = vm_read32(q), tail = vm_read32(q + 4);
         u32 size = vm_read32(q + 8), depth = vm_read32(q + 12);
         u64 buffer64 = vm_read64(q + 16);
@@ -72,31 +79,42 @@ static s32 queue_transfer(u64 queue_ea, u64 data_ea, u32 blocking, int push, u32
             !buffer64 || buffer64 > UINT32_MAX || (buffer64 & 15u) ||
             buffer64 + (u64)size * depth > 0x100000000ull ||
             (u64)data + size > 0x100000000ull || direction > 2) {
+            if (queue_watch >= 0) spu_coh_unwatch_queue(queue_watch);
             spu_lockline_unlock();
-            return CELL_SPURS_TASK_ERROR_INVAL;
+            QUEUE_RETURN(CELL_SPURS_TASK_ERROR_INVAL);
         }
         if (direction != (push ? 2u : 1u)) {
+            if (queue_watch >= 0) spu_coh_unwatch_queue(queue_watch);
             spu_lockline_unlock();
-            return CELL_SPURS_TASK_ERROR_PERM;
+            QUEUE_RETURN(CELL_SPURS_TASK_ERROR_PERM);
         }
         u32 normalized_head = (head & 0x80000000u) ? ~head : head;
         u32 normalized_tail = (tail & 0x80000000u) ? ~tail : tail;
         u32 modulus = depth * 2;
         if (normalized_head >= modulus || normalized_tail >= modulus) {
+            if (queue_watch >= 0) spu_coh_unwatch_queue(queue_watch);
             spu_lockline_unlock();
-            return CELL_SPURS_TASK_ERROR_INVAL;
+            QUEUE_RETURN(CELL_SPURS_TASK_ERROR_INVAL);
         }
         u32 count = normalized_tail >= normalized_head ? normalized_tail - normalized_head
                   : modulus - normalized_head + normalized_tail;
         if (count > depth) {
+            if (queue_watch >= 0) spu_coh_unwatch_queue(queue_watch);
             spu_lockline_unlock();
-            return CELL_SPURS_TASK_ERROR_INVAL;
+            QUEUE_RETURN(CELL_SPURS_TASK_ERROR_INVAL);
         }
         int busy = (head | tail) & 0x80000000u;
         if (busy || (push ? count == depth : count == 0)) {
+            QUEUE_PROFILE_TASKSET((u32)vm_read64(q + 0x70));
+            QUEUE_PROFILE_WAIT(busy);
+            u64 snapshot = 0;
+            if (native_wait) {
+                memcpy(&snapshot, vm_base + q, sizeof(snapshot));
+                if (queue_watch < 0) queue_watch = spu_coh_watch_queue(q, vm_base + q);
+            }
             spu_lockline_unlock();
-            if (!blocking) return busy ? CELL_SPURS_TASK_ERROR_BUSY : CELL_SPURS_TASK_ERROR_AGAIN;
-            Sleep(1);
+            if (!blocking) QUEUE_RETURN(busy ? CELL_SPURS_TASK_ERROR_BUSY : CELL_SPURS_TASK_ERROR_AGAIN);
+            QUEUE_PROFILE_SLEEP(queue_wait_for_publication(q, snapshot, native_wait));
             continue;
         }
         u32 index = push ? tail : head;
@@ -104,17 +122,20 @@ static s32 queue_transfer(u64 queue_ea, u64 data_ea, u32 blocking, int push, u32
         if (push) memcpy(slot, vm_base + data, size);
         else memcpy(vm_base + data, slot, size);
         if (peek) {
+            if (queue_watch >= 0) spu_coh_unwatch_queue(queue_watch);
             spu_lockline_unlock();
-            return CELL_OK;
+            QUEUE_RETURN(CELL_OK);
         }
         /* Payload precedes publication under the same lock as GETLLAR/PUTLLC. */
         queue_write_index(vm_base + q + (push ? 4 : 0), (index + 1) % modulus);
         u32 taskset = (u32)vm_read64(q + 0x70);
+        QUEUE_PROFILE_TASKSET(taskset);
         int waiter = queue_take_waiter(vm_base + q, push ? 0x20 : 0x30);
         spu_coh_notify_write(q);
+        if (queue_watch >= 0) spu_coh_unwatch_queue(queue_watch);
         spu_lockline_unlock();
         if (waiter >= 0 && taskset) spu_taskset_signal_task(taskset, (u32)waiter);
-        return CELL_OK;
+        QUEUE_RETURN(CELL_OK);
     }
 }
 

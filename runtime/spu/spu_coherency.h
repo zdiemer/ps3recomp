@@ -42,6 +42,11 @@ extern "C" {
  * reserved. The critical sections are two 128-byte memcpy and a memcmp. */
 void spu_lockline_lock(void);
 void spu_lockline_unlock(void);
+/* Opt-in HLE queue wake acceleration, called with the lock-line lock held. */
+#ifdef _WIN32
+int spu_coh_watch_queue(uint32_t ea, void* host_address);
+void spu_coh_unwatch_queue(int cookie);
+#endif
 
 /* Mark `ea`'s 128-byte line as SPU-reserved and remember `ctx` as a possible
  * reservation holder. Called from the SPU's GETLLAR with the lock held.

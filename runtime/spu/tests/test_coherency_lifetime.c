@@ -7,6 +7,41 @@
 #include <stdlib.h>
 #include <string.h>
 static unsigned wakes;
+static void notify(uint32_t ea);
+#pragma comment(lib, "synchronization.lib")
+static HANDLE waiter_started;
+static DWORD WINAPI queue_waiter(void* address) {
+    uint64_t snapshot = 0;
+    SetEvent(waiter_started);
+    return WaitOnAddress(address, &snapshot, 8, 2000) ? 0 : GetLastError();
+}
+static void test_queue_wake(int except) {
+    uint64_t* header = (uint64_t*)VirtualAlloc(NULL,4096,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+    assert(header);
+    spu_lockline_lock();
+    int first = spu_coh_watch_queue(0x4000, header);
+    int second = spu_coh_watch_queue(0x4000, header);
+    assert(first >= 0 && second == first);
+    spu_coh_unwatch_queue(first); /* another caller still waits */
+    spu_lockline_unlock();
+    waiter_started = CreateEvent(NULL,TRUE,FALSE,NULL);
+    HANDLE waiter = CreateThread(NULL,0,queue_waiter,header,0,NULL);
+    assert(waiter && waiter_started);
+    assert(WaitForSingleObject(waiter_started,1000)==WAIT_OBJECT_0);
+    Sleep(20);
+    spu_lockline_lock();
+    *header = 1;
+    if (except) spu_coh_notify_write_except(0x4000,NULL);
+    else spu_coh_notify_write(0x4000);
+    spu_lockline_unlock();
+    assert(WaitForSingleObject(waiter,1000)==WAIT_OBJECT_0);
+    DWORD result; assert(GetExitCodeThread(waiter,&result) && result==0);
+    CloseHandle(waiter); CloseHandle(waiter_started);
+    spu_lockline_lock(); spu_coh_unwatch_queue(second); spu_lockline_unlock();
+    DWORD old; assert(VirtualProtect(header,4096,PAGE_NOACCESS,&old));
+    notify(0x4000); /* removed watches must not dereference a freed queue */
+    VirtualFree(header,0,MEM_RELEASE);
+}
 void spu_ch_wake(spu_context* ctx) { assert(ctx); ++wakes; }
 static void reserve(spu_context* ctx,uint32_t ea) {
     spu_lockline_lock(); ctx->resv_valid=1; ctx->resv_ea=ea;
@@ -42,6 +77,7 @@ int main(void) {
     notify(0x5000); assert(wakes==COUNT);
     for (unsigned i=0;i<COUNT;i++) spu_coh_unregister(&holders[i]);
     _aligned_free(holders); notify(0x5000); assert(wakes==COUNT);
-    puts("SPU coherency: protected freed holder, repeated registration, 128 live holders and self-exclusion passed");
+    test_queue_wake(0); test_queue_wake(1);
+    puts("SPU coherency: reservation lifetimes and native queue wake/refcount lifetimes passed");
     return 0;
 }

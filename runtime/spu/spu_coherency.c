@@ -21,6 +21,63 @@
 extern "C" {
 #endif
 
+/* Native HLE queues may sleep on their raw eight-byte BE header. All registry
+ * access, snapshots and notifications occur under the existing lock-line lock.
+ * Watches are reference counted and removed before their HLE calls return, so
+ * freed queues leave no host pointers. Collisions retain timeout polling. */
+#ifdef _WIN32
+#include <windows.h>
+#pragma comment(lib, "synchronization.lib")
+static struct {
+    uint32_t line;
+    void* host;
+    uint64_t value;
+    unsigned references;
+} s_queue_watches[1024];
+static unsigned s_queue_watch_count;
+static unsigned queue_watch_index(uint32_t ea)
+{ return ((ea >> 7) ^ (ea >> 17)) & 1023u; }
+int spu_coh_watch_queue(uint32_t ea, void* host_address)
+{
+    unsigned slot = queue_watch_index(ea);
+    if (s_queue_watches[slot].references) {
+        if (s_queue_watches[slot].line != (ea & ~127u) ||
+            s_queue_watches[slot].host != host_address) return -1;
+        ++s_queue_watches[slot].references;
+        return (int)slot;
+    }
+    s_queue_watches[slot].line = ea & ~127u;
+    s_queue_watches[slot].host = host_address;
+    memcpy(&s_queue_watches[slot].value, host_address, 8);
+    s_queue_watches[slot].references = 1;
+    ++s_queue_watch_count;
+    return (int)slot;
+}
+void spu_coh_unwatch_queue(int cookie)
+{
+    if (cookie < 0 || cookie >= 1024 || !s_queue_watches[cookie].references) return;
+    if (!--s_queue_watches[cookie].references) {
+        s_queue_watches[cookie].host = NULL;
+        --s_queue_watch_count;
+    }
+}
+static void queue_notify_publication(uint32_t ea)
+{
+    if (!s_queue_watch_count) return;
+    unsigned slot = queue_watch_index(ea);
+    if (s_queue_watches[slot].host && s_queue_watches[slot].line == (ea & ~127u)) {
+        uint64_t value;
+        memcpy(&value, s_queue_watches[slot].host, 8);
+        if (value != s_queue_watches[slot].value) {
+            s_queue_watches[slot].value = value;
+            WakeByAddressAll(s_queue_watches[slot].host);
+        }
+    }
+}
+#else
+#define queue_notify_publication(ea) ((void)0)
+#endif
+
 /* ===========================================================================
  * The lock-line lock
  *
@@ -178,6 +235,7 @@ int spu_coh_is_reserved(uint32_t addr)
  * before notifying; this gives the DMA path the same ability. */
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
+    queue_notify_publication(ea);
     uint32_t line = ea & ~127u;
     for (size_t i = 0; i < s_coh_count; i++) {
         spu_context* c = s_coh_ctxs[i];
@@ -193,6 +251,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 
 void spu_coh_notify_write(uint32_t ea)
 {
+    queue_notify_publication(ea);
     uint32_t line = ea & ~127u;
     for (size_t i = 0; i < s_coh_count; i++) {
         spu_context* c = s_coh_ctxs[i];
