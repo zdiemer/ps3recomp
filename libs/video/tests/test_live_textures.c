@@ -619,12 +619,75 @@ static void shadow_sampler_tests(void)
     g_ld_shadow_compare=saved;
     puts("Shadow sampler: Haze GEQUAL/linear state, six RSX comparisons, exact LOD/R identity, raw/cube/color/alpha-kill exclusions passed");
 }
+static void topology_copy_tests(void)
+{
+    const u32 saved_flags=g_ld_cpu_work;
+    dc_reset();
+    const rsx_vertex_remap saved_remap=dc.ref_remap;
+    u8* pages=VirtualAlloc(NULL,8192,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+    assert(pages); DWORD old;
+    assert(VirtualProtect(pages+4096,4096,PAGE_NOACCESS,&old));
+    unsigned cases=0;
+    for (u32 count=0; count<=257; ++count) {
+        u32* map=(u32*)(pages+4096-count*sizeof(u32));
+        for (u32 i=0; i<count; ++i) map[i]=(i*17u)%29u;
+        for (unsigned remapped=0; remapped<2; ++remapped)
+        for (unsigned short_capacity=0; short_capacity<2; ++short_capacity)
+        for (unsigned fast=0; fast<2; ++fast) {
+            u32 output[260];
+            for (u32 i=0; i<260; ++i) output[i]=0xA5A5A5A5u;
+            dc.n_source_refs=count; dc.refs_remapped=remapped;
+            dc.ref_remap.occurrence_to_unique=map;
+            const u32 capacity=short_capacity && count>4 ? count-4 : count;
+            dc.ref_remap.occurrence_capacity=capacity;
+            g_ld_cpu_work=fast?1024:0;
+            write_topology_indices(PRIM_TRIANGLES,output+1);
+            const u32 written=count-count%3;
+            for (u32 i=0; i<written; ++i)
+                assert(output[i+1]==(remapped && i<capacity ? map[i] : i));
+            assert(output[0]==0xA5A5A5A5u);
+            for (u32 i=written+1; i<260; ++i) assert(output[i]==0xA5A5A5A5u);
+            ++cases;
+        }
+    }
+    dc.ref_remap=saved_remap; dc_reset(); g_ld_cpu_work=saved_flags;
+    VirtualFree(pages,0,MEM_RELEASE);
+    printf("Triangle indices: %u ordered-oracle cases, duplicate maps, identity/short-capacity fallback, remainder and protected tails passed\n",cases);
+}
+static void topology_copy_benchmark(void)
+{
+    if (!getenv("LD_TOPOLOGY_BENCH")) return;
+    const u32 count=1000007, written=count-count%3;
+    u32* map=malloc((size_t)count*sizeof(*map));
+    u32* output=malloc((size_t)count*sizeof(*output)); assert(map && output);
+    for (u32 i=0; i<count; ++i) map[i]=(i*17u)%65536u;
+    const u32 saved_flags=g_ld_cpu_work;
+    dc_reset(); const rsx_vertex_remap saved_remap=dc.ref_remap;
+    dc.refs_remapped=1; dc.n_source_refs=count;
+    dc.ref_remap.occurrence_to_unique=map; dc.ref_remap.occurrence_capacity=count;
+    LARGE_INTEGER frequency; assert(QueryPerformanceFrequency(&frequency));
+    for (unsigned pair=0; pair<3; ++pair) for (unsigned fast=0; fast<2; ++fast) {
+        g_ld_cpu_work=fast?1024:0;
+        write_topology_indices(PRIM_TRIANGLES,output);
+        LARGE_INTEGER begin,end; QueryPerformanceCounter(&begin);
+        for (unsigned repeat=0; repeat<32; ++repeat)
+            write_topology_indices(PRIM_TRIANGLES,output);
+        QueryPerformanceCounter(&end);
+        assert(!memcmp(output,map,(size_t)written*sizeof(*map)));
+        printf("Triangle index microbench pair=%u bulk=%u indices=%u mean_ms=%.6f\n",
+            pair,fast,written,(double)(end.QuadPart-begin.QuadPart)*1000/frequency.QuadPart/32);
+    }
+    dc.ref_remap=saved_remap; dc_reset(); g_ld_cpu_work=saved_flags;
+    free(output); free(map);
+}
 int main(void)
 {
     shadow_sampler_tests();
     cache_tests();
     fetch_tests();
     reference_batch_tests();
+    topology_copy_tests();
+    topology_copy_benchmark();
     IDXGIFactory4* factory; IDXGIAdapter* warp;
     OK(CreateDXGIFactory1(&IID_IDXGIFactory4,(void**)&factory));
     OK(factory->lpVtbl->EnumWarpAdapter(factory,&IID_IDXGIAdapter,(void**)&warp));
