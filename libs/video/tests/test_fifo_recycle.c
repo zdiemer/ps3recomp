@@ -10,12 +10,18 @@ int spu_coh_is_reserved(uint32_t ea) { (void)ea; return 0; }
 void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t ea, uint64_t v, int w) { (void)ea; (void)v; (void)w; }
 static DWORD WINAPI recycle(void* unused) { (void)unused; cellGcm_fifo_recycle(0x100); return 0; }
+static DWORD WINAPI wait_ack(void* value) {
+    gcm_fifo_wait_for_ea((u32)(uintptr_t)value); return 0;
+}
 static void wait_put(u32 value) {
     ULONGLONG deadline = GetTickCount64() + 5000;
     while (vm_read32(GCM_CONTROL_GUEST_ADDR) != value && GetTickCount64() < deadline) Sleep(1);
     assert(vm_read32(GCM_CONTROL_GUEST_ADDR) == value);
 }
-int main(void) {
+int main(int argc, char** argv) {
+    const char* mode = argc == 2 ? argv[1] : "0";
+    assert(argc <= 2 && (mode[0] == '0' || mode[0] == '1'));
+    _putenv_s("GCM_FIFO_WAIT_NATIVE", mode);
     const u32 begin = 0x100000, tail = 0x101000;
     vm_base = calloc(1, GCM_CONTROL_GUEST_ADDR + 4096);
     assert(vm_base);
@@ -89,8 +95,23 @@ int main(void) {
     cellGcm_rsx_process_fifo();
     assert(s_fifo_getoff == 12);
     _putenv_s("GCM_SEMA_ACQUIRE", "0");
+    /* Wakes and unrelated progress cannot acknowledge the requested tail. */
+    gcm_fifo_publish_drained_ea(0x1111);
+    HANDLE waiter = CreateThread(NULL, 0, wait_ack, (void*)(uintptr_t)0x3333, 0, NULL);
+    assert(waiter);
+    Sleep(10);
+    WakeByAddressAll((void*)&g_gcm_fifo_drained_ea);
+    gcm_fifo_publish_drained_ea(0x2222);
+    assert(WaitForSingleObject(waiter, 20) == WAIT_TIMEOUT);
+    gcm_fifo_publish_drained_ea(0x3333);
+    assert(WaitForSingleObject(waiter, 5000) == WAIT_OBJECT_0);
+    CloseHandle(waiter);
+    /* Publication before entering the wait must return without another wake. */
+    waiter = CreateThread(NULL, 0, wait_ack, (void*)(uintptr_t)0x3333, 0, NULL);
+    assert(waiter && WaitForSingleObject(waiter, 5000) == WAIT_OBJECT_0);
+    CloseHandle(waiter);
     free(vm_base);
-    puts("PASS: FIFO tail/wrap acknowledgments, delayed consumer, flip insertion and semaphore waits");
+    puts("PASS: FIFO tail/wrap acknowledgments, delayed consumer, flip insertion, semaphore and native wake predicates");
     return 0;
 }
 void (*g_spu_put_hook)(u32,u32);
