@@ -76,7 +76,7 @@ struct PpuWaitProfile {
          * The instrumented run must be compared with an uninstrumented run. */
         static const bool stacks = getenv("PPU_WAIT_STACKS") != nullptr;
         const bool signal = stacks && !strcmp(kind,"syscall") &&
-            (id == 105 || id == 106 || id == 108);
+            (id == 105 || id == 106 || id == 108 || id == 109 || id == 110);
         if (!stream.file || (!signal &&
             (end.QuadPart - begin) * 1000000 < stream.frequency * 200))
             return;

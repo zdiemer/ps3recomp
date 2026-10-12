@@ -236,9 +236,6 @@ typedef struct rsx_draw_backend {
      * back to clear_color, which clears all channels and the whole surface. */
     void (*clear_color_rect)(void* user, u32 surface, const float rgba[4],
                              u32 channels, u32 x, u32 y, u32 w, u32 h);
-    /* Optional read-before-write copy for a pass sampling its own target.
-     * The backend owns and reuses the returned texture until target release. */
-    u32 (*color_snapshot)(void* user, u32 surface);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
