@@ -94,9 +94,10 @@ static unsigned g_ld_shadow_compare;
 static unsigned g_ld_depth_export;
 /* Honor RSX XY by default. Probe: 0=legacy, 1=RSX XY, 2=XY+reciprocal W. */
 static unsigned g_ld_window_position = 1;
-/* Independently benchmark reference filling (1), dense remapping (2), and
- * texture hashing (4). Live changes apply at presentation boundaries. */
-static unsigned g_ld_cpu_work=259;
+/* Default: bulk references (1), dense remapping (2), specialized vertex
+ * decoding (256), and validated triangle remap copies (1024). Live changes
+ * apply at presentation boundaries for independent comparisons. */
+static unsigned g_ld_cpu_work=1283;
 static rsx_vp_program_cache g_ld_vp_program_cache;
 static int g_ld_vertex_cache_enabled=-1;
 static int ld_vertex_cache_enabled(void)
@@ -7150,7 +7151,7 @@ static void write_topology_indices(u32 prim, u32* indices)
         /* The remapper already emits the triangle list's complete occurrence
          * order. Copy that validated prefix instead of calling the external
          * bounds-checked accessor for every index. Other topologies still need
-         * their winding/restart conversion. Bit 1024 is an opt-in comparison. */
+         * their winding/restart conversion. Bit 1024 selects this copy path. */
         if ((g_ld_cpu_work & 1024u) && dc.refs_remapped &&
             dc.ref_remap.occurrence_to_unique &&
             dc.ref_remap.occurrence_capacity >= count) {
