@@ -29,6 +29,7 @@
 /* Non-Windows: the whole path is a no-op (D3D12 is Windows-only). */
 int  rsx_live_draw_enabled(void) { return 0; }
 void rsx_live_draw_set_render_reference(u32 w, u32 h) { (void)w; (void)h; }
+void rsx_live_draw_set_shadow_reference(u32 size) { (void)size; }
 int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void* u)
 { (void)hwnd; (void)w; (void)h; (void)f; (void)u; return 0; }
 void rsx_live_draw_seed_registers(const u32* r, u32 n) { (void)r; (void)n; }
@@ -130,8 +131,20 @@ static int ld_vertex_cache_enabled(void)
 #include <d3dcompiler.h>
 #include "rsx_color_clear.h"
 #include "rsx_render_resolution.h"
+#include "rsx_graphics_settings.h"
+#include "rsx_postprocess.h"
 static rsx_render_resolution g_ld_resolution;
 static u32 g_ld_reference_w, g_ld_reference_h;
+static u32 g_ld_shadow_reference;
+static unsigned g_ld_anisotropy=1, g_ld_aa;
+static float g_ld_mip_bias, g_ld_sharpening, g_ld_exposure;
+static int g_ld_vsync=-1;
+static rsx_postprocess g_ld_postprocess;
+static BOOL g_ld_fullscreen_state;
+static int g_ld_fullscreen_requested;
+static HWND g_ld_display_hwnd;
+static int g_ld_display_focused;
+void rsx_live_draw_set_shadow_reference(u32 size) { g_ld_shadow_reference=size; }
 void rsx_live_draw_set_render_reference(u32 width, u32 height)
 {
     g_ld_reference_w = width; g_ld_reference_h = height;
@@ -142,6 +155,7 @@ void rsx_live_draw_set_render_reference(u32 width, u32 height)
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "user32.lib")
 
 /* Armed by the a010 AUTH repair only after its animation palette is resident. */
 extern volatile LONG g_yz_a010_reference_camera_active;
@@ -626,6 +640,9 @@ static HANDLE g_ld_present_thread_handle = NULL;
 
 #include "rsx_frame_limiter.h"
 static rsx_frame_limiter g_ld_frame_limiter;
+static UINT ld_present_sync_interval(void) {
+    return g_ld_vsync<0 ? (g_ld_frame_limiter.period ? 0u : 1u) : (UINT)g_ld_vsync;
+}
 static u64 g_ld_frame_limit_wait_ticks;
 static void ld_present_measure_dump(void);
 #if defined(YZ_PERF_PROFILE) && defined(YZ_SPU_PROFILE)
@@ -662,7 +679,7 @@ static void ld_present_measure_init(void)
     g_ld_frame_limit_wait_ticks = 0;
     fprintf(stderr,"[frame-limit] max_fps=%u timer=%s present_sync=%u\n", max_fps,
         g_ld_frame_limiter.high_resolution ? "high-resolution" : "fallback",
-        g_ld_frame_limiter.period ? 0u : 1u);
+        ld_present_sync_interval());
 }
 
 static void ld_present_measure_record(u32 guest_frame)
@@ -1662,6 +1679,16 @@ static int ld_texture_shadow(const rsx_dsp_texture* t)
          format==TEX_FMT_DEPTH16 || format==TEX_FMT_DEPTH16_FLOAT);
 }
 
+static int ld_texture_quality_override(const rsx_dsp_texture* t)
+{
+    if (g_ld_anisotropy<=1 && !g_ld_mip_bias) return 0;
+    const u32 format=t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+    const u32 minf=(t->filter>>16)&7u,magf=(t->filter>>24)&7u;
+    return t->dimension==2 && t->mipmaps>1 && (minf==4 || minf==6) && magf==2 &&
+        !(t->format&(TEX_FMT_UNNORM|TEX_FMT_LINEAR)) &&
+        format!=TEX_FMT_DEPTH16 && format!=TEX_FMT_DEPTH16_FLOAT &&
+        format!=TEX_FMT_DEPTH24_D8 && format!=TEX_FMT_DEPTH24_D8_FLOAT;
+}
 static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
 {
     D3D12_SAMPLER_DESC sd = {0};
@@ -1696,6 +1723,15 @@ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
     sd.MaxLOD = mip_present ? (float)max_lod_fx / 256.0f : 0.0f;
     if (sd.MaxLOD < sd.MinLOD) sd.MaxLOD = sd.MinLOD;
     sd.MaxAnisotropy = 1;
+    /* Preserve point-sampled UI, render-target reads and depth comparisons.
+     * A forced anisotropic filter would otherwise change their semantics. */
+    if (ld_texture_quality_override(t)) {
+        if (g_ld_anisotropy>1) {
+            sd.Filter=D3D12_FILTER_ANISOTROPIC;
+            sd.MaxAnisotropy=g_ld_anisotropy;
+        }
+        sd.MipLODBias=g_ld_mip_bias;
+    }
     return sd;
 }
 static u64 sampler_key(const rsx_dsp_texture* t)
@@ -1704,13 +1740,17 @@ static u64 sampler_key(const rsx_dsp_texture* t)
     const u32 magf = (t->filter >> 24) & 0x7;
     /* Exact packed identity: preserve R addressing and both 12-bit LOD fields
      * instead of overflowing the previous 32-bit key. Include comparison state
-     * so a raw depth sampler cannot be reused by the shadow shader. */
+     * so a raw depth sampler cannot be reused by the shadow shader. Bit 46
+     * separates quality-overridden color samplers from excluded UI/depth
+     * textures even when their guest filter/wrap/LOD registers are identical.
+     * The override values themselves are immutable until shutdown. */
     const u64 wrap=(t->wrap & 0xFu) | (((t->wrap >> 8)&0xFu)<<4) |
         (((t->wrap >> 16)&0xFu)<<8);
     const u64 lod=(t->control0 >> 7)&0xFFFFFFu;
     const u64 shadow=ld_texture_shadow(t);
     return minf | ((u64)magf<<3) | (wrap<<6) | (lod<<18) |
-        (shadow<<42) | (shadow ? ((u64)((t->wrap>>28)&7u)<<43) : 0);
+        (shadow<<42) | (shadow ? ((u64)((t->wrap>>28)&7u)<<43) : 0) |
+        ((u64)ld_texture_quality_override(t)<<46);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1977,6 +2017,51 @@ static void ld_flush(ld_flush_reason reason)
     g_ld_profile.total.flush_qpc += flush_ticks;
     g_ld_profile.total.flush_reason_qpc[reason] += flush_ticks;
 #endif
+}
+
+/* DXGI can change fullscreen state on focus loss/restore. Refresh only the
+ * scanout buffers after the present fence; guest surfaces and internal raster
+ * dimensions remain intact. DXGI's automatic Alt+Enter is disabled. */
+static int ld_refresh_display_state(void)
+{
+    if (!g_ld_fullscreen_requested) return 1;
+    BOOL fullscreen=FALSE;
+    HRESULT hr=g.swap->lpVtbl->GetFullscreenState(g.swap,&fullscreen,NULL);
+    if (FAILED(hr)) {
+        fprintf(stderr,"[d3d-fail] GetFullscreenState hr=0x%08lX\n",(unsigned long)hr);
+        g.ready=0; return 0;
+    }
+    const int focused=GetForegroundWindow()==g_ld_display_hwnd && !IsIconic(g_ld_display_hwnd);
+    int transitioned=0;
+    if (focused && !g_ld_display_focused && !fullscreen) {
+        hr=g.swap->lpVtbl->SetFullscreenState(g.swap,TRUE,NULL);
+        if (SUCCEEDED(hr)) {
+            g.swap->lpVtbl->GetFullscreenState(g.swap,&fullscreen,NULL);
+            transitioned=1;
+        } else fprintf(stderr,"[display] DXGI fullscreen retry unavailable hr=0x%08lX; using borderless\n",(unsigned long)hr);
+    }
+    g_ld_display_focused=focused;
+    if (!transitioned && fullscreen==g_ld_fullscreen_state) return 1;
+    ld_flush(LD_FLUSH_PRESENT);
+    if (!g.ready) return 0;
+    for (u32 i=0;i<LD_SWAP_BUFFERS;++i) {
+        if (g.backbuf[i]) g.backbuf[i]->lpVtbl->Release(g.backbuf[i]);
+        g.backbuf[i]=NULL;
+    }
+    hr=g.swap->lpVtbl->ResizeBuffers(g.swap,LD_SWAP_BUFFERS,
+        g_ld_resolution.host_w,g_ld_resolution.host_h,DXGI_FORMAT_R8G8B8A8_UNORM,0);
+    if (SUCCEEDED(hr)) for (u32 i=0;i<LD_SWAP_BUFFERS;++i) {
+        hr=g.swap->lpVtbl->GetBuffer(g.swap,i,&IID_ID3D12Resource,(void**)&g.backbuf[i]);
+        if (FAILED(hr)) break;
+        g.dev->lpVtbl->CreateRenderTargetView(g.dev,g.backbuf[i],NULL,rtv_handle(i));
+    }
+    if (FAILED(hr)) {
+        fprintf(stderr,"[d3d-fail] fullscreen buffer refresh hr=0x%08lX\n",(unsigned long)hr);
+        g.ready=0; return 0;
+    }
+    g_ld_fullscreen_state=fullscreen;
+    fprintf(stderr,"[display] DXGI fullscreen active=%u buffers refreshed\n",(unsigned)fullscreen);
+    return 1;
 }
 
 /* Public wrapper for the RSX SET_REFERENCE / sync fence: block until the GPU
@@ -8492,6 +8577,26 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 {
     if (!rsx_live_draw_enabled()) return 0;
     if (g.ready) return 0;
+    for (unsigned i=0;i<sizeof(rsx_graphics_options)/sizeof(rsx_graphics_options[0]);++i) {
+        const rsx_graphics_option* o=&rsx_graphics_options[i];
+        const char* value=getenv(o->environment);
+        if (value && *value && !rsx_graphics_valid(o,value)) {
+            fprintf(stderr,"[graphics] invalid %s='%s'; expected %s\n",o->environment,value,o->allowed);
+            return -1;
+        }
+    }
+    const char* aa=getenv("RSX_ANTI_ALIASING");
+    const char* af=getenv("RSX_ANISOTROPY");
+    const char* bias=getenv("RSX_MIP_LOD_BIAS");
+    const char* sharp=getenv("RSX_SHARPENING");
+    const char* exposure=getenv("RSX_EXPOSURE");
+    const char* vsync=getenv("RSX_VSYNC");
+    g_ld_aa=aa && !strcmp(aa,"fxaa");
+    g_ld_anisotropy=af && *af ? (unsigned)atoi(af) : 1;
+    g_ld_mip_bias=bias ? (float)atof(bias) : 0;
+    g_ld_sharpening=sharp ? (float)atof(sharp) : 0;
+    g_ld_exposure=exposure ? (float)atof(exposure) : 0;
+    g_ld_vsync=vsync && !strcmp(vsync,"on") ? 1 : vsync && !strcmp(vsync,"off") ? 0 : -1;
     ld_present_measure_init();
 #if defined(YZ_PERF_PROFILE)
     memset(&g_ld_profile, 0, sizeof(g_ld_profile));
@@ -8512,6 +8617,13 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
         g_ld_resolution.reference_w = g_ld_reference_w;
         g_ld_resolution.reference_h = g_ld_reference_h;
     }
+    const char* shadow=getenv("RSX_SHADOW_RESOLUTION");
+    g_ld_resolution.shadow_guest=g_ld_shadow_reference;
+    if (shadow && strcmp(shadow,"follow"))
+        g_ld_resolution.shadow_host=!strcmp(shadow,"native") ? g_ld_shadow_reference : (u32)atoi(shadow);
+    fprintf(stderr,"[graphics] AA=%s AF=%u bias=%g shadow=%u->%u sharpen=%g exposure=%g vsync=%s\n",
+        g_ld_aa ? "fxaa":"off",g_ld_anisotropy,g_ld_mip_bias,g_ld_resolution.shadow_guest,
+        g_ld_resolution.shadow_host,g_ld_sharpening,g_ld_exposure,vsync ? vsync:"auto");
     fprintf(stderr, "[render-resolution] guest=%ux%u scene=%ux%u host=%ux%u custom=%d\n", width, height,
         g_ld_resolution.reference_w, g_ld_resolution.reference_h,
         g_ld_resolution.host_w, g_ld_resolution.host_h, g_ld_resolution.custom);
@@ -8660,7 +8772,32 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     }
     sc1->lpVtbl->QueryInterface(sc1, &IID_IDXGISwapChain3, (void**)&g.swap);
     sc1->lpVtbl->Release(sc1);
+    factory->lpVtbl->MakeWindowAssociation(factory,(HWND)hwnd,DXGI_MWA_NO_ALT_ENTER);
     factory->lpVtbl->Release(factory);
+    const char* window_mode=getenv("RSX_WINDOW_MODE");
+    g_ld_fullscreen_requested=window_mode && !strcmp(window_mode,"fullscreen");
+    g_ld_fullscreen_state=FALSE;
+    g_ld_display_hwnd=(HWND)hwnd;
+    g_ld_display_focused=GetForegroundWindow()==(HWND)hwnd;
+    if (g_ld_fullscreen_requested) {
+        const HRESULT fullscreen_hr=g.swap->lpVtbl->SetFullscreenState(g.swap,TRUE,NULL);
+        if (SUCCEEDED(fullscreen_hr)) {
+            /* Flip-model D3D12 requires ResizeBuffers after the transition.
+             * No backbuffer references have been acquired yet. Keep internal
+             * raster resolution independent of the desktop display mode. */
+            const HRESULT resize_hr=g.swap->lpVtbl->ResizeBuffers(g.swap,LD_SWAP_BUFFERS,
+                g_ld_resolution.host_w,g_ld_resolution.host_h,scd.Format,0);
+            if (FAILED(resize_hr)) {
+                g.swap->lpVtbl->SetFullscreenState(g.swap,FALSE,NULL);
+                fprintf(stderr,"[display] fullscreen ResizeBuffers failed hr=0x%08lX\n",(unsigned long)resize_hr);
+                return -1;
+            }
+            g.swap->lpVtbl->GetFullscreenState(g.swap,&g_ld_fullscreen_state,NULL);
+            fprintf(stderr,"[display] DXGI fullscreen active=%u\n",(unsigned)g_ld_fullscreen_state);
+        } else {
+            fprintf(stderr,"[display] DXGI fullscreen unavailable hr=0x%08lX; using borderless\n",(unsigned long)fullscreen_hr);
+        }
+    }
 
     /* RTV heap: [0..1] backbuffers, [2..] surface cache */
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
@@ -8773,6 +8910,9 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     if (make_root_signature() != 0 ||
         make_depth_snapshot_pipeline() != 0)
         return -1;
+    if ((g_ld_aa || g_ld_sharpening || g_ld_exposure) &&
+        rsx_postprocess_init(&g_ld_postprocess,g.dev,
+            g_ld_resolution.host_w,g_ld_resolution.host_h)!=0) return -1;
 
     static const u8 white[4] = {255, 255, 255, 255};
     g.white_tex = create_texture_rgba(white, 1, 1);
@@ -9082,7 +9222,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
         InterlockedExchange(&g_ld_host_waiting, 1);
         AcquireSRWLockExclusive(&g_ld_access_lock);
     }
-    if (!g.ready || !rgba) {
+    if (!g.ready || !rgba || !ld_refresh_display_state()) {
         if (serialized) {
             ReleaseSRWLockExclusive(&g_ld_access_lock);
             InterlockedExchange(&g_ld_host_waiting, 0);
@@ -9179,7 +9319,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
     {
         g_ld_frame_limit_wait_ticks += rsx_frame_limiter_wait(&g_ld_frame_limiter);
         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap,
-            g_ld_frame_limiter.period ? 0 : 1, 0);
+            ld_present_sync_interval(), 0);
         if (SUCCEEDED(present_hr))
             ld_present_measure_record(g_ld_frames);
         else {
@@ -9515,6 +9655,7 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
 void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
+    if (!ld_refresh_display_state()) return;
     if (g_ld_frames%60==0) {
         static const char* work_control=(const char*)-1;
         if (work_control==(const char*)-1) work_control=getenv("RSX_CPU_WORK_FILE");
@@ -9713,6 +9854,13 @@ void rsx_live_draw_present(u32 buffer_id)
         return;
     }
     g_ld_last_present_target = target;
+    surface_t display_image=g.surfaces[target];
+    if (g_ld_postprocess.output) {
+        display_image.tex=rsx_postprocess_run(&g_ld_postprocess,g.dev,g.list,
+            display_image.tex,g_ld_aa,g_ld_sharpening,g_ld_exposure);
+        display_image.w=g_ld_postprocess.width; display_image.h=g_ld_postprocess.height;
+        display_image.fmt=DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
     if (dump_requested && !DeleteFileA(dump_trigger)) dump_requested = 0;
     if (dump_now || dump_requested) {
         if (dump_now) dump_written++;
@@ -9721,7 +9869,7 @@ void rsx_live_draw_present(u32 buffer_id)
             snprintf(path, sizeof(path), "%s\\requested_%06u.ppm", dump_dir, g_ld_frames);
         else
             snprintf(path, sizeof(path), "%s\\frame_%06u.ppm", dump_dir, dump_n - 1u);
-        const u64 nb = ld_dump_surface_ppm(path, &g.surfaces[target]);
+        const u64 nb = ld_dump_surface_ppm(path, &display_image);
         fprintf(stderr, "[frame-dump] %s %ux%u nonblack=%llu\n", path,
                 g.surfaces[target].w, g.surfaces[target].h,
                 (unsigned long long)(nb == UINT64_MAX ? 0 : nb));
@@ -9750,7 +9898,7 @@ void rsx_live_draw_present(u32 buffer_id)
       }
       if (rec) {
           g_ld_record_to = rec;
-          ld_dump_surface_ppm(NULL, &g.surfaces[target]);
+          ld_dump_surface_ppm(NULL, &display_image);
           g_ld_record_to = NULL;
           fflush(rec);
       } }
@@ -9821,7 +9969,7 @@ void rsx_live_draw_present(u32 buffer_id)
           ld_trace_target("present", target, buffer_id);
           last_present_target = target;
       } }
-    ID3D12Resource* srcimg = presented_surface->tex;
+    ID3D12Resource* srcimg = display_image.tex;
     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
     ID3D12Resource* bb = g.backbuf[bbi];
 
@@ -9850,7 +9998,7 @@ void rsx_live_draw_present(u32 buffer_id)
     {
         g_ld_frame_limit_wait_ticks += rsx_frame_limiter_wait(&g_ld_frame_limiter);
         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap,
-            g_ld_frame_limiter.period ? 0 : 1, 0);
+            ld_present_sync_interval(), 0);
         if (SUCCEEDED(present_hr))
             ld_present_measure_record(g_ld_frames + 1u);
         else {
@@ -10951,7 +11099,11 @@ void rsx_live_draw_shutdown(void)
             g.depth_snapshot_rootsig);
     if (g.rootsig_x) g.rootsig_x->lpVtbl->Release(g.rootsig_x);
     rsx_color_clear_release(&g.color_clear);
-    if (g.swap) g.swap->lpVtbl->Release(g.swap);
+    rsx_postprocess_destroy(&g_ld_postprocess);
+    if (g.swap) {
+        g.swap->lpVtbl->SetFullscreenState(g.swap,FALSE,NULL);
+        g.swap->lpVtbl->Release(g.swap);
+    }
     if (g_ld_info_queue) {
         g_ld_info_queue->lpVtbl->Release(g_ld_info_queue);
         g_ld_info_queue = NULL;
