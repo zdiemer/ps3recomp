@@ -231,6 +231,11 @@ typedef struct rsx_draw_backend {
      * engine owns the returned handle and releases it with texture_release.
      * 0 rejects the consuming draw; NULL retains the legacy guest-upload route. */
     u32 (*color_snapshot)(void* user, u32 surface);
+    /* Optional precise clear. Channel bits are R=1, G=2, B=4, A=8;
+     * the rectangle uses guest surface coordinates. Legacy backends fall
+     * back to clear_color, which clears all channels and the whole surface. */
+    void (*clear_color_rect)(void* user, u32 surface, const float rgba[4],
+                             u32 channels, u32 x, u32 y, u32 w, u32 h);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
