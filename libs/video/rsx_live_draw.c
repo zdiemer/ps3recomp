@@ -30,6 +30,8 @@
 int  rsx_live_draw_enabled(void) { return 0; }
 void rsx_live_draw_set_render_reference(u32 w, u32 h) { (void)w; (void)h; }
 void rsx_live_draw_set_shadow_reference(u32 size) { (void)size; }
+int rsx_live_draw_set_texture_write_watch(void* base, size_t bytes)
+{ (void)base; (void)bytes; return 0; }
 int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void* u)
 { (void)hwnd; (void)w; (void)h; (void)f; (void)u; return 0; }
 void rsx_live_draw_seed_registers(const u32* r, u32 n) { (void)r; (void)n; }
@@ -87,6 +89,26 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "rsx_texture_write_watch.h"
+
+static rsx_texture_write_watch g_texture_watch;
+static u64 g_texture_watch_queries, g_texture_watch_dirty_pages;
+static u64 g_texture_watch_skips, g_texture_watch_skip_bytes;
+static u64 g_texture_watch_audits, g_texture_watch_races, g_texture_watch_failures;
+int rsx_live_draw_set_texture_write_watch(void* base, size_t bytes)
+{
+    if (g_texture_watch.base) return 0;
+    return rsx_texture_write_watch_init(&g_texture_watch, base, bytes);
+}
+static void ld_texture_watch_summary(void)
+{
+    if (!g_texture_watch.base) return;
+    fprintf(stderr,"[texture-write-watch-summary] healthy=%d queries=%llu dirty_pages=%llu skips=%llu skip_bytes=%llu audits=%llu races=%llu failures=%llu\n",
+        g_texture_watch.healthy,(unsigned long long)g_texture_watch_queries,
+        (unsigned long long)g_texture_watch_dirty_pages,(unsigned long long)g_texture_watch_skips,
+        (unsigned long long)g_texture_watch_skip_bytes,(unsigned long long)g_texture_watch_audits,
+        (unsigned long long)g_texture_watch_races,(unsigned long long)g_texture_watch_failures);
+}
 
 static rsx_vertex_payload_cache g_ld_vertex_cache;
 static int g_ld_apply_polygon_bias=1;
@@ -299,6 +321,8 @@ typedef struct {
     ID3D12Resource* tex;
     u64 content_hash;
     unsigned content_hash_kind;
+    u64 write_watch_stamp;
+    int write_watch_valid;
     u32 last_hash_frame;
     u64 last_use_serial;
 } texcache_t;
@@ -1197,6 +1221,7 @@ typedef struct {
     u64 texture_decode_qpc;
     u64 texture_hash_qpc;
     u64 texture_hash_bytes;
+    u64 texture_watch_qpc;
     u64 gpu_ticks;
     u64 ps_constant_allocations;
     u64 ps_constant_upload_bytes;
@@ -2431,6 +2456,32 @@ static u64 texture_content_hash_kind(const rsx_dsp_texture* t, int* readable, un
 }
 
 static unsigned texture_hash_kind(void) { return (g_ld_cpu_work >> 2) & 1u; }
+static int texture_watch_stamp(const rsx_dsp_texture* t, u64* stamp, u32* bytes)
+{
+    if (!(g_ld_cpu_work & 4096u) || !g_texture_watch.healthy) return 0;
+    static int observation = -1;
+    if (observation < 0) observation = getenv("LD_TEX_RACE") || getenv("LD_FBDBG");
+    if (observation) return 0; /* Preserve full-read diagnostic semantics. */
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG begin = ld_profile_qpc();
+#endif
+    const u32 span = texture_source_span(t);
+    const u8* source = span ? guest_ptr(t->location,t->offset,span) : NULL;
+    size_t dirty = 0;
+    const int healthy_before = g_texture_watch.healthy;
+    const int ok = source && rsx_texture_write_watch_stamp(&g_texture_watch,source,span,stamp,&dirty);
+    ++g_texture_watch_queries;
+    g_texture_watch_dirty_pages += dirty;
+    if (healthy_before && !g_texture_watch.healthy) {
+        ++g_texture_watch_failures;
+        fprintf(stderr,"[texture-write-watch] query failed; disabling reuse\n");
+    }
+    if (bytes) *bytes = span;
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.texture_watch_qpc += ld_profile_qpc()-begin;
+#endif
+    return ok;
+}
 static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
 {
     return texture_content_hash_kind(t, readable, texture_hash_kind());
@@ -2838,8 +2889,40 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         }
         if (refresh_enabled && entry->tex &&
             entry->last_hash_frame != g_ld_frames) {
-            int readable = 0;
-            const u64 hash = texture_content_hash(t, &readable);
+            u64 watch_stamp = 0;
+            u32 watch_bytes = 0;
+            int watch_valid = texture_watch_stamp(t,&watch_stamp,&watch_bytes);
+            int skip = watch_valid && entry->write_watch_valid &&
+                entry->write_watch_stamp == watch_stamp &&
+                entry->content_hash_kind == texture_hash_kind();
+            static int validate = -1;
+            if (validate < 0) {
+                const char* option = getenv("RSX_TEXTURE_WRITE_WATCH_VALIDATE");
+                validate = option && *option == '1';
+            }
+            int readable = skip && !validate;
+            const u64 hash = readable ? entry->content_hash : texture_content_hash(t, &readable);
+            if (skip && validate) {
+                ++g_texture_watch_audits;
+                u64 after = 0;
+                const int stable = texture_watch_stamp(t,&after,NULL) && after == watch_stamp;
+                if (!stable) {
+                    ++g_texture_watch_races;
+                    watch_valid = 0;
+                    skip = 0;
+                } else if (!readable || hash != entry->content_hash) {
+                    ++g_texture_watch_failures;
+                    g_texture_watch.healthy = 0;
+                    watch_valid = 0; skip = 0;
+                    fprintf(stderr,"[texture-write-watch] unchanged-stamp hash mismatch; disabling reuse\n");
+                }
+            }
+            if (skip) {
+                ++g_texture_watch_skips;
+                g_texture_watch_skip_bytes += watch_bytes;
+            }
+            /* A failed decode must not stamp old GPU contents as current. */
+            entry->write_watch_valid = 0;
             const int hash_changed = texture_cached_content_changed(entry,t,hash,&readable);
             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
              * reads are microseconds apart, so they can only disagree if a
@@ -2905,6 +2988,10 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                                 refresh_count, g_ld_frames, t->location, t->offset,
                                 t->format, t->width, t->height);
                 }
+            }
+            if (readable && entry->content_hash == hash && g_texture_watch.healthy) {
+                entry->write_watch_valid = watch_valid;
+                entry->write_watch_stamp = watch_stamp;
             }
         }
         entry->last_use_serial = ++g_ld_texture_use_serial;
@@ -5785,7 +5872,8 @@ static void ld_profile_present(u32 frame)
                 "create_pso_ms,texture_decode_ms,draws,vertices,texture_upload_bytes,"
                 "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
                 "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work,"
-                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses,topology_index_ms\n");
+                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses,topology_index_ms,"
+                "texture_watch_ms,texture_watch_queries,texture_watch_dirty_pages,texture_watch_skip_bytes,texture_watch_skips,texture_watch_audits,texture_watch_races,texture_watch_failures\n");
         }
     }
     if (csv) {
@@ -5794,8 +5882,10 @@ static void ld_profile_present(u32 frame)
         u64 blit_ticks,blit_pixels,blit_row_pixels;
         cellGcmGetBlitProfile(&blit_ticks,&blit_pixels,&blit_row_pixels);
         static u64 previous_limit_ticks;
+        static u64 previous_watch_queries, previous_watch_dirty_pages, previous_watch_skip_bytes;
+        static u64 previous_watch_skips, previous_watch_audits, previous_watch_races, previous_watch_failures;
         fprintf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu,%.6f\n", frame, now, frame_ms,
+            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
@@ -5829,7 +5919,19 @@ static void ld_profile_present(u32 frame)
             ld_profile_ticks_ms(LD_PROFILE_DELTA(fp_prepare_qpc)),
             (unsigned long long)LD_PROFILE_DELTA(vp_cache_hits),
             (unsigned long long)LD_PROFILE_DELTA(vp_cache_misses),
-            ld_profile_ticks_ms(LD_PROFILE_DELTA(topology_index_qpc)));
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(topology_index_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(texture_watch_qpc)),
+            (unsigned long long)(g_texture_watch_queries-previous_watch_queries),
+            (unsigned long long)(g_texture_watch_dirty_pages-previous_watch_dirty_pages),
+            (unsigned long long)(g_texture_watch_skip_bytes-previous_watch_skip_bytes),
+            (unsigned long long)(g_texture_watch_skips-previous_watch_skips),
+            (unsigned long long)(g_texture_watch_audits-previous_watch_audits),
+            (unsigned long long)(g_texture_watch_races-previous_watch_races),
+            (unsigned long long)(g_texture_watch_failures-previous_watch_failures));
+        previous_watch_queries=g_texture_watch_queries; previous_watch_dirty_pages=g_texture_watch_dirty_pages;
+        previous_watch_skip_bytes=g_texture_watch_skip_bytes; previous_watch_skips=g_texture_watch_skips;
+        previous_watch_audits=g_texture_watch_audits; previous_watch_races=g_texture_watch_races;
+        previous_watch_failures=g_texture_watch_failures;
         previous_limit_ticks=g_ld_frame_limit_wait_ticks;
         previous_ticks=blit_ticks; previous_pixels=blit_pixels; previous_row_pixels=blit_row_pixels;
         if ((frame & 63u) == 0) fflush(csv);
@@ -9252,6 +9354,7 @@ double rsx_live_draw_get_present_fps(void)
 void rsx_live_draw_dump_present_samples(void)
 {
     ld_present_measure_dump();
+    ld_texture_watch_summary();
 }
 
 /* Present a host-decoded RGBA8 frame to the window: copy it straight into the
@@ -9718,7 +9821,7 @@ void rsx_live_draw_present(u32 buffer_id)
         if (work_control) {
             FILE* file=fopen(work_control,"r"); unsigned flags;
             if (file) {
-                if (fscanf(file,"%u",&flags)==1 && flags<=4095 && flags!=g_ld_cpu_work) {
+                if (fscanf(file,"%u",&flags)==1 && flags<=8191 && flags!=g_ld_cpu_work) {
                     g_ld_cpu_work=flags;
                     fprintf(stderr,"[cpu-work] frame=%u flags=%u\n",g_ld_frames,flags);
                 }
@@ -10922,6 +11025,10 @@ void rsx_live_draw_present(u32 buffer_id)
 void rsx_live_draw_shutdown(void)
 {
     if (!g.ready) return;
+    if (g_texture_watch.base) {
+        ld_texture_watch_summary();
+        rsx_texture_write_watch_destroy(&g_texture_watch);
+    }
     rsx_vertex_payload_cache_clear(&g_ld_vertex_cache);
     ld_vertex_diag_emit("shutdown", 1);
     ld_present_measure_dump();
