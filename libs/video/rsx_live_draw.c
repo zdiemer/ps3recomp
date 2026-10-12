@@ -90,6 +90,7 @@ static rsx_vertex_payload_cache g_ld_vertex_cache;
 static int g_ld_apply_polygon_bias=1;
 /* -1 follows the guest state; 0/1 are explicit diagnostic overrides. */
 static int g_ld_depth_clip_probe=-1;
+static unsigned g_ld_shadow_compare;
 /* Independently benchmark reference filling (1), dense remapping (2), and
  * texture hashing (4). Live changes apply at presentation boundaries. */
 static unsigned g_ld_cpu_work=259;
@@ -361,7 +362,7 @@ typedef struct {
     ID3D12DescriptorHeap*      smp_heap;
     u32                        smp_step, smp_ring_used;
     u32                        smp_ring_slots[SMP_RING_TABLES][SMP_TABLE_SIZE];
-    u32                        smp_keys[SMP_CACHE_SLOTS];
+    u64                        smp_keys[SMP_CACHE_SLOTS];
     u32                        n_samplers;
 
     ID3D12RootSignature*       rootsig_x;
@@ -590,6 +591,7 @@ typedef struct {
     u64 present_id;
     u32 guest_frame;
     u32 cpu_work;
+    u32 shadow_compare;
     LONGLONG qpc;
     u64 process_kernel_100ns;
     u64 process_user_100ns;
@@ -672,6 +674,7 @@ static void ld_present_measure_record(u32 guest_frame)
     sample->present_id = present_id;
     sample->guest_frame = guest_frame;
     sample->cpu_work = g_ld_cpu_work;
+    sample->shadow_compare = g_ld_shadow_compare;
     sample->qpc = now.QuadPart;
     g_ld_frame_limiter.last_present = now.QuadPart;
     if (g_ld_schedule_diag) {
@@ -772,9 +775,9 @@ static void ld_present_measure_dump(void)
     if (g_ld_schedule_diag) {
         fprintf(f, "present_id,guest_frame,qpc,process_kernel_100ns,"
                    "process_user_100ns,present_thread_kernel_100ns,"
-                   "present_thread_user_100ns,present_thread_id,cpu_work\n");
+                   "present_thread_user_100ns,present_thread_id,cpu_work,shadow_compare\n");
     } else {
-        fprintf(f, "present_id,guest_frame,qpc,cpu_work\n");
+        fprintf(f, "present_id,guest_frame,qpc,cpu_work,shadow_compare\n");
     }
     const u64 first =
         g_ld_present_total > LD_PRESENT_RING_CAP
@@ -786,18 +789,18 @@ static void ld_present_measure_dump(void)
                                (LD_PRESENT_RING_CAP - 1u)];
         if (sample->present_id == present_id) {
             if (g_ld_schedule_diag) {
-                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u\n",
+                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u,%u\n",
                         (unsigned long long)sample->present_id,
                         sample->guest_frame, sample->qpc,
                         (unsigned long long)sample->process_kernel_100ns,
                         (unsigned long long)sample->process_user_100ns,
                         (unsigned long long)sample->present_thread_kernel_100ns,
                         (unsigned long long)sample->present_thread_user_100ns,
-                        sample->present_thread_id, sample->cpu_work);
+                        sample->present_thread_id, sample->cpu_work, sample->shadow_compare);
             } else {
-                fprintf(f, "%llu,%u,%lld,%u\n",
+                fprintf(f, "%llu,%u,%lld,%u,%u\n",
                         (unsigned long long)sample->present_id,
-                        sample->guest_frame, sample->qpc, sample->cpu_work);
+                        sample->guest_frame, sample->qpc, sample->cpu_work, sample->shadow_compare);
             }
         }
     }
@@ -1630,6 +1633,17 @@ static D3D12_TEXTURE_ADDRESS_MODE gcm_wrap(u32 w)
     }
 }
 
+static int ld_texture_shadow(const rsx_dsp_texture* t)
+{
+    const u32 format=t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+    const u32 compare=(t->wrap >> 28) & 0xFu;
+    return g_ld_shadow_compare && !t->cubemap && t->dimension==2u &&
+        !(t->control0 & 4u) && /* Alpha-kill uses the comparator for alpha. */
+        compare>0u && compare<7u &&
+        (format==TEX_FMT_DEPTH24_D8 || format==TEX_FMT_DEPTH24_D8_FLOAT ||
+         format==TEX_FMT_DEPTH16 || format==TEX_FMT_DEPTH16_FLOAT);
+}
+
 static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
 {
     D3D12_SAMPLER_DESC sd = {0};
@@ -1642,7 +1656,18 @@ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
     D3D12_FILTER_TYPE mnf = min_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
     D3D12_FILTER_TYPE mgf = mag_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
     D3D12_FILTER_TYPE mpf = mip_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
-    sd.Filter = D3D12_ENCODE_BASIC_FILTER(mnf, mgf, mpf, D3D12_FILTER_REDUCTION_TYPE_STANDARD);
+    const int shadow=ld_texture_shadow(t);
+    sd.Filter = D3D12_ENCODE_BASIC_FILTER(mnf, mgf, mpf,
+        shadow ? D3D12_FILTER_REDUCTION_TYPE_COMPARISON : D3D12_FILTER_REDUCTION_TYPE_STANDARD);
+    if (shadow) {
+        /* NV40 RCOMP numbering differs from the GL depth-test enum. */
+        static const D3D12_COMPARISON_FUNC compare[8]={
+            D3D12_COMPARISON_FUNC_NEVER,D3D12_COMPARISON_FUNC_GREATER,
+            D3D12_COMPARISON_FUNC_EQUAL,D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+            D3D12_COMPARISON_FUNC_LESS,D3D12_COMPARISON_FUNC_NOT_EQUAL,
+            D3D12_COMPARISON_FUNC_LESS_EQUAL,D3D12_COMPARISON_FUNC_ALWAYS};
+        sd.ComparisonFunc=compare[(t->wrap >> 28) & 7u];
+    }
     sd.AddressU = gcm_wrap(t->wrap);
     sd.AddressV = gcm_wrap(t->wrap >> 8);
     sd.AddressW = gcm_wrap(t->wrap >> 16);
@@ -1654,13 +1679,19 @@ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
     sd.MaxAnisotropy = 1;
     return sd;
 }
-static u32 sampler_key(const rsx_dsp_texture* t)
+static u64 sampler_key(const rsx_dsp_texture* t)
 {
     const u32 minf = (t->filter >> 16) & 0x7;
     const u32 magf = (t->filter >> 24) & 0x7;
-    const u32 wrap = t->wrap & 0xFFF;
-    const u32 lod  = (t->control0 >> 7) & 0x1FFFFF;
-    return minf | (magf << 3) | (wrap << 6) | (lod << 18);
+    /* Exact packed identity: preserve R addressing and both 12-bit LOD fields
+     * instead of overflowing the previous 32-bit key. Include comparison state
+     * so a raw depth sampler cannot be reused by the shadow shader. */
+    const u64 wrap=(t->wrap & 0xFu) | (((t->wrap >> 8)&0xFu)<<4) |
+        (((t->wrap >> 16)&0xFu)<<8);
+    const u64 lod=(t->control0 >> 7)&0xFFFFFFu;
+    const u64 shadow=ld_texture_shadow(t);
+    return minf | ((u64)magf<<3) | (wrap<<6) | (lod<<18) |
+        (shadow<<42) | (shadow ? ((u64)((t->wrap>>28)&7u)<<43) : 0);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1775,7 +1806,7 @@ static D3D12_CPU_DESCRIPTOR_HANDLE smp_cpu(u32 slot)
     h.ptr += (size_t)slot * g.smp_step;
     return h;
 }
-static u32 sampler_slot(const rsx_dsp_texture* t, u32 key)
+static u32 sampler_slot(const rsx_dsp_texture* t, u64 key)
 {
     for (u32 i = 0; i < g.n_samplers; i++)
         if (g.smp_keys[i] == key) return 1 + i;
@@ -4539,12 +4570,14 @@ static ID3D12PipelineState* get_pso(
     static int ctrl_auto = -1;
     if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
     const u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : rsx_dsp_shader_control(&g.rsx);
-    u32 cube_mask = 0;
+    u32 cube_mask = 0, shadow_mask = 0;
     for (u32 unit = 0; unit < RSX_DSP_NUM_TEXTURES; unit++) {
         rsx_dsp_texture texture;
         rsx_dsp_get_texture(&g.rsx, unit, &texture);
         if (texture.enabled && texture.cubemap)
             cube_mask |= 1u << unit;
+        if (texture.enabled && ld_texture_shadow(&texture))
+            shadow_mask |= 1u << unit;
     }
     const u32 vtex_mask = vertex_texture_mask();
     const u32 txl_mask = cache_vp ? vp_info.txl_mask : vp_txl_unit_mask(vp_uc, vp_instrs);
@@ -4595,6 +4628,7 @@ static ID3D12PipelineState* get_pso(
     const u32 fp_ctrl_key = fp_ctrl & 0x40u;
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
+    key = fnv1a(&shadow_mask, sizeof(shadow_mask), key);
     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
     /* Texel-addressed (RSX_TEX_FMT_UNNORM) units need their coordinates divided
      * by the texture size in the shader -- D3D12 has no unnormalised addressing
@@ -4699,8 +4733,8 @@ static ID3D12PipelineState* get_pso(
     u32 decompiled_constant_count = 0;
     int fi;
     if (ld_fp_constants_buffered()) {
-        fi = rsx_fp_decompile_buffered_ex(
-            fp_uc, fp_size, fp_ctrl, cube_mask, ps_hlsl,
+        fi = rsx_fp_decompile_shadow_ex(
+            fp_uc, fp_size, fp_ctrl, cube_mask, shadow_mask, 1, ps_hlsl,
             sizeof(ps_hlsl), &decompiled_constant_count);
         if (fi > 0 &&
             decompiled_constant_count != g.fp_constants.count)
@@ -4721,9 +4755,9 @@ static ID3D12PipelineState* get_pso(
             if (np < 0) fi = -1;
         }
     } else {
-        fi = rsx_fp_decompile_ex(
-            fp_uc, fp_size, fp_ctrl, cube_mask,
-            ps_hlsl, sizeof(ps_hlsl));
+        fi = rsx_fp_decompile_shadow_ex(
+            fp_uc, fp_size, fp_ctrl, cube_mask, shadow_mask, 0,
+            ps_hlsl, sizeof(ps_hlsl), NULL);
         if (fi > 0 && rs.alpha_test_enable &&
             rsx_fp_apply_alpha_test(
                 ps_hlsl, sizeof(ps_hlsl), rs.alpha_func,
@@ -7679,6 +7713,40 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                         break;
                     }
             if (sampled_depth >= 0) {
+                /* Bounded diagnostics for camera-dependent shadow errors:
+                 * retain the guest's raw compare/address/filter state and the
+                 * logical snapshot dimensions actually exposed to the shader. */
+                {
+                    static int trace=-1;
+                    static u32 seen[64][14], count;
+                    if (trace<0) trace=getenv("RSX_DEPTH_TRACE")!=NULL;
+                    if (trace && count<64u) {
+                        const zdepth_t* z=&g.zdepths[sampled_depth];
+                        const u32 state[14]={u,t.location,t.offset,t.format,t.width,t.height,
+                            t.wrap,t.filter,t.remap,t.control0,z->snapshot_w,z->snapshot_h,
+                            (u32)g_ld_current_pso.key,(u32)(g_ld_current_pso.key>>32)};
+                        u32 index;
+                        for (index=0;index<count;++index)
+                            if (!memcmp(state,seen[index],sizeof(state))) break;
+                        if (index==count) {
+                            memcpy(seen[count++],state,sizeof(state));
+                            fprintf(stderr,"[depth-sample] frame=%u unit=%u loc=%u off=%08X "
+                                "fmt=%X declared=%ux%u snapshot=%ux%u wrap=%08X filter=%08X "
+                                "remap=%08X control0=%08X\n",g_ld_frames,u,t.location,t.offset,
+                                t.format,t.width,t.height,z->snapshot_w,z->snapshot_h,
+                                t.wrap,t.filter,t.remap,t.control0);
+                            if (g_ld_current_pso.valid) {
+                                const ld_pso_metadata* p=&g_ld_current_pso;
+                                const u8* bytes=guest_ptr(p->fp_location,p->fp_offset,p->fp_size);
+                                char path[80];
+                                snprintf(path,sizeof(path),"depth_shader_%016llX.bin",
+                                    (unsigned long long)p->key);
+                                FILE* file=bytes ? fopen(path,"wb") : NULL;
+                                if (file) { fwrite(bytes,1,p->fp_size,file); fclose(file); }
+                            }
+                        }
+                    }
+                }
                 slots[u] = SRV_ZDEPTH_BASE + sampled_depth;
                 g_ld_zdepth_srv_binds++;
                 int seen = 0;
@@ -9274,6 +9342,19 @@ void rsx_live_draw_present(u32 buffer_id)
                 if (fscanf(file,"%u",&flags)==1 && flags<=1023 && flags!=g_ld_cpu_work) {
                     g_ld_cpu_work=flags;
                     fprintf(stderr,"[cpu-work] frame=%u flags=%u\n",g_ld_frames,flags);
+                }
+                fclose(file);
+            }
+        }
+        static const char* shadow_control=(const char*)-1;
+        if (shadow_control==(const char*)-1) shadow_control=getenv("RSX_SHADOW_COMPARE_FILE");
+        if (shadow_control) {
+            FILE* file=fopen(shadow_control,"r"); unsigned enabled;
+            if (file) {
+                if (fscanf(file,"%u",&enabled)==1 && enabled<=1 &&
+                    enabled!=g_ld_shadow_compare) {
+                    g_ld_shadow_compare=enabled;
+                    fprintf(stderr,"[shadow-compare] frame=%u enabled=%u\n",g_ld_frames,enabled);
                 }
                 fclose(file);
             }
