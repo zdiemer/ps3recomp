@@ -2490,16 +2490,13 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         u32 flags = 0;
         if (mask & RSX_CLEAR_DEPTH)   flags |= RSX_BE_CLEAR_DEPTH;
         if (mask & RSX_CLEAR_STENCIL) flags |= RSX_BE_CLEAR_STENCIL;
-        /* ZSTENCIL_CLEAR_VALUE is laid out as the zeta is: depth24 << 8 |
-         * stencil8 for Z24S8, a bare depth16 for Z16 (SURFACE_FORMAT depth
-         * field 1). Read as Z24S8, a Z16 surface's 0xFFFF -- its far plane --
-         * would clear it to 255/16777215, nearly the near plane, and every
-         * LESS or LEQUAL draw into it would then fail. The nv40 reset
-         * 0xFFFFFF00 seeded by rsx_dispatch_init clears to 1.0 / 0. */
+        /* Z16 stores depth in the low word; Z24S8 puts it above stencil.
+         * Match the live renderer's shadow-clear correction. Zero is a valid
+         * near-depth clear; the dispatcher already supplies the reset value. */
         const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
         const int z16 = sf.depth_format == 1u;
-        const float depth = !zs ? 1.0f
-                          : z16 ? (float)(zs & 0xFFFFu) / 65535.0f
+        const float depth =
+                          z16 ? (float)(zs & 0xFFFFu) / 65535.0f
                                 : (float)(zs >> 8) / 16777215.0f;
         g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
                                   depth, z16 ? 0 : (u8)(zs & 0xFFu));
