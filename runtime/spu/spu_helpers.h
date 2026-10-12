@@ -34,6 +34,7 @@ static inline int spu_clz32(uint32_t x) { return x ? __builtin_clz(x) : 32; }
 #endif
 
 #include "spu_float.h"
+#include "spu_float_native.h"
 
 /* Architectural SPU barrier -- the lifted `sync`/`dsync`/`syncc` emission.
  * SPU ISA v1.2 §13 (+ the per-instruction pages): order all earlier LS and
@@ -352,8 +353,8 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
 
 /* ---- single-precision float (4 lanes), SPU extended-range semantics ---- */
-static inline u128 spu_fa(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_add(a._u32[i],b._u32[i]); return r; }
-static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_add(a._u32[i],b._u32[i]^0x80000000u); return r; }
+static inline u128 spu_fa(u128 a, u128 b) { if (spu_float_native_active()) return spu_float_native_add(a,b); u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_add(a._u32[i],b._u32[i]); return r; }
+static inline u128 spu_fs(u128 a, u128 b) { if (spu_float_native_active()) { for(int i=0;i<4;i++) b._u32[i]^=0x80000000u; return spu_float_native_add(a,b); } u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_add(a._u32[i],b._u32[i]^0x80000000u); return r; }
 
 /* RI8 scale: float-to-int uses 2^(173-i8), int-to-float 2^(i8-155).
  * The canonical immediates 173 and 155 are identity conversions. */
@@ -366,10 +367,10 @@ static inline u128 spu_csflt(u128 a, int i8) { u128 r;
         r._u32[i]=spu_float_pack(sign ? 0u-v : v,i8-155,sign); } return r; }
 static inline u128 spu_cuflt(u128 a, int i8) { u128 r;
     for(int i=0;i<4;i++) r._u32[i]=spu_float_pack(a._u32[i],i8-155,0); return r; }
-static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_mul(a._u32[i],b._u32[i]); return r; }
-static inline u128 spu_fma(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_madd(a._u32[i],b._u32[i],c._u32[i]); return r; }
-static inline u128 spu_fms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_madd(a._u32[i],b._u32[i],c._u32[i]^0x80000000u); return r; }
-static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_madd(a._u32[i]^0x80000000u,b._u32[i],c._u32[i]); return r; }
+static inline u128 spu_fm(u128 a, u128 b) { if (spu_float_native_active()) return spu_float_native_mul(a,b); u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_mul(a._u32[i],b._u32[i]); return r; }
+static inline u128 spu_fma(u128 a, u128 b, u128 c) { if (spu_float_native_active()) return spu_float_native_madd(a,b,c); u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_madd(a._u32[i],b._u32[i],c._u32[i]); return r; }
+static inline u128 spu_fms(u128 a, u128 b, u128 c) { if (spu_float_native_active()) { for(int i=0;i<4;i++) c._u32[i]^=0x80000000u; return spu_float_native_madd(a,b,c); } u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_madd(a._u32[i],b._u32[i],c._u32[i]^0x80000000u); return r; }
+static inline u128 spu_fnms(u128 a, u128 b, u128 c) { if (spu_float_native_active()) { for(int i=0;i<4;i++) a._u32[i]^=0x80000000u; return spu_float_native_madd(a,b,c); } u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_madd(a._u32[i]^0x80000000u,b._u32[i],c._u32[i]); return r; }
 static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_canonical(a._u32[i])==spu_float_canonical(b._u32[i])?0xffffffffu:0; return r; }
 static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu_float_gt(a._u32[i],b._u32[i])?0xffffffffu:0; return r; }
 
