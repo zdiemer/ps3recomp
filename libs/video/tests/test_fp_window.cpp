@@ -33,11 +33,11 @@ int main()try{
     float alpha_payload[4]={.25f,0,0,0};D3D11_BUFFER_DESC bd={};bd.ByteWidth=16;bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;D3D11_SUBRESOURCE_DATA init={};init.pSysMem=alpha_payload;
     ComPtr<ID3D11Buffer> alpha_cb;checked(dev->CreateBuffer(&bd,&init,&alpha_cb));ID3D11Buffer* cb=alpha_cb.Get();ctx->PSSetConstantBuffers(1,1,&cb);
     unsigned pixels=0;
-    for(u32 reciprocal:{0u,1u})for(u32 origin:{0u,1u})for(u32 center:{0u,1u})for(u32 height:{0u,8u,576u})for(u32 buffered:{0u,1u})for(u32 alpha:{0u,1u})for(u32 mrt:{0u,1u}){
+    for(float scale:{1.f, 2.f/3.f, .5f, 720.f/997.f})for(u32 reciprocal:{0u,1u})for(u32 origin:{0u,1u})for(u32 center:{0u,1u})for(u32 height:{0u,8u,576u})for(u32 buffered:{0u,1u})for(u32 alpha:{0u,1u})for(u32 mrt:{0u,1u}){
         u8 p[32]={};mov(p,0,0,!mrt);if(mrt)mov(p+16,2,1,true);
         char hlsl[32768];check(rsx_fp_decompile_shadow_ex(p,mrt?32:16,0x40,0,0,buffered,hlsl,sizeof(hlsl),nullptr)>0,"decompile");
         const u32 window=height|(origin<<12)|(center<<16);
-        check(rsx_fp_apply_window_position_ex(hlsl,sizeof(hlsl),window,reciprocal)==(origin||center||reciprocal?1:0),"WPOS patch");
+        check(rsx_fp_apply_window_position_scaled(hlsl,sizeof(hlsl),window,reciprocal,scale,scale)==(origin||center||reciprocal||scale!=1.f?1:0),"WPOS patch");
         if(alpha)check((buffered?rsx_fp_apply_alpha_test_buffered(hlsl,sizeof(hlsl),0x206):rsx_fp_apply_alpha_test(hlsl,sizeof(hlsl),0x206,.25f))==1,"alpha patch");
         auto pc=compile(hlsl,"ps_5_0");ComPtr<ID3D11PixelShader> pixel;checked(dev->CreatePixelShader(pc->GetBufferPointer(),pc->GetBufferSize(),nullptr,&pixel));ctx->PSSetShader(pixel.Get(),nullptr,0);
         ID3D11RenderTargetView* targets[]={rtv[0].Get(),rtv[1].Get()};ctx->OMSetRenderTargets(mrt?2:1,targets,nullptr);ctx->Draw(3,0);ctx->CopyResource(readback.Get(),color[0].Get());
@@ -47,8 +47,8 @@ int main()try{
             const float bias=center?.5f:0.f;
             // SV_POSITION.w is interpolated clip W on Direct3D, not GLSL's
             // reciprocal W. Test both preserving host W and converting to RSX W.
-            const float expected[]={x+.5f-bias,(origin?height-(y+.5f):y+.5f)-bias,.25f,reciprocal?.5f:2.f};
-            for(unsigned c=0;c<4;++c)if(std::abs(actual[c]-expected[c])>=.000001f){
+            const float expected[]={(x+.5f)*scale-bias,(origin?height-(y+.5f)*scale:(y+.5f)*scale)-bias,.25f,reciprocal?.5f:2.f};
+            for(unsigned c=0;c<4;++c)if(std::abs(actual[c]-expected[c])>=.00001f){
                 if(pass)std::cerr<<"window="<<std::hex<<window<<std::dec<<" buffered="<<buffered<<" alpha="<<alpha<<" mrt="<<mrt<<" xy="<<x<<","<<y<<" lane="<<c<<" actual="<<actual[c]<<" expected="<<expected[c]<<"\n";
                 pass=false;
             }

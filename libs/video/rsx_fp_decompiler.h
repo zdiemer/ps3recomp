@@ -229,6 +229,8 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes);
 int rsx_fp_apply_window_position(char* hlsl, u32 out_size, u32 window);
 /* Additionally convert host interpolated clip W to RSX reciprocal W when
  * reciprocal_w is nonzero. Z remains unchanged. Same return contract. */
+int rsx_fp_apply_window_position_scaled(char* hlsl, u32 out_size, u32 window,
+    int reciprocal_w, float scale_x, float scale_y);
 int rsx_fp_apply_window_position_ex(char* hlsl, u32 out_size, u32 window,
                                   int reciprocal_w);
 

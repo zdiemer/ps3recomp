@@ -1427,8 +1427,8 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
 }
 
 /* Honor shader-window XY conventions; optionally supply RSX reciprocal W. */
-int rsx_fp_apply_window_position_ex(char* hlsl, u32 out_size, u32 window,
-                                  int reciprocal_w)
+int rsx_fp_apply_window_position_scaled(char* hlsl, u32 out_size, u32 window,
+                                  int reciprocal_w, float scale_x, float scale_y)
 {
     if (!hlsl || !out_size) return -1;
     const char* end = memchr(hlsl, 0, out_size);
@@ -1436,18 +1436,25 @@ int rsx_fp_apply_window_position_ex(char* hlsl, u32 out_size, u32 window,
     const u32 origin = (window >> 12) & 15u;
     const u32 center = (window >> 16) & 15u;
     if (origin > 1u || center > 1u) return -1;
-    if (!origin && !center && !reciprocal_w) return 0;
+    if (!(scale_x > 0.0f) || !(scale_y > 0.0f)) return -1;
+    if (!origin && !center && !reciprocal_w && scale_x == 1.0f && scale_y == 1.0f) return 0;
     char* entry = strstr(hlsl, "main(PSInput input)");
     char* brace = entry ? strchr(entry, '{') : NULL;
     if (!brace) return -1;
     char* body = brace + 1;
     if (!strstr(body, "input.position")) return 0;
     if (strstr(body, "rsx_wpos")) return -1;
-    char declaration[192];
+    char declaration[320];
     const int added = snprintf(declaration, sizeof(declaration),
         "\n    float4 rsx_wpos = input.position;\n");
     if (added < 0 || (size_t)added >= sizeof(declaration)) return -1;
     size_t length = (size_t)added;
+    if (scale_x != 1.0f || scale_y != 1.0f) {
+        const int n = snprintf(declaration + length, sizeof(declaration) - length,
+            "    rsx_wpos.xy *= float2(%.9g, %.9g);\n", scale_x, scale_y);
+        if (n < 0 || (size_t)n >= sizeof(declaration) - length) return -1;
+        length += (size_t)n;
+    }
     if (origin) {
         const int n = snprintf(declaration + length, sizeof(declaration) - length,
             "    rsx_wpos.y = %u.0 - rsx_wpos.y;\n", window & 4095u);
@@ -1477,6 +1484,12 @@ int rsx_fp_apply_window_position_ex(char* hlsl, u32 out_size, u32 window,
     memmove(body + length, body, strlen(body) + 1u);
     memcpy(body, declaration, length);
     return 1;
+}
+
+int rsx_fp_apply_window_position_ex(char* hlsl, u32 out_size, u32 window,
+                                  int reciprocal_w)
+{
+    return rsx_fp_apply_window_position_scaled(hlsl, out_size, window, reciprocal_w, 1.0f, 1.0f);
 }
 
 int rsx_fp_apply_window_position(char* hlsl, u32 out_size, u32 window)
