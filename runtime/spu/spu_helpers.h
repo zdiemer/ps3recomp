@@ -128,9 +128,21 @@ static inline u128 spu_fi(u128 a, u128 b) {
         uint32_t base_bits = rb & 0xFFFFFC00u;
         float base; memcpy(&base, &base_bits, sizeof base);
         uint32_t step_frac = rb & 0x3FFu;
-        float step = ldexpf((float)step_frac, (int)exp - 127 - 13);
+        float step;
+        if (exp >= 14u) {
+            /* 2^(exp-140) is a normal float for exp 14..255. Multiplying
+             * an exact 10-bit integer by it is exact and cannot overflow or
+             * produce a nonzero subnormal. Preserve ldexpf for small exponents
+             * where host rounding and denormal handling can affect the result. */
+            uint32_t scale_bits = (exp - 13u) << 23;
+            float scale; memcpy(&scale, &scale_bits, sizeof scale);
+            step = (float)step_frac * scale;
+        } else {
+            step = ldexpf((float)step_frac, (int)exp - 127 - 13);
+        }
         if (base < 0.0f) step = -step;
-        float y = ldexpf((float)(ra & 0x7FFFFu), -19);
+        /* A 19-bit unsigned integer scales exactly into [0,1). */
+        float y = (float)(ra & 0x7FFFFu) * 0x1p-19f;
         r._f32[i] = base - step * y;
     }
     return r;

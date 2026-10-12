@@ -48,6 +48,14 @@ typedef const u8* (*rsx_live_guest_ptr_fn)(void* user, u32 location, u32 offset,
  * Cheap; safe to call from the hot method hook. */
 int  rsx_live_draw_enabled(void);
 
+/* Optional title-owned main scene size (before its final scanout upscale).
+ * Call before init. Custom RSX_RENDER_RESOLUTION scales this scene to the
+ * requested size; an unset option preserves all native dimensions. */
+void rsx_live_draw_set_render_reference(u32 width, u32 height);
+/* Optional square shadow atlas size. Independent shadow scaling applies to
+ * all raster attachments of this exact guest extent. Call before init. */
+void rsx_live_draw_set_shadow_reference(u32 size);
+
 /* Bring up the D3D12 device + swap chain bound to an existing HWND (the
  * runtime already opens the present window). Returns 0 on success. Safe to
  * call when disabled (returns 0 and stays inert). `hwnd` is an HWND cast to

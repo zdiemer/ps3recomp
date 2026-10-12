@@ -28,6 +28,8 @@
 
 /* Non-Windows: the whole path is a no-op (D3D12 is Windows-only). */
 int  rsx_live_draw_enabled(void) { return 0; }
+void rsx_live_draw_set_render_reference(u32 w, u32 h) { (void)w; (void)h; }
+void rsx_live_draw_set_shadow_reference(u32 size) { (void)size; }
 int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void* u)
 { (void)hwnd; (void)w; (void)h; (void)f; (void)u; return 0; }
 void rsx_live_draw_seed_registers(const u32* r, u32 n) { (void)r; (void)n; }
@@ -94,9 +96,12 @@ static unsigned g_ld_shadow_compare;
 static unsigned g_ld_depth_export;
 /* Honor RSX XY by default. Probe: 0=legacy, 1=RSX XY, 2=XY+reciprocal W. */
 static unsigned g_ld_window_position = 1;
-/* Independently benchmark reference filling (1), dense remapping (2), and
- * texture hashing (4). Live changes apply at presentation boundaries. */
-static unsigned g_ld_cpu_work=259;
+/* Correct Z16 clear packing; the file control permits native A/B validation. */
+static unsigned g_ld_depth_clear = 1;
+/* Default: bulk references (1), dense remapping (2), specialized vertex
+ * decoding (256), and validated triangle remap copies (1024). Live changes
+ * apply at presentation boundaries for independent comparisons. */
+static unsigned g_ld_cpu_work=1283;
 static rsx_vp_program_cache g_ld_vp_program_cache;
 static int g_ld_vertex_cache_enabled=-1;
 static int ld_vertex_cache_enabled(void)
@@ -127,12 +132,32 @@ static int ld_vertex_cache_enabled(void)
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 #include "rsx_color_clear.h"
+#include "rsx_render_resolution.h"
+#include "rsx_graphics_settings.h"
+#include "rsx_postprocess.h"
+static rsx_render_resolution g_ld_resolution;
+static u32 g_ld_reference_w, g_ld_reference_h;
+static u32 g_ld_shadow_reference;
+static unsigned g_ld_anisotropy=1, g_ld_aa;
+static float g_ld_mip_bias, g_ld_sharpening, g_ld_exposure;
+static int g_ld_vsync=-1;
+static rsx_postprocess g_ld_postprocess;
+static BOOL g_ld_fullscreen_state;
+static int g_ld_fullscreen_requested;
+static HWND g_ld_display_hwnd;
+static int g_ld_display_focused;
+void rsx_live_draw_set_shadow_reference(u32 size) { g_ld_shadow_reference=size; }
+void rsx_live_draw_set_render_reference(u32 width, u32 height)
+{
+    g_ld_reference_w = width; g_ld_reference_h = height;
+}
 #include "rsx_vertex_formats.h"
 #include <sys/stat.h>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "user32.lib")
 
 /* Armed by the a010 AUTH repair only after its animation palette is resident. */
 extern volatile LONG g_yz_a010_reference_camera_active;
@@ -228,7 +253,8 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 typedef struct {
     u32 location, offset;
     ID3D12Resource* tex;
-    u32 w, h;
+    u32 w, h; /* host resource dimensions */
+    u32 guest_w, guest_h; /* identity and guest address arithmetic */
     DXGI_FORMAT fmt;
     ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
 #if !defined(YZ_PERF_CLEAN)
@@ -597,6 +623,7 @@ typedef struct {
     u32 shadow_compare;
     u32 depth_export;
     u32 window_position;
+    u32 depth_clear;
     LONGLONG qpc;
     u64 process_kernel_100ns;
     u64 process_user_100ns;
@@ -616,6 +643,9 @@ static HANDLE g_ld_present_thread_handle = NULL;
 
 #include "rsx_frame_limiter.h"
 static rsx_frame_limiter g_ld_frame_limiter;
+static UINT ld_present_sync_interval(void) {
+    return g_ld_vsync<0 ? (g_ld_frame_limiter.period ? 0u : 1u) : (UINT)g_ld_vsync;
+}
 static u64 g_ld_frame_limit_wait_ticks;
 static void ld_present_measure_dump(void);
 #if defined(YZ_PERF_PROFILE) && defined(YZ_SPU_PROFILE)
@@ -652,7 +682,7 @@ static void ld_present_measure_init(void)
     g_ld_frame_limit_wait_ticks = 0;
     fprintf(stderr,"[frame-limit] max_fps=%u timer=%s present_sync=%u\n", max_fps,
         g_ld_frame_limiter.high_resolution ? "high-resolution" : "fallback",
-        g_ld_frame_limiter.period ? 0u : 1u);
+        ld_present_sync_interval());
 }
 
 static void ld_present_measure_record(u32 guest_frame)
@@ -682,6 +712,7 @@ static void ld_present_measure_record(u32 guest_frame)
     sample->shadow_compare = g_ld_shadow_compare;
     sample->depth_export = g_ld_depth_export;
     sample->window_position = g_ld_window_position;
+    sample->depth_clear = g_ld_depth_clear;
     sample->qpc = now.QuadPart;
     g_ld_frame_limiter.last_present = now.QuadPart;
     if (g_ld_schedule_diag) {
@@ -782,9 +813,9 @@ static void ld_present_measure_dump(void)
     if (g_ld_schedule_diag) {
         fprintf(f, "present_id,guest_frame,qpc,process_kernel_100ns,"
                    "process_user_100ns,present_thread_kernel_100ns,"
-                   "present_thread_user_100ns,present_thread_id,cpu_work,shadow_compare,depth_export,window_position\n");
+                   "present_thread_user_100ns,present_thread_id,cpu_work,shadow_compare,depth_export,window_position,depth_clear\n");
     } else {
-        fprintf(f, "present_id,guest_frame,qpc,cpu_work,shadow_compare,depth_export,window_position\n");
+        fprintf(f, "present_id,guest_frame,qpc,cpu_work,shadow_compare,depth_export,window_position,depth_clear\n");
     }
     const u64 first =
         g_ld_present_total > LD_PRESENT_RING_CAP
@@ -796,18 +827,18 @@ static void ld_present_measure_dump(void)
                                (LD_PRESENT_RING_CAP - 1u)];
         if (sample->present_id == present_id) {
             if (g_ld_schedule_diag) {
-                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u\n",
+                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u,%u\n",
                         (unsigned long long)sample->present_id,
                         sample->guest_frame, sample->qpc,
                         (unsigned long long)sample->process_kernel_100ns,
                         (unsigned long long)sample->process_user_100ns,
                         (unsigned long long)sample->present_thread_kernel_100ns,
                         (unsigned long long)sample->present_thread_user_100ns,
-                        sample->present_thread_id, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position);
+                        sample->present_thread_id, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position, sample->depth_clear);
             } else {
-                fprintf(f, "%llu,%u,%lld,%u,%u,%u,%u\n",
+                fprintf(f, "%llu,%u,%lld,%u,%u,%u,%u,%u\n",
                         (unsigned long long)sample->present_id,
-                        sample->guest_frame, sample->qpc, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position);
+                        sample->guest_frame, sample->qpc, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position, sample->depth_clear);
             }
         }
     }
@@ -1147,6 +1178,7 @@ typedef struct {
     u64 vertex_remap_qpc;
     u64 vertex_plan_qpc;
     u64 vertex_decode_qpc;
+    u64 topology_index_qpc;
     u64 flush_qpc;
     u64 fence_wait_qpc;
     u64 flush_reason[LD_FLUSH_REASON_COUNT];
@@ -1651,6 +1683,16 @@ static int ld_texture_shadow(const rsx_dsp_texture* t)
          format==TEX_FMT_DEPTH16 || format==TEX_FMT_DEPTH16_FLOAT);
 }
 
+static int ld_texture_quality_override(const rsx_dsp_texture* t)
+{
+    if (g_ld_anisotropy<=1 && !g_ld_mip_bias) return 0;
+    const u32 format=t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+    const u32 minf=(t->filter>>16)&7u,magf=(t->filter>>24)&7u;
+    return t->dimension==2 && t->mipmaps>1 && (minf==4 || minf==6) && magf==2 &&
+        !(t->format&(TEX_FMT_UNNORM|TEX_FMT_LINEAR)) &&
+        format!=TEX_FMT_DEPTH16 && format!=TEX_FMT_DEPTH16_FLOAT &&
+        format!=TEX_FMT_DEPTH24_D8 && format!=TEX_FMT_DEPTH24_D8_FLOAT;
+}
 static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
 {
     D3D12_SAMPLER_DESC sd = {0};
@@ -1685,6 +1727,15 @@ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
     sd.MaxLOD = mip_present ? (float)max_lod_fx / 256.0f : 0.0f;
     if (sd.MaxLOD < sd.MinLOD) sd.MaxLOD = sd.MinLOD;
     sd.MaxAnisotropy = 1;
+    /* Preserve point-sampled UI, render-target reads and depth comparisons.
+     * A forced anisotropic filter would otherwise change their semantics. */
+    if (ld_texture_quality_override(t)) {
+        if (g_ld_anisotropy>1) {
+            sd.Filter=D3D12_FILTER_ANISOTROPIC;
+            sd.MaxAnisotropy=g_ld_anisotropy;
+        }
+        sd.MipLODBias=g_ld_mip_bias;
+    }
     return sd;
 }
 static u64 sampler_key(const rsx_dsp_texture* t)
@@ -1693,13 +1744,17 @@ static u64 sampler_key(const rsx_dsp_texture* t)
     const u32 magf = (t->filter >> 24) & 0x7;
     /* Exact packed identity: preserve R addressing and both 12-bit LOD fields
      * instead of overflowing the previous 32-bit key. Include comparison state
-     * so a raw depth sampler cannot be reused by the shadow shader. */
+     * so a raw depth sampler cannot be reused by the shadow shader. Bit 46
+     * separates quality-overridden color samplers from excluded UI/depth
+     * textures even when their guest filter/wrap/LOD registers are identical.
+     * The override values themselves are immutable until shutdown. */
     const u64 wrap=(t->wrap & 0xFu) | (((t->wrap >> 8)&0xFu)<<4) |
         (((t->wrap >> 16)&0xFu)<<8);
     const u64 lod=(t->control0 >> 7)&0xFFFFFFu;
     const u64 shadow=ld_texture_shadow(t);
     return minf | ((u64)magf<<3) | (wrap<<6) | (lod<<18) |
-        (shadow<<42) | (shadow ? ((u64)((t->wrap>>28)&7u)<<43) : 0);
+        (shadow<<42) | (shadow ? ((u64)((t->wrap>>28)&7u)<<43) : 0) |
+        ((u64)ld_texture_quality_override(t)<<46);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1966,6 +2021,51 @@ static void ld_flush(ld_flush_reason reason)
     g_ld_profile.total.flush_qpc += flush_ticks;
     g_ld_profile.total.flush_reason_qpc[reason] += flush_ticks;
 #endif
+}
+
+/* DXGI can change fullscreen state on focus loss/restore. Refresh only the
+ * scanout buffers after the present fence; guest surfaces and internal raster
+ * dimensions remain intact. DXGI's automatic Alt+Enter is disabled. */
+static int ld_refresh_display_state(void)
+{
+    if (!g_ld_fullscreen_requested) return 1;
+    BOOL fullscreen=FALSE;
+    HRESULT hr=g.swap->lpVtbl->GetFullscreenState(g.swap,&fullscreen,NULL);
+    if (FAILED(hr)) {
+        fprintf(stderr,"[d3d-fail] GetFullscreenState hr=0x%08lX\n",(unsigned long)hr);
+        g.ready=0; return 0;
+    }
+    const int focused=GetForegroundWindow()==g_ld_display_hwnd && !IsIconic(g_ld_display_hwnd);
+    int transitioned=0;
+    if (focused && !g_ld_display_focused && !fullscreen) {
+        hr=g.swap->lpVtbl->SetFullscreenState(g.swap,TRUE,NULL);
+        if (SUCCEEDED(hr)) {
+            g.swap->lpVtbl->GetFullscreenState(g.swap,&fullscreen,NULL);
+            transitioned=1;
+        } else fprintf(stderr,"[display] DXGI fullscreen retry unavailable hr=0x%08lX; using borderless\n",(unsigned long)hr);
+    }
+    g_ld_display_focused=focused;
+    if (!transitioned && fullscreen==g_ld_fullscreen_state) return 1;
+    ld_flush(LD_FLUSH_PRESENT);
+    if (!g.ready) return 0;
+    for (u32 i=0;i<LD_SWAP_BUFFERS;++i) {
+        if (g.backbuf[i]) g.backbuf[i]->lpVtbl->Release(g.backbuf[i]);
+        g.backbuf[i]=NULL;
+    }
+    hr=g.swap->lpVtbl->ResizeBuffers(g.swap,LD_SWAP_BUFFERS,
+        g_ld_resolution.host_w,g_ld_resolution.host_h,DXGI_FORMAT_R8G8B8A8_UNORM,0);
+    if (SUCCEEDED(hr)) for (u32 i=0;i<LD_SWAP_BUFFERS;++i) {
+        hr=g.swap->lpVtbl->GetBuffer(g.swap,i,&IID_ID3D12Resource,(void**)&g.backbuf[i]);
+        if (FAILED(hr)) break;
+        g.dev->lpVtbl->CreateRenderTargetView(g.dev,g.backbuf[i],NULL,rtv_handle(i));
+    }
+    if (FAILED(hr)) {
+        fprintf(stderr,"[d3d-fail] fullscreen buffer refresh hr=0x%08lX\n",(unsigned long)hr);
+        g.ready=0; return 0;
+    }
+    g_ld_fullscreen_state=fullscreen;
+    fprintf(stderr,"[display] DXGI fullscreen active=%u buffers refreshed\n",(unsigned)fullscreen);
+    return 1;
 }
 
 /* Public wrapper for the RSX SET_REFERENCE / sync fence: block until the GPU
@@ -3110,6 +3210,8 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
 {
     if (!want_w) want_w = g.width;
     if (!want_h) want_h = g.height;
+    u32 host_w, host_h;
+    rsx_render_surface_extent(&g_ld_resolution, want_w, want_h, &host_w, &host_h);
     /* Key on the DIMENSIONS as well as location/offset.
      *
      * Keying on location/offset alone meant a redeclaration of the same offset
@@ -3134,7 +3236,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     u32 slot = MAX_SURFACES;
     for (u32 i = 0; i < g.n_surfaces; i++)
         if (g.surfaces[i].location == location && g.surfaces[i].offset == offset &&
-            g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
+            g.surfaces[i].guest_w == want_w && g.surfaces[i].guest_h == want_h &&
             g.surfaces[i].fmt == want_fmt)
             return i;
     /* Never destroy a usable render target because a malformed live command
@@ -3143,7 +3245,8 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      * 1280x16452 declaration and the old path then dereferenced a null
      * resource.  Preserve the prior surface so diagnostics can capture the
      * actual world pass while the bad command link is isolated. */
-    if (want_w > 8192u || want_h > 8192u) {
+    if (want_w > 8192u || want_h > 8192u ||
+        host_w > 16384u || host_h > 16384u) {
         static u32 invalid_surface_logs = 0;
         if (invalid_surface_logs++ < 32u)
             fprintf(stderr,
@@ -3171,7 +3274,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = want_w; rd.Height = want_h; rd.DepthOrArraySize = 1;
+    rd.Width = host_w; rd.Height = host_h; rd.DepthOrArraySize = 1;
     rd.MipLevels = 1; rd.Format = want_fmt; rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_CLEAR_VALUE cv = {0}; cv.Format = rd.Format;
@@ -3205,7 +3308,11 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         s->fb_tex = NULL;
     }
     s->tex = replacement;
-    s->location = location; s->offset = offset; s->w = want_w; s->h = want_h;
+    s->location = location; s->offset = offset;
+    s->guest_w = want_w; s->guest_h = want_h;
+    s->w = host_w; s->h = host_h;
+    fprintf(stderr, "[render-resolution] surface %u guest=%ux%u host=%ux%u\n",
+        slot, want_w, want_h, s->w, s->h);
     s->fmt = want_fmt;
 #if !defined(YZ_PERF_CLEAN)
     s->resource_serial = ++g_ld_surface_resource_serial;
@@ -3276,7 +3383,7 @@ static int surface_containing(u32 location, u32 abs, u32 pitch, u32 w, u32 h,
         const surface_t* s = &g.surfaces[i];
         if (!s->tex || s->location != location || abs < s->offset) continue;
         const u32 d = abs - s->offset, y = d / pitch, x = (d % pitch) / 4u;
-        if (x + w <= s->w && y + h <= s->h) { *ox = x; *oy = y; return (int)i; }
+        if (x + w <= s->guest_w && y + h <= s->guest_h) { *ox = x; *oy = y; return (int)i; }
     }
     return -1;
 }
@@ -3354,7 +3461,7 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, 
         const surface_t* s = &g.surfaces[i];
         if (!s->tex || s->location != src_loc || src_abs < s->offset) continue;
         const u32 d = src_abs - s->offset;
-        if (d / src_pitch >= 2u * s->h) continue;
+        if (d / src_pitch >= 2u * s->guest_h) continue;
         if (si >= 0 && g.surfaces[si].offset > s->offset) continue;
         si = (int)i; gx = (d % src_pitch) / 4u; gy = d / src_pitch;
     }
@@ -3368,8 +3475,8 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, 
     }
     if (bi < 0) return 0;
     const display_buffer_t* db = &g.display_buffers[bi];
-    const u32 dx = (dst_abs - db->offset) % db->pitch / 4u + out_x;
-    const u32 dy = (dst_abs - db->offset) / db->pitch + out_y;
+    u32 dx = (dst_abs - db->offset) % db->pitch / 4u + out_x;
+    u32 dy = (dst_abs - db->offset) / db->pitch + out_y;
     const u32 slot = surface_get(db->location, db->offset, db->width, db->height, g.surfaces[si].fmt);
     if (slot == LD_INVALID_SURFACE || (int)slot == si) return 0;
     surface_t* dst = &g.surfaces[slot];
@@ -3378,6 +3485,14 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, 
     const u32 k = ds >> 20;                       /* 20.12 fixed -> integer factor */
     u32 sx = gx / (k ? k : 1), sy = gy / (k ? k : 1);
     u32 w = out_w, h = out_h;
+    const surface_t* source = &g.surfaces[si];
+    const u32 ex = rsx_render_edge(sx+w, source->guest_w, source->w);
+    const u32 ey = rsx_render_edge(sy+h, source->guest_h, source->h);
+    sx = rsx_render_edge(sx, source->guest_w, source->w);
+    sy = rsx_render_edge(sy, source->guest_h, source->h);
+    dx = rsx_render_edge(dx, dst->guest_w, dst->w);
+    dy = rsx_render_edge(dy, dst->guest_h, dst->h);
+    w = ex-sx; h = ey-sy;
     if (dx >= dst->w || dy >= dst->h || sx >= g.surfaces[si].w || sy >= g.surfaces[si].h) return 0;
     if (dx + w > dst->w) w = dst->w - dx;
     if (dy + h > dst->h) h = dst->h - dy;
@@ -3444,10 +3559,21 @@ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
                                      g.surfaces[si].fmt);
         if (slot == LD_INVALID_SURFACE) return -2;
         di = (int)slot;
-        if (w > g.surfaces[di].w || h > g.surfaces[di].h) return -3;
+        if (w > g.surfaces[di].guest_w || h > g.surfaces[di].guest_h) return -3;
     }
     if (di == si) return -4;
     if (g.surfaces[di].fmt != g.surfaces[si].fmt) return -5;
+    const surface_t* ss = &g.surfaces[si];
+    const surface_t* ds = &g.surfaces[di];
+    u32 ex = rsx_render_edge(sx+w, ss->guest_w, ss->w);
+    u32 ey = rsx_render_edge(sy+h, ss->guest_h, ss->h);
+    sx = rsx_render_edge(sx, ss->guest_w, ss->w);
+    sy = rsx_render_edge(sy, ss->guest_h, ss->h);
+    dx = rsx_render_edge(dx, ds->guest_w, ds->w);
+    dy = rsx_render_edge(dy, ds->guest_h, ds->h);
+    w = ex-sx; h = ey-sy;
+    if (dx+w > ds->w || dy+h > ds->h) return -6;
+    if (!w || !h) return 1;
     ID3D12Resource* src = g.surfaces[si].tex;
     ID3D12Resource* dst = g.surfaces[di].tex;
     D3D12_RESOURCE_BARRIER b[2] = {0};
@@ -3518,8 +3644,12 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
      * allocating only that clip causes the D3D device to reject later
      * surface/PSO creation.  Sampling a declared-size window from this padded
      * backing remains a separate SRV concern. */
-    u32 want_w = rt_w > g.width ? rt_w : g.width;
-    u32 want_h = rt_h > g.height ? rt_h : g.height;
+    u32 snapshot_w, snapshot_h;
+    rsx_render_surface_extent(&g_ld_resolution, rt_w ? rt_w : g.width,
+        rt_h ? rt_h : g.height, &snapshot_w, &snapshot_h);
+    u32 want_w = snapshot_w > g_ld_resolution.host_w ? snapshot_w : g_ld_resolution.host_w;
+    u32 want_h = snapshot_h > g_ld_resolution.host_h ? snapshot_h : g_ld_resolution.host_h;
+    if (want_w > 16384u || want_h > 16384u) return 0;
     u32 slot = MAX_SURFACES;
     for (u32 i = 0; i < g.n_zdepths; i++) {
         zdepth_t* z = &g.zdepths[i];
@@ -3590,8 +3720,8 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->h = want_h;
     z->had_write = 0;
     z->snapshot_valid = 0;
-    z->snapshot_w = rt_w ? rt_w : want_w;
-    z->snapshot_h = rt_h ? rt_h : want_h;
+    z->snapshot_w = snapshot_w;
+    z->snapshot_h = snapshot_h;
     if (z->snapshot_w > want_w) z->snapshot_w = want_w;
     if (z->snapshot_h > want_h) z->snapshot_h = want_h;
     D3D12_DEPTH_STENCIL_VIEW_DESC dsvd = {0};
@@ -4642,6 +4772,14 @@ static ID3D12PipelineState* get_pso(
     key = fnv1a(&shader_window, sizeof(shader_window), key);
     const u32 reciprocal_w = g_ld_window_position == 2;
     key = fnv1a(&reciprocal_w, sizeof(reciprocal_w), key);
+    rsx_dsp_surface raster_surface; rsx_dsp_get_surface(&g.rsx, &raster_surface);
+    const u32 raster_w = raster_surface.clip_w ? raster_surface.clip_w : g.width;
+    const u32 raster_h = raster_surface.clip_h ? raster_surface.clip_h : g.height;
+    u32 raster_host_w, raster_host_h;
+    rsx_render_surface_extent(&g_ld_resolution, raster_w, raster_h, &raster_host_w, &raster_host_h);
+    const float raster_scale[2] = {(float)raster_w / raster_host_w,
+                                  (float)raster_h / raster_host_h};
+    key = fnv1a(raster_scale, sizeof(raster_scale), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
     key = fnv1a(&shadow_mask, sizeof(shadow_mask), key);
     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
@@ -4808,8 +4946,8 @@ static ID3D12PipelineState* get_pso(
     g_ld_profile.total.decompile_qpc +=
         (u64)(ld_profile_qpc() - decompile_begin);
 #endif
-    if (fi > 0 && rsx_fp_apply_window_position_ex(
-            ps_hlsl, sizeof(ps_hlsl), shader_window, reciprocal_w) < 0)
+    if (fi > 0 && rsx_fp_apply_window_position_scaled(
+            ps_hlsl, sizeof(ps_hlsl), shader_window, reciprocal_w, raster_scale[0], raster_scale[1]) < 0)
         fi = -1;
     /* LD_FORCE_GREEN=1: make every fragment program return solid green.
      *
@@ -5640,7 +5778,7 @@ static void ld_profile_present(u32 frame)
                 "create_pso_ms,texture_decode_ms,draws,vertices,texture_upload_bytes,"
                 "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
                 "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work,"
-                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses\n");
+                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses,topology_index_ms\n");
         }
     }
     if (csv) {
@@ -5650,7 +5788,7 @@ static void ld_profile_present(u32 frame)
         cellGcmGetBlitProfile(&blit_ticks,&blit_pixels,&blit_row_pixels);
         static u64 previous_limit_ticks;
         fprintf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu\n", frame, now, frame_ms,
+            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu,%.6f\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
@@ -5683,7 +5821,8 @@ static void ld_profile_present(u32 frame)
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vp_prepare_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(fp_prepare_qpc)),
             (unsigned long long)LD_PROFILE_DELTA(vp_cache_hits),
-            (unsigned long long)LD_PROFILE_DELTA(vp_cache_misses));
+            (unsigned long long)LD_PROFILE_DELTA(vp_cache_misses),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(topology_index_qpc)));
         previous_limit_ticks=g_ld_frame_limit_wait_ticks;
         previous_ticks=blit_ticks; previous_pixels=blit_pixels; previous_row_pixels=blit_row_pixels;
         if ((frame & 63u) == 0) fflush(csv);
@@ -6114,8 +6253,8 @@ static int ld_movie_overlay_ensure(void)
         g.movie_overlay_mask)
         return 1;
 
-    g.movie_overlay_pitch = (g.width * 4 + 255) & ~255u;
-    const UINT64 rb_size = (UINT64)g.movie_overlay_pitch * g.height;
+    g.movie_overlay_pitch = (g_ld_resolution.host_w * 4 + 255) & ~255u;
+    const UINT64 rb_size = (UINT64)g.movie_overlay_pitch * g_ld_resolution.host_h;
     D3D12_HEAP_PROPERTIES hp = {0};
     D3D12_RESOURCE_DESC bd = {0};
     hp.Type = D3D12_HEAP_TYPE_READBACK;
@@ -6134,8 +6273,8 @@ static int ld_movie_overlay_ensure(void)
         fprintf(stderr, "[movie-ui] readback allocation failed\n");
         return 0;
     }
-    g.movie_overlay_rgba = (u8*)malloc((size_t)g.width * g.height * 4);
-    g.movie_overlay_mask = (u8*)malloc((size_t)g.width * g.height);
+    g.movie_overlay_rgba = (u8*)malloc((size_t)g_ld_resolution.host_w * g_ld_resolution.host_h * 4);
+    g.movie_overlay_mask = (u8*)malloc((size_t)g_ld_resolution.host_w * g_ld_resolution.host_h);
     if (!g.movie_overlay_rgba || !g.movie_overlay_mask) {
         free(g.movie_overlay_rgba);
         free(g.movie_overlay_mask);
@@ -6201,7 +6340,7 @@ static void ld_movie_overlay_begin(void)
     if (g.n_surfaces) ld_flush(LD_FLUSH_MOVIE);
     ld_movie_reset_rings();
     fprintf(stderr, "[movie-ui] compositor armed (%ux%u, %u guest surfaces)\n",
-            g.width, g.height, g.n_surfaces);
+            g_ld_resolution.host_w, g_ld_resolution.host_h, g.n_surfaces);
     fflush(stderr);
 }
 
@@ -6234,8 +6373,8 @@ static void ld_movie_capture_overlay(void)
     dst.pResource = g.movie_overlay_readback;
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    dst.PlacedFootprint.Footprint.Width = g.width;
-    dst.PlacedFootprint.Footprint.Height = g.height;
+    dst.PlacedFootprint.Footprint.Width = g_ld_resolution.host_w;
+    dst.PlacedFootprint.Footprint.Height = g_ld_resolution.host_h;
     dst.PlacedFootprint.Footprint.Depth = 1;
     dst.PlacedFootprint.Footprint.RowPitch = g.movie_overlay_pitch;
     g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
@@ -6245,7 +6384,7 @@ static void ld_movie_capture_overlay(void)
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
     ld_flush(LD_FLUSH_MOVIE);
 
-    const SIZE_T rb_size = (SIZE_T)g.movie_overlay_pitch * g.height;
+    const SIZE_T rb_size = (SIZE_T)g.movie_overlay_pitch * g_ld_resolution.host_h;
     u8* mapped = NULL;
     D3D12_RANGE rr = {0, rb_size};
     if (FAILED(g.movie_overlay_readback->lpVtbl->Map(
@@ -6253,19 +6392,19 @@ static void ld_movie_capture_overlay(void)
         g.movie_overlay_valid = 0;
         return;
     }
-    for (u32 y = 0; y < g.height; y++)
-        memcpy(g.movie_overlay_rgba + (size_t)y * g.width * 4,
+    for (u32 y = 0; y < g_ld_resolution.host_h; y++)
+        memcpy(g.movie_overlay_rgba + (size_t)y * g_ld_resolution.host_w * 4,
                mapped + (size_t)y * g.movie_overlay_pitch,
-               (size_t)g.width * 4);
+               (size_t)g_ld_resolution.host_w * 4);
     D3D12_RANGE wr = {0, 0};
     g.movie_overlay_readback->lpVtbl->Unmap(
         g.movie_overlay_readback, 0, &wr);
 
-    const u64 total = (u64)g.width * g.height;
-    const u32 band_y0 = g.height * 52 / 100;
-    const u32 band_y1 = g.height * 96 / 100;
-    const u32 band_x0 = g.width * 5 / 100;
-    const u32 band_x1 = g.width * 95 / 100;
+    const u64 total = (u64)g_ld_resolution.host_w * g_ld_resolution.host_h;
+    const u32 band_y0 = g_ld_resolution.host_h * 52 / 100;
+    const u32 band_y1 = g_ld_resolution.host_h * 96 / 100;
+    const u32 band_x0 = g_ld_resolution.host_w * 5 / 100;
+    const u32 band_x1 = g_ld_resolution.host_w * 95 / 100;
     const u64 band_pixels =
         (u64)(band_y1 - band_y0) * (band_x1 - band_x0);
     u64 glyph_pixels = 0;
@@ -6273,7 +6412,7 @@ static void ld_movie_capture_overlay(void)
 
     for (u32 y = band_y0; y < band_y1; y++) {
         for (u32 x = band_x0; x < band_x1; x++) {
-            const u64 i = (u64)y * g.width + x;
+            const u64 i = (u64)y * g_ld_resolution.host_w + x;
             const u8* p = g.movie_overlay_rgba + i * 4;
             const int hi = p[0] > p[1]
                 ? (p[0] > p[2] ? p[0] : p[2])
@@ -6297,16 +6436,16 @@ static void ld_movie_capture_overlay(void)
     if (glyph_pixels >= 8 && glyph_pixels < band_pixels / 6) {
         for (u32 y = band_y0; y < band_y1; y++) {
             for (u32 x = band_x0; x < band_x1; x++) {
-                const u64 i = (u64)y * g.width + x;
+                const u64 i = (u64)y * g_ld_resolution.host_w + x;
                 if (g.movie_overlay_mask[i] < 64)
                     continue;
                 const u32 ya = y > 1 ? y - 2 : 0;
-                const u32 yb = y + 2 < g.height ? y + 2 : g.height - 1;
+                const u32 yb = y + 2 < g_ld_resolution.host_h ? y + 2 : g_ld_resolution.host_h - 1;
                 const u32 xa = x > 1 ? x - 2 : 0;
-                const u32 xb = x + 2 < g.width ? x + 2 : g.width - 1;
+                const u32 xb = x + 2 < g_ld_resolution.host_w ? x + 2 : g_ld_resolution.host_w - 1;
                 for (u32 oy = ya; oy <= yb; oy++)
                     for (u32 ox = xa; ox <= xb; ox++) {
-                        u8* m = &g.movie_overlay_mask[(u64)oy * g.width + ox];
+                        u8* m = &g.movie_overlay_mask[(u64)oy * g_ld_resolution.host_w + ox];
                         if (!*m) *m = 1;
                     }
             }
@@ -7068,6 +7207,17 @@ static void write_topology_indices(u32 prim, u32* indices)
     case PRIM_TRIANGLES: {
         const u32 count =
             dc.n_source_refs - dc.n_source_refs % 3u;
+        /* The remapper already emits the triangle list's complete occurrence
+         * order. Copy that validated prefix instead of calling the external
+         * bounds-checked accessor for every index. Other topologies still need
+         * their winding/restart conversion. Bit 1024 selects this copy path. */
+        if ((g_ld_cpu_work & 1024u) && dc.refs_remapped &&
+            dc.ref_remap.occurrence_to_unique &&
+            dc.ref_remap.occurrence_capacity >= count) {
+            memcpy(indices, dc.ref_remap.occurrence_to_unique,
+                   (size_t)count * sizeof(*indices));
+            break;
+        }
         for (u32 occurrence = 0; occurrence < count; occurrence++)
             indices[write++] = topology_vertex_index(occurrence);
         break;
@@ -7241,9 +7391,16 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         memcpy(
             g.vb_mapped + g.vb_used, vertex_data,
             (size_t)draw_vb_bytes);
-    if (indexed)
+    if (indexed) {
+#if defined(YZ_PERF_PROFILE)
+        const LONGLONG topology_begin = ld_profile_qpc();
+#endif
         write_topology_indices(
             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
+#if defined(YZ_PERF_PROFILE)
+        g_ld_profile.total.topology_index_qpc += ld_profile_qpc() - topology_begin;
+#endif
+    }
 
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG pso_begin=ld_profile_qpc();
@@ -7590,7 +7747,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
               if (sf_i->location != t.location || sf_i->offset != t.offset ||
                   i == target)
                   continue;
-              if (sf_i->w == t.width && sf_i->h == t.height) { sampled = (int)i; break; }
+              if (sf_i->guest_w == t.width && sf_i->guest_h == t.height) { sampled = (int)i; break; }
               if (sampled < 0 || sf_i->last_draw_generation > best_gen) {
                   sampled = (int)i;
                   best_gen = sf_i->last_draw_generation;
@@ -7966,11 +8123,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             g.list, 3, vtex_table);
     g.cb_used += CB_BLOCK_ALIGNED;
 
-    D3D12_VIEWPORT dvp = {0, 0, W, H, 0.0f, 1.0f};
+    D3D12_VIEWPORT dvp = {0, 0, (float)g.surfaces[target].w, (float)g.surfaces[target].h, 0.0f, 1.0f};
     D3D12_RECT sc = {
         0, 0,
-        (LONG)(g.surfaces[target].w ? g.surfaces[target].w : g.width),
-        (LONG)(g.surfaces[target].h ? g.surfaces[target].h : g.height)
+        (LONG)(g.surfaces[target].guest_w ? g.surfaces[target].guest_w : g.width),
+        (LONG)(g.surfaces[target].guest_h ? g.surfaces[target].guest_h : g.height)
     };
     /* Guest scissor, intersected with the surface rect. The nv40 reset value
      * is a full-window 4096x4096; never-written regs read 0 here, so an
@@ -7995,6 +8152,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             if (sc.bottom < sc.top)      sc.bottom = sc.top;
         }
     }
+    sc.left = rsx_render_edge(sc.left, (u32)W, (u32)dvp.Width);
+    sc.right = rsx_render_edge(sc.right, (u32)W, (u32)dvp.Width);
+    sc.top = rsx_render_edge(sc.top, (u32)H, (u32)dvp.Height);
+    sc.bottom = rsx_render_edge(sc.bottom, (u32)H, (u32)dvp.Height);
     g.list->lpVtbl->RSSetViewports(g.list, 1, &dvp);
     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
     /* Dynamic stencil reference (kept out of the PSO key on purpose). */
@@ -8179,9 +8340,14 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         fflush(s_csv_file);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
-    const D3D12_RECT clear_rect = rsx_clear_rect(g.surfaces[target].w, g.surfaces[target].h,
+    D3D12_RECT clear_rect = rsx_clear_rect(g.surfaces[target].guest_w, g.surfaces[target].guest_h,
         rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL), rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL),
         g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] || g.rsx.seen[M_SCISSOR_VERTICAL >> 2]);
+    const surface_t* clear_surface = &g.surfaces[target];
+    clear_rect.left = rsx_render_edge(clear_rect.left, clear_surface->guest_w, clear_surface->w);
+    clear_rect.right = rsx_render_edge(clear_rect.right, clear_surface->guest_w, clear_surface->w);
+    clear_rect.top = rsx_render_edge(clear_rect.top, clear_surface->guest_h, clear_surface->h);
+    clear_rect.bottom = rsx_render_edge(clear_rect.bottom, clear_surface->guest_h, clear_surface->h);
     if (clear_rect.left >= clear_rect.right || clear_rect.top >= clear_rect.bottom) return;
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A)) {
         const u32 c = rsx_dsp_clear_color(&g.rsx);
@@ -8215,13 +8381,14 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_DEPTH);
         if (mask & RSX_CLEAR_STENCIL)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_STENCIL);
-        /* ZSTENCIL_CLEAR_VALUE (Z24S8 layout: depth24 << 8 | stencil8; nv40
-         * reset 0xFFFFFF00 = depth 1.0, stencil 0 — so never-written streams
-         * keep the old hardcoded behaviour). Previously decoded upstream but
-         * discarded here: every guest depth clear forced 1.0/0. */
+        /* Z16 stores depth in the low 16 bits; Z24S8 stores it above the
+         * low stencil byte. Haze's shadow atlas uses Z16 with 0x0000FFFF:
+         * treating it as Z24S8 clears to near zero instead of far depth. */
         {
             const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
-            const float cd = (float)(zs >> 8) / 16777215.0f;
+            const float cd = g_ld_depth_clear && sf.depth_format == 1u
+                ? (float)(zs & 0xFFFFu) / 65535.0f
+                : (float)(zs >> 8) / 16777215.0f;
             g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
                 clear_flags, cd, (UINT8)(zs & 0xFFu), 1, &clear_rect);
         }
@@ -8415,6 +8582,26 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 {
     if (!rsx_live_draw_enabled()) return 0;
     if (g.ready) return 0;
+    for (unsigned i=0;i<sizeof(rsx_graphics_options)/sizeof(rsx_graphics_options[0]);++i) {
+        const rsx_graphics_option* o=&rsx_graphics_options[i];
+        const char* value=getenv(o->environment);
+        if (value && *value && !rsx_graphics_valid(o,value)) {
+            fprintf(stderr,"[graphics] invalid %s='%s'; expected %s\n",o->environment,value,o->allowed);
+            return -1;
+        }
+    }
+    const char* aa=getenv("RSX_ANTI_ALIASING");
+    const char* af=getenv("RSX_ANISOTROPY");
+    const char* bias=getenv("RSX_MIP_LOD_BIAS");
+    const char* sharp=getenv("RSX_SHARPENING");
+    const char* exposure=getenv("RSX_EXPOSURE");
+    const char* vsync=getenv("RSX_VSYNC");
+    g_ld_aa=aa && !strcmp(aa,"fxaa");
+    g_ld_anisotropy=af && *af ? (unsigned)atoi(af) : 1;
+    g_ld_mip_bias=bias ? (float)atof(bias) : 0;
+    g_ld_sharpening=sharp ? (float)atof(sharp) : 0;
+    g_ld_exposure=exposure ? (float)atof(exposure) : 0;
+    g_ld_vsync=vsync && !strcmp(vsync,"on") ? 1 : vsync && !strcmp(vsync,"off") ? 0 : -1;
     ld_present_measure_init();
 #if defined(YZ_PERF_PROFILE)
     memset(&g_ld_profile, 0, sizeof(g_ld_profile));
@@ -8426,6 +8613,25 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     }
 #endif
     g.width = width; g.height = height;
+    const char* render_option = getenv("RSX_RENDER_RESOLUTION");
+    if (rsx_render_resolution_parse(&g_ld_resolution, width, height, render_option) < 0) {
+        fprintf(stderr, "[render-resolution] invalid RSX_RENDER_RESOLUTION='%s'; expected WIDTHxHEIGHT (1..8192)\n", render_option ? render_option : "");
+        return -1;
+    }
+    if (g_ld_reference_w && g_ld_reference_h) {
+        g_ld_resolution.reference_w = g_ld_reference_w;
+        g_ld_resolution.reference_h = g_ld_reference_h;
+    }
+    const char* shadow=getenv("RSX_SHADOW_RESOLUTION");
+    g_ld_resolution.shadow_guest=g_ld_shadow_reference;
+    if (shadow && strcmp(shadow,"follow"))
+        g_ld_resolution.shadow_host=!strcmp(shadow,"native") ? g_ld_shadow_reference : (u32)atoi(shadow);
+    fprintf(stderr,"[graphics] AA=%s AF=%u bias=%g shadow=%u->%u sharpen=%g exposure=%g vsync=%s\n",
+        g_ld_aa ? "fxaa":"off",g_ld_anisotropy,g_ld_mip_bias,g_ld_resolution.shadow_guest,
+        g_ld_resolution.shadow_host,g_ld_sharpening,g_ld_exposure,vsync ? vsync:"auto");
+    fprintf(stderr, "[render-resolution] guest=%ux%u scene=%ux%u host=%ux%u custom=%d\n", width, height,
+        g_ld_resolution.reference_w, g_ld_resolution.reference_h,
+        g_ld_resolution.host_w, g_ld_resolution.host_h, g_ld_resolution.custom);
     g.guest_ptr = guest_fn; g.guest_user = guest_user;
     {
         const char* requested = getenv("RSX_FP_CONSTANT_MODE");
@@ -8561,7 +8767,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 
     /* swap chain bound to the runtime's HWND */
     DXGI_SWAP_CHAIN_DESC1 scd = {0};
-    scd.Width = width; scd.Height = height; scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scd.Width = g_ld_resolution.host_w; scd.Height = g_ld_resolution.host_h; scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.SampleDesc.Count = 1; scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.BufferCount = LD_SWAP_BUFFERS; scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     IDXGISwapChain1* sc1 = NULL;
@@ -8571,7 +8777,32 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     }
     sc1->lpVtbl->QueryInterface(sc1, &IID_IDXGISwapChain3, (void**)&g.swap);
     sc1->lpVtbl->Release(sc1);
+    factory->lpVtbl->MakeWindowAssociation(factory,(HWND)hwnd,DXGI_MWA_NO_ALT_ENTER);
     factory->lpVtbl->Release(factory);
+    const char* window_mode=getenv("RSX_WINDOW_MODE");
+    g_ld_fullscreen_requested=window_mode && !strcmp(window_mode,"fullscreen");
+    g_ld_fullscreen_state=FALSE;
+    g_ld_display_hwnd=(HWND)hwnd;
+    g_ld_display_focused=GetForegroundWindow()==(HWND)hwnd;
+    if (g_ld_fullscreen_requested) {
+        const HRESULT fullscreen_hr=g.swap->lpVtbl->SetFullscreenState(g.swap,TRUE,NULL);
+        if (SUCCEEDED(fullscreen_hr)) {
+            /* Flip-model D3D12 requires ResizeBuffers after the transition.
+             * No backbuffer references have been acquired yet. Keep internal
+             * raster resolution independent of the desktop display mode. */
+            const HRESULT resize_hr=g.swap->lpVtbl->ResizeBuffers(g.swap,LD_SWAP_BUFFERS,
+                g_ld_resolution.host_w,g_ld_resolution.host_h,scd.Format,0);
+            if (FAILED(resize_hr)) {
+                g.swap->lpVtbl->SetFullscreenState(g.swap,FALSE,NULL);
+                fprintf(stderr,"[display] fullscreen ResizeBuffers failed hr=0x%08lX\n",(unsigned long)resize_hr);
+                return -1;
+            }
+            g.swap->lpVtbl->GetFullscreenState(g.swap,&g_ld_fullscreen_state,NULL);
+            fprintf(stderr,"[display] DXGI fullscreen active=%u\n",(unsigned)g_ld_fullscreen_state);
+        } else {
+            fprintf(stderr,"[display] DXGI fullscreen unavailable hr=0x%08lX; using borderless\n",(unsigned long)fullscreen_hr);
+        }
+    }
 
     /* RTV heap: [0..1] backbuffers, [2..] surface cache */
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
@@ -8667,7 +8898,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
         D3D12_HEAP_PROPERTIES dhp = {0}; dhp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC drd = {0};
         drd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        drd.Width = width; drd.Height = height; drd.DepthOrArraySize = 1;
+        drd.Width = g_ld_resolution.host_w; drd.Height = g_ld_resolution.host_h; drd.DepthOrArraySize = 1;
         drd.MipLevels = 1; drd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; drd.SampleDesc.Count = 1;
         drd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         D3D12_CLEAR_VALUE dcv = {0}; dcv.Format = drd.Format; dcv.DepthStencil.Depth = 1.0f;
@@ -8684,6 +8915,9 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     if (make_root_signature() != 0 ||
         make_depth_snapshot_pipeline() != 0)
         return -1;
+    if ((g_ld_aa || g_ld_sharpening || g_ld_exposure) &&
+        rsx_postprocess_init(&g_ld_postprocess,g.dev,
+            g_ld_resolution.host_w,g_ld_resolution.host_h)!=0) return -1;
 
     static const u8 white[4] = {255, 255, 255, 255};
     g.white_tex = create_texture_rgba(white, 1, 1);
@@ -8907,7 +9141,7 @@ void rsx_live_draw_note_inline_transfer(u32 dma, u32 offset, u32 value)
     for (u32 i = 0; i < g.n_surfaces; ++i) {
         surface_t* surface = &g.surfaces[i];
         const u64 begin = surface->offset;
-        const u64 end = begin + (u64)surface->w * surface->h * 4u;
+        const u64 end = begin + (u64)surface->guest_w * surface->guest_h * 4u;
         if (surface->location != location || offset < begin || offset >= end)
             continue;
         surface->last_guest_blit_generation = ++g_ld_guest_blit_generation;
@@ -8993,7 +9227,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
         InterlockedExchange(&g_ld_host_waiting, 1);
         AcquireSRWLockExclusive(&g_ld_access_lock);
     }
-    if (!g.ready || !rgba) {
+    if (!g.ready || !rgba || !ld_refresh_display_state()) {
         if (serialized) {
             ReleaseSRWLockExclusive(&g_ld_access_lock);
             InterlockedExchange(&g_ld_host_waiting, 0);
@@ -9005,8 +9239,15 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
         InterlockedExchange(&g_ld_host_waiting, 0);
         return;
     }
-    if (w > g.width)  w = g.width;
-    if (h > g.height) h = g.height;
+    const u32 input_w = w, input_h = h;
+    if (!input_w || !input_h) {
+        if (serialized) {
+            ReleaseSRWLockExclusive(&g_ld_access_lock);
+            InterlockedExchange(&g_ld_host_waiting, 0);
+        }
+        return;
+    }
+    w = g_ld_resolution.host_w; h = g_ld_resolution.host_h;
     const u32 pitch = (w * 4 + 255) & ~255u;          /* D3D12 copy pitch align */
     if ((UINT64)pitch * h > UPLOAD_SIZE) {
         if (serialized) {
@@ -9019,12 +9260,15 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
     u8* host_upload = composite ? g.movie_upload_mapped : g.upload_mapped;
     for (u32 y = 0; y < h; y++) {
         u8* dstrow = host_upload + (size_t)y * pitch;
-        memcpy(dstrow, rgba + (size_t)y * w * 4, (size_t)w * 4);
+        const u8* input_row = rgba + (size_t)((u64)y * input_h / h) * input_w * 4;
+        if (w == input_w) memcpy(dstrow, input_row, (size_t)w * 4);
+        else for (u32 x=0; x<w; ++x)
+            memcpy(dstrow + (size_t)x*4, input_row + (size_t)((u64)x*input_w/w)*4, 4);
         if (composite && g.movie_overlay_valid && g.movie_overlay_rgba &&
             g.movie_overlay_mask) {
-            const u8* ov = g.movie_overlay_rgba + (size_t)y * g.width * 4;
+            const u8* ov = g.movie_overlay_rgba + (size_t)y * g_ld_resolution.host_w * 4;
             const u8* mask =
-                g.movie_overlay_mask + (size_t)y * g.width;
+                g.movie_overlay_mask + (size_t)y * g_ld_resolution.host_w;
             for (u32 x = 0; x < w; x++, ov += 4) {
                 const int coverage = mask[x];
                 if (!coverage) continue;
@@ -9080,7 +9324,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
     {
         g_ld_frame_limit_wait_ticks += rsx_frame_limiter_wait(&g_ld_frame_limiter);
         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap,
-            g_ld_frame_limiter.period ? 0 : 1, 0);
+            ld_present_sync_interval(), 0);
         if (SUCCEEDED(present_hr))
             ld_present_measure_record(g_ld_frames);
         else {
@@ -9416,13 +9660,26 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
 void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
+    if (!ld_refresh_display_state()) return;
     if (g_ld_frames%60==0) {
+        static const char* clear_control=(const char*)-1;
+        if (clear_control==(const char*)-1) clear_control=getenv("RSX_DEPTH_CLEAR_FILE");
+        if (clear_control) {
+            FILE* file=fopen(clear_control,"r"); unsigned enabled;
+            if (file) {
+                if (fscanf(file,"%u",&enabled)==1 && enabled<=1 && enabled!=g_ld_depth_clear) {
+                    g_ld_depth_clear=enabled;
+                    fprintf(stderr,"[depth-clear] frame=%u enabled=%u\n",g_ld_frames,enabled);
+                }
+                fclose(file);
+            }
+        }
         static const char* work_control=(const char*)-1;
         if (work_control==(const char*)-1) work_control=getenv("RSX_CPU_WORK_FILE");
         if (work_control) {
             FILE* file=fopen(work_control,"r"); unsigned flags;
             if (file) {
-                if (fscanf(file,"%u",&flags)==1 && flags<=1023 && flags!=g_ld_cpu_work) {
+                if (fscanf(file,"%u",&flags)==1 && flags<=2047 && flags!=g_ld_cpu_work) {
                     g_ld_cpu_work=flags;
                     fprintf(stderr,"[cpu-work] frame=%u flags=%u\n",g_ld_frames,flags);
                 }
@@ -9614,6 +9871,13 @@ void rsx_live_draw_present(u32 buffer_id)
         return;
     }
     g_ld_last_present_target = target;
+    surface_t display_image=g.surfaces[target];
+    if (g_ld_postprocess.output) {
+        display_image.tex=rsx_postprocess_run(&g_ld_postprocess,g.dev,g.list,
+            display_image.tex,g_ld_aa,g_ld_sharpening,g_ld_exposure);
+        display_image.w=g_ld_postprocess.width; display_image.h=g_ld_postprocess.height;
+        display_image.fmt=DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
     if (dump_requested && !DeleteFileA(dump_trigger)) dump_requested = 0;
     if (dump_now || dump_requested) {
         if (dump_now) dump_written++;
@@ -9622,7 +9886,7 @@ void rsx_live_draw_present(u32 buffer_id)
             snprintf(path, sizeof(path), "%s\\requested_%06u.ppm", dump_dir, g_ld_frames);
         else
             snprintf(path, sizeof(path), "%s\\frame_%06u.ppm", dump_dir, dump_n - 1u);
-        const u64 nb = ld_dump_surface_ppm(path, &g.surfaces[target]);
+        const u64 nb = ld_dump_surface_ppm(path, &display_image);
         fprintf(stderr, "[frame-dump] %s %ux%u nonblack=%llu\n", path,
                 g.surfaces[target].w, g.surfaces[target].h,
                 (unsigned long long)(nb == UINT64_MAX ? 0 : nb));
@@ -9651,7 +9915,7 @@ void rsx_live_draw_present(u32 buffer_id)
       }
       if (rec) {
           g_ld_record_to = rec;
-          ld_dump_surface_ppm(NULL, &g.surfaces[target]);
+          ld_dump_surface_ppm(NULL, &display_image);
           g_ld_record_to = NULL;
           fflush(rec);
       } }
@@ -9722,7 +9986,7 @@ void rsx_live_draw_present(u32 buffer_id)
           ld_trace_target("present", target, buffer_id);
           last_present_target = target;
       } }
-    ID3D12Resource* srcimg = presented_surface->tex;
+    ID3D12Resource* srcimg = display_image.tex;
     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
     ID3D12Resource* bb = g.backbuf[bbi];
 
@@ -9751,7 +10015,7 @@ void rsx_live_draw_present(u32 buffer_id)
     {
         g_ld_frame_limit_wait_ticks += rsx_frame_limiter_wait(&g_ld_frame_limiter);
         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap,
-            g_ld_frame_limiter.period ? 0 : 1, 0);
+            ld_present_sync_interval(), 0);
         if (SUCCEEDED(present_hr))
             ld_present_measure_record(g_ld_frames + 1u);
         else {
@@ -10852,7 +11116,11 @@ void rsx_live_draw_shutdown(void)
             g.depth_snapshot_rootsig);
     if (g.rootsig_x) g.rootsig_x->lpVtbl->Release(g.rootsig_x);
     rsx_color_clear_release(&g.color_clear);
-    if (g.swap) g.swap->lpVtbl->Release(g.swap);
+    rsx_postprocess_destroy(&g_ld_postprocess);
+    if (g.swap) {
+        g.swap->lpVtbl->SetFullscreenState(g.swap,FALSE,NULL);
+        g.swap->lpVtbl->Release(g.swap);
+    }
     if (g_ld_info_queue) {
         g_ld_info_queue->lpVtbl->Release(g_ld_info_queue);
         g_ld_info_queue = NULL;

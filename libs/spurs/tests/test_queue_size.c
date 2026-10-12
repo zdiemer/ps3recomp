@@ -30,6 +30,12 @@ void spu_coh_notify_write(uint32_t ea) { assert(locked && ea == 0x100); ++notifi
 void spu_taskset_signal_task(uint32_t ts, uint32_t task)
 { assert(!locked && ts == 0x900); ++signals; signalled_task = task; }
 void ps3_ww_report_inline(uint32_t ea, uint64_t v, int w) { (void)ea; (void)v; (void)w; }
+#ifdef _WIN32
+/* Contract harness intentionally has no publisher notification. Native mode
+ * must still deliver real data through its bounded polling fallback. */
+int spu_coh_watch_queue(uint32_t ea, void* address) { (void)ea; (void)address; return -1; }
+void spu_coh_unwatch_queue(int cookie) { (void)cookie; }
+#endif
 
 static void expect_size(u32 head, u32 tail, u32 depth, u32 expected)
 {
