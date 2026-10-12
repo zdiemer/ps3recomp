@@ -111,6 +111,32 @@ static void ld_texture_watch_summary(void)
 }
 
 static rsx_vertex_payload_cache g_ld_vertex_cache;
+static struct {
+    u64 hits, misses, bypasses, queries, dirty_pages, bytes, audits, races, failures, hit_vertices, hit_refs;
+} g_geom_stats;
+static u64 g_geom_query_ticks, g_geom_begin_ticks, g_geom_store_ticks, g_geom_copy_ticks;
+static int g_ld_geometry_cache_enabled=-1, g_geom_cache_failed, g_geom_validate=-1;
+static int ld_geometry_cache_enabled(void)
+{
+    if (g_ld_geometry_cache_enabled<0) {
+        const char* option=getenv("RSX_GEOMETRY_CACHE");
+        g_ld_geometry_cache_enabled=option && *option=='1';
+    }
+    return g_ld_geometry_cache_enabled;
+}
+static int ld_geometry_cache_validate(void)
+{
+    if (g_geom_validate<0) { const char* option=getenv("RSX_GEOMETRY_CACHE_VALIDATE"); g_geom_validate=option && *option=='1'; }
+    return g_geom_validate;
+}
+static void ld_geometry_cache_summary(void)
+{
+    if (!g_geom_stats.queries && !g_geom_stats.bypasses) return;
+    fprintf(stderr,"[geometry-cache-summary] enabled=%d failed=%d hits=%llu misses=%llu bypass=%llu queries=%llu dirty_pages=%llu bytes=%llu audits=%llu races=%llu failures=%llu\n",
+        ld_geometry_cache_enabled(),g_geom_cache_failed,g_geom_stats.hits,g_geom_stats.misses,
+        g_geom_stats.bypasses,g_geom_stats.queries,g_geom_stats.dirty_pages,g_geom_stats.bytes,
+        g_geom_stats.audits,g_geom_stats.races,g_geom_stats.failures);
+}
 static int g_ld_apply_polygon_bias=1;
 /* -1 follows the guest state; 0/1 are explicit diagnostic overrides. */
 static int g_ld_depth_clip_probe=-1;
@@ -648,6 +674,8 @@ typedef struct {
     u32 depth_export;
     u32 window_position;
     u32 depth_clear;
+    u32 vertex_cache;
+    u32 geometry_cache;
     LONGLONG qpc;
     u64 process_kernel_100ns;
     u64 process_user_100ns;
@@ -737,6 +765,8 @@ static void ld_present_measure_record(u32 guest_frame)
     sample->depth_export = g_ld_depth_export;
     sample->window_position = g_ld_window_position;
     sample->depth_clear = g_ld_depth_clear;
+    sample->vertex_cache = (u32)ld_vertex_cache_enabled();
+    sample->geometry_cache = (u32)ld_geometry_cache_enabled();
     sample->qpc = now.QuadPart;
     g_ld_frame_limiter.last_present = now.QuadPart;
     if (g_ld_schedule_diag) {
@@ -837,9 +867,9 @@ static void ld_present_measure_dump(void)
     if (g_ld_schedule_diag) {
         fprintf(f, "present_id,guest_frame,qpc,process_kernel_100ns,"
                    "process_user_100ns,present_thread_kernel_100ns,"
-                   "present_thread_user_100ns,present_thread_id,cpu_work,shadow_compare,depth_export,window_position,depth_clear\n");
+                   "present_thread_user_100ns,present_thread_id,cpu_work,shadow_compare,depth_export,window_position,depth_clear,vertex_cache,geometry_cache\n");
     } else {
-        fprintf(f, "present_id,guest_frame,qpc,cpu_work,shadow_compare,depth_export,window_position,depth_clear\n");
+        fprintf(f, "present_id,guest_frame,qpc,cpu_work,shadow_compare,depth_export,window_position,depth_clear,vertex_cache,geometry_cache\n");
     }
     const u64 first =
         g_ld_present_total > LD_PRESENT_RING_CAP
@@ -851,18 +881,18 @@ static void ld_present_measure_dump(void)
                                (LD_PRESENT_RING_CAP - 1u)];
         if (sample->present_id == present_id) {
             if (g_ld_schedule_diag) {
-                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u,%u\n",
+                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u,%u,%u,%u\n",
                         (unsigned long long)sample->present_id,
                         sample->guest_frame, sample->qpc,
                         (unsigned long long)sample->process_kernel_100ns,
                         (unsigned long long)sample->process_user_100ns,
                         (unsigned long long)sample->present_thread_kernel_100ns,
                         (unsigned long long)sample->present_thread_user_100ns,
-                        sample->present_thread_id, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position, sample->depth_clear);
+                        sample->present_thread_id, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position, sample->depth_clear, sample->vertex_cache, sample->geometry_cache);
             } else {
-                fprintf(f, "%llu,%u,%lld,%u,%u,%u,%u,%u\n",
+                fprintf(f, "%llu,%u,%lld,%u,%u,%u,%u,%u,%u,%u\n",
                         (unsigned long long)sample->present_id,
-                        sample->guest_frame, sample->qpc, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position, sample->depth_clear);
+                        sample->guest_frame, sample->qpc, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position, sample->depth_clear, sample->vertex_cache, sample->geometry_cache);
             }
         }
     }
@@ -5559,9 +5589,11 @@ static void fetch_batches(void)
         }
 }
 
+#include "rsx_live_geometry_cache.h"
 static void fetch_batches_hoisted(
     const rsx_vertex_layout_plan* layout, int packed_payload)
 {
+    if (ld_geom_begin(layout,packed_payload)) return;
 #if defined(YZ_PERF_PROFILE)
     LONGLONG stage_begin = ld_profile_qpc();
 #endif
@@ -5679,6 +5711,7 @@ static void fetch_batches_hoisted(
     stage_begin = ld_profile_qpc();
 #endif
     if (packed_payload) {
+        ld_geom_prepare();
         const u64 required = (u64)dc.n_refs * layout->stride;
         if (!reserve_compact_vertices(required)) {
             dc.fetch_ok = 0;
@@ -5732,6 +5765,7 @@ static void fetch_batches_hoisted(
     g_ld_profile.total.vertex_decode_qpc += ld_profile_qpc() - stage_begin;
 #endif
     dc.n_verts = dc.n_refs;
+    if (packed_payload) ld_geom_finish();
 }
 
 static const float* dc_vertex_attr(
@@ -5950,7 +5984,7 @@ static void ld_profile_present(u32 frame)
                 "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
                 "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work,"
                 "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses,topology_index_ms,"
-                "texture_watch_ms,texture_watch_queries,texture_watch_dirty_pages,texture_watch_skip_bytes,texture_watch_skips,texture_watch_audits,texture_watch_races,texture_watch_failures\n");
+                "texture_watch_ms,texture_watch_queries,texture_watch_dirty_pages,texture_watch_skip_bytes,texture_watch_skips,texture_watch_audits,texture_watch_races,texture_watch_failures,vertex_cache,vertex_cache_hits,vertex_cache_misses,vertex_cache_bypasses,vertex_cache_compared_bytes,vertex_cache_storage_bytes,geometry_cache,geometry_cache_hits,geometry_cache_misses,geometry_cache_bypasses,geometry_cache_queries,geometry_cache_dirty_pages,geometry_cache_storage_bytes,geometry_cache_audits,geometry_cache_races,geometry_cache_failures,geometry_cache_query_ms,geometry_cache_begin_ms,geometry_cache_store_ms,geometry_cache_copy_ms,geometry_cache_hit_vertices,geometry_cache_hit_refs\n");
         }
     }
     if (csv) {
@@ -5961,8 +5995,12 @@ static void ld_profile_present(u32 frame)
         static u64 previous_limit_ticks;
         static u64 previous_watch_queries, previous_watch_dirty_pages, previous_watch_skip_bytes;
         static u64 previous_watch_skips, previous_watch_audits, previous_watch_races, previous_watch_failures;
+        static u64 previous_vertex_hits, previous_vertex_misses, previous_vertex_bypasses, previous_vertex_compared;
+        static u64 previous_geom_hits, previous_geom_misses, previous_geom_bypasses, previous_geom_queries;
+        static u64 previous_geom_dirty, previous_geom_audits, previous_geom_races, previous_geom_failures, previous_geom_query_ticks;
+        static u64 previous_geom_begin_ticks, previous_geom_store_ticks, previous_geom_copy_ticks, previous_geom_hit_vertices, previous_geom_hit_refs;
         fprintf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", frame, now, frame_ms,
+            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
@@ -6004,7 +6042,39 @@ static void ld_profile_present(u32 frame)
             (unsigned long long)(g_texture_watch_skips-previous_watch_skips),
             (unsigned long long)(g_texture_watch_audits-previous_watch_audits),
             (unsigned long long)(g_texture_watch_races-previous_watch_races),
-            (unsigned long long)(g_texture_watch_failures-previous_watch_failures));
+            (unsigned long long)(g_texture_watch_failures-previous_watch_failures),
+            (unsigned)ld_vertex_cache_enabled(),
+            (unsigned long long)(g_ld_vertex_cache.hits-previous_vertex_hits),
+            (unsigned long long)(g_ld_vertex_cache.misses-previous_vertex_misses),
+            (unsigned long long)(g_ld_vertex_cache.bypasses-previous_vertex_bypasses),
+            (unsigned long long)(g_ld_vertex_cache.compared_bytes-previous_vertex_compared),
+            (unsigned long long)g_ld_vertex_cache.bytes,
+            (unsigned)ld_geometry_cache_enabled(),
+            (unsigned long long)(g_geom_stats.hits-previous_geom_hits),
+            (unsigned long long)(g_geom_stats.misses-previous_geom_misses),
+            (unsigned long long)(g_geom_stats.bypasses-previous_geom_bypasses),
+            (unsigned long long)(g_geom_stats.queries-previous_geom_queries),
+            (unsigned long long)(g_geom_stats.dirty_pages-previous_geom_dirty),
+            (unsigned long long)g_geom_stats.bytes,
+            (unsigned long long)(g_geom_stats.audits-previous_geom_audits),
+            (unsigned long long)(g_geom_stats.races-previous_geom_races),
+            (unsigned long long)(g_geom_stats.failures-previous_geom_failures),
+            ld_profile_ticks_ms(g_geom_query_ticks-previous_geom_query_ticks),
+            ld_profile_ticks_ms(g_geom_begin_ticks-previous_geom_begin_ticks),
+            ld_profile_ticks_ms(g_geom_store_ticks-previous_geom_store_ticks),
+            ld_profile_ticks_ms(g_geom_copy_ticks-previous_geom_copy_ticks),
+            (unsigned long long)(g_geom_stats.hit_vertices-previous_geom_hit_vertices),
+            (unsigned long long)(g_geom_stats.hit_refs-previous_geom_hit_refs));
+        previous_geom_hits=g_geom_stats.hits; previous_geom_misses=g_geom_stats.misses;
+        previous_geom_bypasses=g_geom_stats.bypasses; previous_geom_queries=g_geom_stats.queries;
+        previous_geom_dirty=g_geom_stats.dirty_pages; previous_geom_audits=g_geom_stats.audits;
+        previous_geom_races=g_geom_stats.races; previous_geom_failures=g_geom_stats.failures;
+        previous_geom_query_ticks=g_geom_query_ticks;
+        previous_geom_begin_ticks=g_geom_begin_ticks; previous_geom_store_ticks=g_geom_store_ticks;
+        previous_geom_copy_ticks=g_geom_copy_ticks; previous_geom_hit_vertices=g_geom_stats.hit_vertices;
+        previous_geom_hit_refs=g_geom_stats.hit_refs;
+        previous_vertex_hits=g_ld_vertex_cache.hits; previous_vertex_misses=g_ld_vertex_cache.misses;
+        previous_vertex_bypasses=g_ld_vertex_cache.bypasses; previous_vertex_compared=g_ld_vertex_cache.compared_bytes;
         previous_watch_queries=g_texture_watch_queries; previous_watch_dirty_pages=g_texture_watch_dirty_pages;
         previous_watch_skip_bytes=g_texture_watch_skip_bytes; previous_watch_skips=g_texture_watch_skips;
         previous_watch_audits=g_texture_watch_audits; previous_watch_races=g_texture_watch_races;
@@ -9462,6 +9532,7 @@ void rsx_live_draw_dump_present_samples(void)
 {
     ld_present_measure_dump();
     ld_texture_watch_summary();
+    ld_geometry_cache_summary();
 }
 
 /* Present a host-decoded RGBA8 frame to the window: copy it straight into the
@@ -10000,6 +10071,15 @@ void rsx_live_draw_present(u32 buffer_id)
             }
         }
         static const char* control=(const char*)-1;
+        static const char* geometry_control=(const char*)-1;
+        if (geometry_control==(const char*)-1) geometry_control=getenv("RSX_GEOMETRY_CACHE_FILE");
+        if (geometry_control) {
+            FILE* file=fopen(geometry_control,"r"); unsigned enabled;
+            if (file) {
+                if (fscanf(file,"%u",&enabled)==1 && enabled<=1) g_ld_geometry_cache_enabled=(int)enabled;
+                fclose(file);
+            }
+        }
         if (control==(const char*)-1) control=getenv("RSX_VERTEX_CACHE_FILE");
         if (control) {
             FILE* file=fopen(control,"r"); unsigned enabled;
@@ -11132,6 +11212,8 @@ void rsx_live_draw_present(u32 buffer_id)
 void rsx_live_draw_shutdown(void)
 {
     if (!g.ready) return;
+    ld_geometry_cache_summary();
+    ld_geometry_cache_clear();
     if (g_texture_watch.base) {
         ld_texture_watch_summary();
         rsx_texture_write_watch_destroy(&g_texture_watch);
