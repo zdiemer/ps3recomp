@@ -140,6 +140,10 @@ static unsigned g_ld_anisotropy=1, g_ld_aa;
 static float g_ld_mip_bias, g_ld_sharpening, g_ld_exposure;
 static int g_ld_vsync=-1;
 static rsx_postprocess g_ld_postprocess;
+static BOOL g_ld_fullscreen_state;
+static int g_ld_fullscreen_requested;
+static HWND g_ld_display_hwnd;
+static int g_ld_display_focused;
 void rsx_live_draw_set_shadow_reference(u32 size) { g_ld_shadow_reference=size; }
 void rsx_live_draw_set_render_reference(u32 width, u32 height)
 {
@@ -151,6 +155,7 @@ void rsx_live_draw_set_render_reference(u32 width, u32 height)
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "user32.lib")
 
 /* Armed by the a010 AUTH repair only after its animation palette is resident. */
 extern volatile LONG g_yz_a010_reference_camera_active;
@@ -2012,6 +2017,51 @@ static void ld_flush(ld_flush_reason reason)
     g_ld_profile.total.flush_qpc += flush_ticks;
     g_ld_profile.total.flush_reason_qpc[reason] += flush_ticks;
 #endif
+}
+
+/* DXGI can change fullscreen state on focus loss/restore. Refresh only the
+ * scanout buffers after the present fence; guest surfaces and internal raster
+ * dimensions remain intact. DXGI's automatic Alt+Enter is disabled. */
+static int ld_refresh_display_state(void)
+{
+    if (!g_ld_fullscreen_requested) return 1;
+    BOOL fullscreen=FALSE;
+    HRESULT hr=g.swap->lpVtbl->GetFullscreenState(g.swap,&fullscreen,NULL);
+    if (FAILED(hr)) {
+        fprintf(stderr,"[d3d-fail] GetFullscreenState hr=0x%08lX\n",(unsigned long)hr);
+        g.ready=0; return 0;
+    }
+    const int focused=GetForegroundWindow()==g_ld_display_hwnd && !IsIconic(g_ld_display_hwnd);
+    int transitioned=0;
+    if (focused && !g_ld_display_focused && !fullscreen) {
+        hr=g.swap->lpVtbl->SetFullscreenState(g.swap,TRUE,NULL);
+        if (SUCCEEDED(hr)) {
+            g.swap->lpVtbl->GetFullscreenState(g.swap,&fullscreen,NULL);
+            transitioned=1;
+        } else fprintf(stderr,"[display] DXGI fullscreen retry unavailable hr=0x%08lX; using borderless\n",(unsigned long)hr);
+    }
+    g_ld_display_focused=focused;
+    if (!transitioned && fullscreen==g_ld_fullscreen_state) return 1;
+    ld_flush(LD_FLUSH_PRESENT);
+    if (!g.ready) return 0;
+    for (u32 i=0;i<LD_SWAP_BUFFERS;++i) {
+        if (g.backbuf[i]) g.backbuf[i]->lpVtbl->Release(g.backbuf[i]);
+        g.backbuf[i]=NULL;
+    }
+    hr=g.swap->lpVtbl->ResizeBuffers(g.swap,LD_SWAP_BUFFERS,
+        g_ld_resolution.host_w,g_ld_resolution.host_h,DXGI_FORMAT_R8G8B8A8_UNORM,0);
+    if (SUCCEEDED(hr)) for (u32 i=0;i<LD_SWAP_BUFFERS;++i) {
+        hr=g.swap->lpVtbl->GetBuffer(g.swap,i,&IID_ID3D12Resource,(void**)&g.backbuf[i]);
+        if (FAILED(hr)) break;
+        g.dev->lpVtbl->CreateRenderTargetView(g.dev,g.backbuf[i],NULL,rtv_handle(i));
+    }
+    if (FAILED(hr)) {
+        fprintf(stderr,"[d3d-fail] fullscreen buffer refresh hr=0x%08lX\n",(unsigned long)hr);
+        g.ready=0; return 0;
+    }
+    g_ld_fullscreen_state=fullscreen;
+    fprintf(stderr,"[display] DXGI fullscreen active=%u buffers refreshed\n",(unsigned)fullscreen);
+    return 1;
 }
 
 /* Public wrapper for the RSX SET_REFERENCE / sync fence: block until the GPU
@@ -8722,7 +8772,32 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     }
     sc1->lpVtbl->QueryInterface(sc1, &IID_IDXGISwapChain3, (void**)&g.swap);
     sc1->lpVtbl->Release(sc1);
+    factory->lpVtbl->MakeWindowAssociation(factory,(HWND)hwnd,DXGI_MWA_NO_ALT_ENTER);
     factory->lpVtbl->Release(factory);
+    const char* window_mode=getenv("RSX_WINDOW_MODE");
+    g_ld_fullscreen_requested=window_mode && !strcmp(window_mode,"fullscreen");
+    g_ld_fullscreen_state=FALSE;
+    g_ld_display_hwnd=(HWND)hwnd;
+    g_ld_display_focused=GetForegroundWindow()==(HWND)hwnd;
+    if (g_ld_fullscreen_requested) {
+        const HRESULT fullscreen_hr=g.swap->lpVtbl->SetFullscreenState(g.swap,TRUE,NULL);
+        if (SUCCEEDED(fullscreen_hr)) {
+            /* Flip-model D3D12 requires ResizeBuffers after the transition.
+             * No backbuffer references have been acquired yet. Keep internal
+             * raster resolution independent of the desktop display mode. */
+            const HRESULT resize_hr=g.swap->lpVtbl->ResizeBuffers(g.swap,LD_SWAP_BUFFERS,
+                g_ld_resolution.host_w,g_ld_resolution.host_h,scd.Format,0);
+            if (FAILED(resize_hr)) {
+                g.swap->lpVtbl->SetFullscreenState(g.swap,FALSE,NULL);
+                fprintf(stderr,"[display] fullscreen ResizeBuffers failed hr=0x%08lX\n",(unsigned long)resize_hr);
+                return -1;
+            }
+            g.swap->lpVtbl->GetFullscreenState(g.swap,&g_ld_fullscreen_state,NULL);
+            fprintf(stderr,"[display] DXGI fullscreen active=%u\n",(unsigned)g_ld_fullscreen_state);
+        } else {
+            fprintf(stderr,"[display] DXGI fullscreen unavailable hr=0x%08lX; using borderless\n",(unsigned long)fullscreen_hr);
+        }
+    }
 
     /* RTV heap: [0..1] backbuffers, [2..] surface cache */
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
@@ -9147,7 +9222,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
         InterlockedExchange(&g_ld_host_waiting, 1);
         AcquireSRWLockExclusive(&g_ld_access_lock);
     }
-    if (!g.ready || !rgba) {
+    if (!g.ready || !rgba || !ld_refresh_display_state()) {
         if (serialized) {
             ReleaseSRWLockExclusive(&g_ld_access_lock);
             InterlockedExchange(&g_ld_host_waiting, 0);
@@ -9580,6 +9655,7 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
 void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
+    if (!ld_refresh_display_state()) return;
     if (g_ld_frames%60==0) {
         static const char* work_control=(const char*)-1;
         if (work_control==(const char*)-1) work_control=getenv("RSX_CPU_WORK_FILE");
@@ -11024,7 +11100,10 @@ void rsx_live_draw_shutdown(void)
     if (g.rootsig_x) g.rootsig_x->lpVtbl->Release(g.rootsig_x);
     rsx_color_clear_release(&g.color_clear);
     rsx_postprocess_destroy(&g_ld_postprocess);
-    if (g.swap) g.swap->lpVtbl->Release(g.swap);
+    if (g.swap) {
+        g.swap->lpVtbl->SetFullscreenState(g.swap,FALSE,NULL);
+        g.swap->lpVtbl->Release(g.swap);
+    }
     if (g_ld_info_queue) {
         g_ld_info_queue->lpVtbl->Release(g_ld_info_queue);
         g_ld_info_queue = NULL;

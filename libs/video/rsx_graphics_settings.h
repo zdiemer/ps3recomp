@@ -21,6 +21,9 @@ static const rsx_graphics_option rsx_graphics_options[] = {
     {"exposure","RSX_EXPOSURE","0","-2..2 stops",4,-2,2},
     {"vsync","RSX_VSYNC","auto","auto, on or off",0,0,0},
     {"frame_limit","RSX_MAX_FPS","30","0..240 (0 = uncapped)",5,0,240},
+    {"display_mode","RSX_WINDOW_MODE","windowed","windowed, fullscreen or borderless",6,0,0},
+    {"window_size","RSX_WINDOW_SIZE","1280x720","WIDTHxHEIGHT (1..8192), independent of rendering resolution",7,0,0},
+    {"monitor","RSX_MONITOR","primary","primary or a monitor number (1..16)",8,1,16},
 };
 static const rsx_graphics_option* rsx_graphics_find_option(const char* key) {
     for (unsigned i=0;i<sizeof(rsx_graphics_options)/sizeof(rsx_graphics_options[0]);++i)
@@ -29,10 +32,13 @@ static const rsx_graphics_option* rsx_graphics_find_option(const char* key) {
 }
 static int rsx_graphics_valid(const rsx_graphics_option* o,const char* value) {
     if (!value || !*value) return 0;
-    if (o->kind==1) {
+    if (o->kind==1 || o->kind==7) {
         rsx_render_resolution r;
-        return !strcmp(value,"native") || rsx_render_resolution_parse(&r,1,1,value)==0;
+        return (!strcmp(value,"native") && o->kind==1) ||
+            (strcmp(value,"native") && rsx_render_resolution_parse(&r,1,1,value)==0);
     }
+    if (o->kind==6) return !strcmp(value,"windowed") || !strcmp(value,"fullscreen") || !strcmp(value,"borderless");
+    if (o->kind==8 && !strcmp(value,"primary")) return 1;
     if (o->kind==0) {
         if (!strcmp(o->key,"anti_aliasing")) return !strcmp(value,"off") || !strcmp(value,"fxaa");
         return !strcmp(value,"auto") || !strcmp(value,"on") || !strcmp(value,"off");
@@ -44,6 +50,6 @@ static int rsx_graphics_valid(const rsx_graphics_option* o,const char* value) {
     if (*end || !isfinite(n) || n<o->low || n>o->high) return 0;
     if (o->kind==4) return 1;
     for (const char* c=value;*c;++c) if (*c<'0' || *c>'9') return 0;
-    return o->kind==5 || n==1 || n==2 || n==4 || n==8 || n==16;
+    return o->kind==5 || o->kind==8 || n==1 || n==2 || n==4 || n==8 || n==16;
 }
 #endif
