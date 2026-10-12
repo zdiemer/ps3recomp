@@ -1426,6 +1426,64 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
     return h;
 }
 
+/* Honor shader-window XY conventions; optionally supply RSX reciprocal W. */
+int rsx_fp_apply_window_position_ex(char* hlsl, u32 out_size, u32 window,
+                                  int reciprocal_w)
+{
+    if (!hlsl || !out_size) return -1;
+    const char* end = memchr(hlsl, 0, out_size);
+    if (!end) return -1;
+    const u32 origin = (window >> 12) & 15u;
+    const u32 center = (window >> 16) & 15u;
+    if (origin > 1u || center > 1u) return -1;
+    if (!origin && !center && !reciprocal_w) return 0;
+    char* entry = strstr(hlsl, "main(PSInput input)");
+    char* brace = entry ? strchr(entry, '{') : NULL;
+    if (!brace) return -1;
+    char* body = brace + 1;
+    if (!strstr(body, "input.position")) return 0;
+    if (strstr(body, "rsx_wpos")) return -1;
+    char declaration[192];
+    const int added = snprintf(declaration, sizeof(declaration),
+        "\n    float4 rsx_wpos = input.position;\n");
+    if (added < 0 || (size_t)added >= sizeof(declaration)) return -1;
+    size_t length = (size_t)added;
+    if (origin) {
+        const int n = snprintf(declaration + length, sizeof(declaration) - length,
+            "    rsx_wpos.y = %u.0 - rsx_wpos.y;\n", window & 4095u);
+        if (n < 0 || (size_t)n >= sizeof(declaration) - length) return -1;
+        length += (size_t)n;
+    }
+    if (center) {
+        const char bias[] = "    rsx_wpos.xy -= float2(0.5, 0.5);\n";
+        if (length + sizeof(bias) > sizeof(declaration)) return -1;
+        memcpy(declaration + length, bias, sizeof(bias));
+        length += sizeof(bias) - 1u;
+    }
+    if (reciprocal_w) {
+        const char conversion[] = "    rsx_wpos.w = rcp(rsx_wpos.w);\n";
+        if (length + sizeof(conversion) > sizeof(declaration)) return -1;
+        memcpy(declaration + length, conversion, sizeof(conversion));
+        length += sizeof(conversion) - 1u;
+    }
+    const size_t used = (size_t)(end - hlsl);
+    /* Conservative capacity check before any mutation. Replacements shrink. */
+    if (used + length + 1u > out_size) return -1;
+    for (char* at = strstr(body, "input.position"); at;
+         at = strstr(at + 8, "input.position")) {
+        memcpy(at, "rsx_wpos", 8);
+        memmove(at + 8, at + 14, strlen(at + 14) + 1u);
+    }
+    memmove(body + length, body, strlen(body) + 1u);
+    memcpy(body, declaration, length);
+    return 1;
+}
+
+int rsx_fp_apply_window_position(char* hlsl, u32 out_size, u32 window)
+{
+    return rsx_fp_apply_window_position_ex(hlsl, out_size, window, 0);
+}
+
 /* Scale texel-space coordinates to the 0..1 range HLSL sampling expects.
  *
  * An RSX texture whose format carries RSX_TEX_FMT_UNNORM (0x40) is addressed in
