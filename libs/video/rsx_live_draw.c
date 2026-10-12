@@ -80,6 +80,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include "rsx_restart_cuts.h"
 #include "rsx_vertex_compact.h"
 #include "rsx_vp_decompiler.h"
+#include "rsx_vp_program_cache.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -87,9 +88,12 @@ static volatile long g_ld_ps1_vram_ready = 0;
 
 static rsx_vertex_payload_cache g_ld_vertex_cache;
 static int g_ld_apply_polygon_bias=1;
+/* -1 follows the guest state; 0/1 are explicit diagnostic overrides. */
+static int g_ld_depth_clip_probe=-1;
 /* Independently benchmark reference filling (1), dense remapping (2), and
  * texture hashing (4). Live changes apply at presentation boundaries. */
 static unsigned g_ld_cpu_work=259;
+static rsx_vp_program_cache g_ld_vp_program_cache;
 static int g_ld_vertex_cache_enabled=-1;
 static int ld_vertex_cache_enabled(void)
 {
@@ -585,6 +589,7 @@ static u64 g_ld_recent_draw_total = 0;
 typedef struct {
     u64 present_id;
     u32 guest_frame;
+    u32 cpu_work;
     LONGLONG qpc;
     u64 process_kernel_100ns;
     u64 process_user_100ns;
@@ -666,6 +671,7 @@ static void ld_present_measure_record(u32 guest_frame)
         &g_ld_present_ring[(present_id - 1u) & (LD_PRESENT_RING_CAP - 1u)];
     sample->present_id = present_id;
     sample->guest_frame = guest_frame;
+    sample->cpu_work = g_ld_cpu_work;
     sample->qpc = now.QuadPart;
     g_ld_frame_limiter.last_present = now.QuadPart;
     if (g_ld_schedule_diag) {
@@ -766,9 +772,9 @@ static void ld_present_measure_dump(void)
     if (g_ld_schedule_diag) {
         fprintf(f, "present_id,guest_frame,qpc,process_kernel_100ns,"
                    "process_user_100ns,present_thread_kernel_100ns,"
-                   "present_thread_user_100ns,present_thread_id\n");
+                   "present_thread_user_100ns,present_thread_id,cpu_work\n");
     } else {
-        fprintf(f, "present_id,guest_frame,qpc\n");
+        fprintf(f, "present_id,guest_frame,qpc,cpu_work\n");
     }
     const u64 first =
         g_ld_present_total > LD_PRESENT_RING_CAP
@@ -780,18 +786,18 @@ static void ld_present_measure_dump(void)
                                (LD_PRESENT_RING_CAP - 1u)];
         if (sample->present_id == present_id) {
             if (g_ld_schedule_diag) {
-                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u\n",
+                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u\n",
                         (unsigned long long)sample->present_id,
                         sample->guest_frame, sample->qpc,
                         (unsigned long long)sample->process_kernel_100ns,
                         (unsigned long long)sample->process_user_100ns,
                         (unsigned long long)sample->present_thread_kernel_100ns,
                         (unsigned long long)sample->present_thread_user_100ns,
-                        sample->present_thread_id);
+                        sample->present_thread_id, sample->cpu_work);
             } else {
-                fprintf(f, "%llu,%u,%lld\n",
+                fprintf(f, "%llu,%u,%lld,%u\n",
                         (unsigned long long)sample->present_id,
-                        sample->guest_frame, sample->qpc);
+                        sample->guest_frame, sample->qpc, sample->cpu_work);
             }
         }
     }
@@ -1124,6 +1130,8 @@ typedef struct {
     u64 ps_compile_qpc;
     u64 create_pso_qpc;
     u64 pso_prepare_qpc;
+    u64 vp_prepare_qpc, fp_prepare_qpc;
+    u64 vp_cache_hits, vp_cache_misses;
     u64 pso_lookup_qpc;
     u64 vertex_refs_qpc;
     u64 vertex_remap_qpc;
@@ -1403,7 +1411,7 @@ static u32 ld_rt_count(u32 sel)
 typedef struct {
     u32 alpha_test_enable, alpha_func, alpha_ref_raw, alpha_ref_format;
     u32 blend_enable, sf_rgb, df_rgb, sf_a, df_a, eq_rgb, eq_a;
-    u32 depth_test, depth_write, depth_func;
+    u32 depth_test, depth_write, depth_func, depth_clip;
     u32 bias_factor, bias_units;
     u32 cull_enable, cull_face, front_face;
     u32 color_mask;
@@ -1448,6 +1456,32 @@ static void decode_render_state(render_state_t* rs)
     { static int nd = -1; if (nd < 0) nd = getenv("LD_NO_DEPTH") ? 1 : 0; if (nd) rs->depth_test = 0; }
     rs->depth_write = rsx_dsp_reg(&g.rsx, M_DEPTH_WRITE) & 1;
     rs->depth_func  = rsx_dsp_reg(&g.rsx, M_DEPTH_FUNC);
+    rs->depth_clip = g_ld_depth_clip_probe >= 0 ?
+        (u32)g_ld_depth_clip_probe : ((rsx_dsp_reg(&g.rsx, 0x1D78) & 0xFu) != 0);
+    {
+        static int trace = -1;
+        static u32 seen[64][9], count;
+        if (trace < 0) trace = getenv("RSX_DEPTH_TRACE") != NULL;
+        if (trace && count < 64u) {
+            const u32 state[9] = {
+                rsx_dsp_reg(&g.rsx, 0x1D78), rsx_dsp_reg(&g.rsx, 0x0394),
+                rsx_dsp_reg(&g.rsx, 0x0398), rsx_dsp_reg(&g.rsx, 0x0A38),
+                rsx_dsp_reg(&g.rsx, 0x0A28), rs->depth_test, rs->depth_write,
+                rs->depth_func, rsx_dsp_reg(&g.rsx, M_COLOR_MASK)
+            };
+            u32 index;
+            for (index = 0; index < count; ++index)
+                if (!memcmp(state, seen[index], sizeof(state))) break;
+            if (index == count) {
+                memcpy(seen[count++], state, sizeof(state));
+                fprintf(stderr, "[depth-state] frame=%u control=%08X clip=%08X/%08X "
+                    "scaleZ=%08X translateZ=%08X test=%u write=%u func=%X "
+                    "host_clip=%u zeta=%08X control_written=%u\n", g_ld_frames, state[0], state[1],
+                    state[2], state[3], state[4], state[5], state[6], state[7],
+                    rs->depth_clip, rsx_dsp_reg(&g.rsx, 0x0214), g.rsx.seen[0x1D78 >> 2]);
+            }
+        }
+    }
     if (g_ld_apply_polygon_bias && (rsx_dsp_reg(&g.rsx, 0x0A68) & 1)) {
         rs->bias_factor = rsx_dsp_reg(&g.rsx, 0x0A78);
         rs->bias_units = rsx_dsp_reg(&g.rsx, 0x0A7C);
@@ -1543,6 +1577,7 @@ static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
     /* Y-negating viewport epilogue mirrors winding; take the front sense
      * straight from the guest value (validated in B1). */
     pd->RasterizerState.FrontCounterClockwise = (rs->front_face == 0x0901);
+    pd->RasterizerState.DepthClipEnable = rs->depth_clip ? TRUE : FALSE;
     if (g_ld_bias_list) pd->Flags |= D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
     else {
         float factor, units;
@@ -3875,6 +3910,7 @@ static u64 ld_hash_structural_render_state(
     LD_HASH_RENDER_FIELD(depth_test);
     LD_HASH_RENDER_FIELD(depth_write);
     LD_HASH_RENDER_FIELD(depth_func);
+    LD_HASH_RENDER_FIELD(depth_clip);
     if (!g_ld_bias_list) {
         LD_HASH_RENDER_FIELD(bias_factor);
         LD_HASH_RENDER_FIELD(bias_units);
@@ -4122,8 +4158,41 @@ static void ld_profile_note_fp_variants(
 }
 #endif
 
+#if defined(YZ_PERF_PROFILE)
+#define LD_SHADER_PREP(type,name,parameters,expression,field) \
+    static type name parameters { \
+        const LONGLONG begin=ld_profile_qpc(); \
+        const type result=(expression); \
+        g_ld_profile.total.field+=ld_profile_qpc()-begin; \
+        return result; \
+    }
+LD_SHADER_PREP(u32,ld_vp_program_size,(const u8* code,u32 bytes),
+    rsx_vp_program_size_instrs(code,bytes),vp_prepare_qpc)
+LD_SHADER_PREP(int,ld_vp_analyze_inputs,(const u8* code,u32 bytes,rsx_vp_input_analysis* out),
+    rsx_vp_analyze_inputs(code,bytes,out),vp_prepare_qpc)
+LD_SHADER_PREP(u64,ld_vp_hash,(const u8* code,u32 bytes),
+    fnv1a(code,bytes,1469598103934665603ull),vp_prepare_qpc)
+LD_SHADER_PREP(u32,ld_fp_program_size,(const u8* code,u32 bytes),
+    rsx_fp_program_size(code,bytes),fp_prepare_qpc)
+LD_SHADER_PREP(int,ld_fp_collect_constants,(const u8* code,u32 bytes,rsx_fp_constant_block* out),
+    rsx_fp_collect_constants(code,bytes,out),fp_prepare_qpc)
+LD_SHADER_PREP(u64,ld_fp_structural_hash,(const u8* code,u32 bytes,u64 seed),
+    rsx_fp_structural_hash(code,bytes,seed),fp_prepare_qpc)
+#undef LD_SHADER_PREP
+#else
+#define ld_vp_program_size rsx_vp_program_size_instrs
+#define ld_vp_analyze_inputs rsx_vp_analyze_inputs
+#define ld_vp_hash(code,bytes) fnv1a(code,bytes,1469598103934665603ull)
+#define ld_fp_program_size rsx_fp_program_size
+#define ld_fp_collect_constants rsx_fp_collect_constants
+#define ld_fp_structural_hash rsx_fp_structural_hash
+#endif
+
 static u32 vp_txl_unit_mask(const u8* ucode, u32 instrs)
 {
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG begin=ld_profile_qpc();
+#endif
     u32 mask = 0;
     for (u32 i = 0; i < instrs; i++) {
         const u8* p = ucode + i * 16;
@@ -4134,7 +4203,24 @@ static u32 vp_txl_unit_mask(const u8* ucode, u32 instrs)
                        ((u32)p[10] << 16) | ((u32)p[11] << 24);
         mask |= 1u << ((d2 >> 8) & 3u);
     }
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.vp_prepare_qpc+=ld_profile_qpc()-begin;
+#endif
     return mask;
+}
+
+static void ld_vp_cached_info(const u8* code, u32 bytes, rsx_vp_program_info* out)
+{
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG begin = ld_profile_qpc();
+    const int hit =
+#endif
+        rsx_vp_program_cache_get(&g_ld_vp_program_cache, code, bytes, out);
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.vp_prepare_qpc += ld_profile_qpc() - begin;
+    if (hit) g_ld_profile.total.vp_cache_hits++;
+    else g_ld_profile.total.vp_cache_misses++;
+#endif
 }
 
 static ID3D12PipelineState* build_pso(
@@ -4346,11 +4432,17 @@ static int ld_current_vertex_layout(rsx_vertex_layout_plan* layout)
         return 0;
     }
     const u8* vp_uc = (const u8*)(g.rsx.vp + start * 4);
-    const u32 vp_instrs = rsx_vp_program_size_instrs(
+    if (g_ld_cpu_work & 512u) {
+        rsx_vp_program_info info;
+        ld_vp_cached_info(vp_uc, (RSX_DSP_VP_INSTR - start) * 16, &info);
+        ld_layout_plan_get(info.input_mask, layout);
+        return info.instructions != 0;
+    }
+    const u32 vp_instrs = ld_vp_program_size(
         vp_uc, (RSX_DSP_VP_INSTR - start) * 16);
     rsx_vp_input_analysis analysis = {0xFFFFu, 0};
     if (!vp_instrs ||
-        rsx_vp_analyze_inputs(
+        ld_vp_analyze_inputs(
             vp_uc, vp_instrs * 16, &analysis) != (int)vp_instrs ||
         !analysis.exact)
         analysis.input_mask = 0xFFFFu;
@@ -4382,14 +4474,19 @@ static ID3D12PipelineState* get_pso(
     const u32 start = rsx_dsp_vp_start(&g.rsx);
     if (start >= RSX_DSP_VP_INSTR) { LD_PSO_BAIL("no vertex program uploaded (vp start out of range)"); return NULL; }
     const u8* vp_uc = (const u8*)(g.rsx.vp + start * 4);
-    const u32 vp_instrs = rsx_vp_program_size_instrs(vp_uc, (RSX_DSP_VP_INSTR - start) * 16);
+    rsx_vp_program_info vp_info;
+    const int cache_vp = (g_ld_cpu_work & 512u) != 0;
+    if (cache_vp)
+        ld_vp_cached_info(vp_uc, (RSX_DSP_VP_INSTR - start) * 16, &vp_info);
+    const u32 vp_instrs = cache_vp ? vp_info.instructions :
+        ld_vp_program_size(vp_uc, (RSX_DSP_VP_INSTR - start) * 16);
     if (!vp_instrs) { LD_PSO_BAIL("vertex program has zero instructions"); return NULL; }
 
     u32 fp_loc = 0;
     const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
     const u8* fp_uc = guest_ptr(fp_loc, fp_off, 16);
     if (!fp_uc) { LD_PSO_BAIL("fragment program address does not resolve to guest memory"); return NULL; }
-    const u32 fp_size = rsx_fp_program_size(fp_uc, 0x10000);
+    const u32 fp_size = ld_fp_program_size(fp_uc, 0x10000);
     if (!fp_size) {
         /* No END-bit instruction in 64 KB: the bytes at (location, offset) are
          * not a fragment program. Almost always the LOCATION is wrong, not the
@@ -4450,7 +4547,7 @@ static ID3D12PipelineState* get_pso(
             cube_mask |= 1u << unit;
     }
     const u32 vtex_mask = vertex_texture_mask();
-    const u32 txl_mask = vp_txl_unit_mask(vp_uc, vp_instrs);
+    const u32 txl_mask = cache_vp ? vp_info.txl_mask : vp_txl_unit_mask(vp_uc, vp_instrs);
     if (txl_mask && !(txl_mask & vtex_mask)) {
         g_ld_vtex_missing_for_txl++;
         static u32 warned = 0;
@@ -4478,7 +4575,7 @@ static ID3D12PipelineState* get_pso(
 
     render_state_t rs;
     decode_render_state(&rs);
-    if (rsx_fp_collect_constants(
+    if (ld_fp_collect_constants(
             fp_uc, fp_size, &g.fp_constants) < 0) {
         LD_PSO_BAIL("fragment program constant collection failed");
         return NULL;
@@ -4486,10 +4583,9 @@ static ID3D12PipelineState* get_pso(
     g.fp_alpha_ref = rsx_fp_alpha_ref(
         rs.alpha_ref_raw, rs.alpha_ref_format);
 
-    u64 key = fnv1a(
-        vp_uc, vp_instrs * 16, 1469598103934665603ull);
+    u64 key = cache_vp ? vp_info.hash : ld_vp_hash(vp_uc, vp_instrs * 16);
     if (ld_fp_constants_buffered())
-        key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+        key = ld_fp_structural_hash(fp_uc, fp_size, key);
     else
         key = fnv1a(fp_uc, fp_size, key);
     if (!key) {
@@ -4541,8 +4637,7 @@ static ID3D12PipelineState* get_pso(
 #endif
     g_ld_current_pso.valid = 1;
     g_ld_current_pso.key = key;
-    g_ld_current_pso.vp_hash = fnv1a(
-        vp_uc, vp_instrs * 16, 1469598103934665603ull);
+    g_ld_current_pso.vp_hash = cache_vp ? vp_info.hash : ld_vp_hash(vp_uc, vp_instrs * 16);
     g_ld_current_pso.vp_start = start;
     g_ld_current_pso.vp_instrs = vp_instrs;
     g_ld_current_pso.fp_location = fp_loc;
@@ -5465,7 +5560,7 @@ static void ld_profile_present(u32 frame)
                 "create_pso_ms,texture_decode_ms,draws,vertices,texture_upload_bytes,"
                 "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
                 "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work,"
-                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms\n");
+                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses\n");
         }
     }
     if (csv) {
@@ -5475,7 +5570,7 @@ static void ld_profile_present(u32 frame)
         cellGcmGetBlitProfile(&blit_ticks,&blit_pixels,&blit_row_pixels);
         static u64 previous_limit_ticks;
         fprintf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f\n", frame, now, frame_ms,
+            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
@@ -5504,7 +5599,11 @@ static void ld_profile_present(u32 frame)
             (unsigned long long)(blit_pixels-previous_pixels),
             (unsigned long long)(blit_row_pixels-previous_row_pixels),
             g_ld_profile.qpc_frequency,g_ld_profile.first_draw_qpc,g_ld_profile.last_draw_qpc,
-            ld_profile_ticks_ms(g_ld_frame_limit_wait_ticks-previous_limit_ticks));
+            ld_profile_ticks_ms(g_ld_frame_limit_wait_ticks-previous_limit_ticks),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(vp_prepare_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(fp_prepare_qpc)),
+            (unsigned long long)LD_PROFILE_DELTA(vp_cache_hits),
+            (unsigned long long)LD_PROFILE_DELTA(vp_cache_misses));
         previous_limit_ticks=g_ld_frame_limit_wait_ticks;
         previous_ticks=blit_ticks; previous_pixels=blit_pixels; previous_row_pixels=blit_row_pixels;
         if ((frame & 63u) == 0) fflush(csv);
@@ -9172,7 +9271,7 @@ void rsx_live_draw_present(u32 buffer_id)
         if (work_control) {
             FILE* file=fopen(work_control,"r"); unsigned flags;
             if (file) {
-                if (fscanf(file,"%u",&flags)==1 && flags<=511 && flags!=g_ld_cpu_work) {
+                if (fscanf(file,"%u",&flags)==1 && flags<=1023 && flags!=g_ld_cpu_work) {
                     g_ld_cpu_work=flags;
                     fprintf(stderr,"[cpu-work] frame=%u flags=%u\n",g_ld_frames,flags);
                 }
@@ -9180,6 +9279,20 @@ void rsx_live_draw_present(u32 buffer_id)
             }
         }
         static const char* bias_control=(const char*)-1;
+        static const char* clip_control=(const char*)-1;
+        if (clip_control==(const char*)-1) clip_control=getenv("RSX_DEPTH_CLIP_FILE");
+        if (clip_control) {
+            FILE* file=fopen(clip_control,"r"); int enabled;
+            if (file) {
+                if (fscanf(file,"%d",&enabled)==1 && enabled>=-1 && enabled<=1 &&
+                    enabled!=g_ld_depth_clip_probe) {
+                    g_ld_depth_clip_probe=enabled;
+                    fprintf(stderr,"[depth-clip-probe] frame=%u enabled=%d\n",
+                        g_ld_frames,enabled);
+                }
+                fclose(file);
+            }
+        }
         if (bias_control==(const char*)-1) bias_control=getenv("RSX_BIAS_FILE");
         if (bias_control) {
             FILE* file=fopen(bias_control,"r"); unsigned enabled;

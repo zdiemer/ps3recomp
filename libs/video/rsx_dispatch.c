@@ -171,6 +171,10 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
     rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
 
+    /* NV4097 ZMIN_MAX_CONTROL reset: depth clipping enabled. A never-written
+     * register must not look like an explicit guest request to disable it. */
+    rsx->regs[0x1D78 >> 2] = 1u;
+
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
