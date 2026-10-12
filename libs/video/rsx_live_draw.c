@@ -7575,12 +7575,22 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
               }
           } }
     /* LD_TRACE_PSO=<hex key>: raw vertex attributes + unit-0 texels of the
-     * first three draws with that CSV pso_key. */
+     * first three draws with that CSV pso_key. LD_TRACE_SOURCE_VERTS=<decimal>
+     * selects a source occurrence count instead, useful before a mesh's PSO
+     * is known. Both selectors honor LD_TRACE_SURFACE_GATE. */
     { static u64 tk = 1; static int tn;
       static u32 trace_surf = ~0u;
+      static u32 trace_source_verts = ~0u;
       if (trace_surf == ~0u) { const char* e = getenv("LD_TRACE_SURFACE");
           trace_surf = e ? (u32)strtoul(e, 0, 16) : 0; }
+      if (trace_source_verts == ~0u) { const char* e = getenv("LD_TRACE_SOURCE_VERTS");
+          trace_source_verts = e ? (u32)strtoul(e, 0, 10) : 0; }
       if (tk == 1) { const char* e = getenv("LD_TRACE_PSO"); tk = e ? _strtoui64(e, 0, 16) : 0; }
+      const int trace_match =
+          (tk && live_legacy_pso_key() == tk) ||
+          (trace_surf && target < g.n_surfaces && g.surfaces[target].offset == trace_surf) ||
+          (trace_source_verts &&
+           (dc.n_source_refs ? dc.n_source_refs : dc.n_verts) == trace_source_verts);
       if (tk && live_legacy_pso_key() == tk && tn >= 3) {
           static u32 every;
           if (dc.inl && (++every % 60) == 0)
@@ -7594,15 +7604,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
       static const char* trace_gate = (const char*)-1;
       if (trace_gate == (const char*)-1) trace_gate = getenv("LD_TRACE_SURFACE_GATE");
       int trace_open = 1;
-      if (trace_gate && tn < 3 &&
-          ((tk && live_legacy_pso_key() == tk) ||
-           (trace_surf && target < g.n_surfaces && g.surfaces[target].offset == trace_surf))) {
+      if (trace_gate && tn < 3 && trace_match) {
           FILE* gate = fopen(trace_gate, "rb"); trace_open = gate != NULL;
           if (gate) fclose(gate);
       }
-      if (tn < 3 && trace_open && (long)g_ld_frames >= tfrom &&
-          ((tk && live_legacy_pso_key() == tk) ||
-           (trace_surf && target < g.n_surfaces && g.surfaces[target].offset == trace_surf))) {
+      if (tn < 3 && trace_open && (long)g_ld_frames >= tfrom && trace_match) {
           tn++;
           fprintf(stderr, "[pso-trace] frame=%u surface=%08X key=%016llX decoded=%u\n",
                   g_ld_frames, g.surfaces[target].offset,
