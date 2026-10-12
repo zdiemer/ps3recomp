@@ -92,6 +92,8 @@ static int g_ld_apply_polygon_bias=1;
 static int g_ld_depth_clip_probe=-1;
 static unsigned g_ld_shadow_compare;
 static unsigned g_ld_depth_export;
+/* Honor RSX XY by default. Probe: 0=legacy, 1=RSX XY, 2=XY+reciprocal W. */
+static unsigned g_ld_window_position = 1;
 /* Independently benchmark reference filling (1), dense remapping (2), and
  * texture hashing (4). Live changes apply at presentation boundaries. */
 static unsigned g_ld_cpu_work=259;
@@ -594,6 +596,7 @@ typedef struct {
     u32 cpu_work;
     u32 shadow_compare;
     u32 depth_export;
+    u32 window_position;
     LONGLONG qpc;
     u64 process_kernel_100ns;
     u64 process_user_100ns;
@@ -678,6 +681,7 @@ static void ld_present_measure_record(u32 guest_frame)
     sample->cpu_work = g_ld_cpu_work;
     sample->shadow_compare = g_ld_shadow_compare;
     sample->depth_export = g_ld_depth_export;
+    sample->window_position = g_ld_window_position;
     sample->qpc = now.QuadPart;
     g_ld_frame_limiter.last_present = now.QuadPart;
     if (g_ld_schedule_diag) {
@@ -778,9 +782,9 @@ static void ld_present_measure_dump(void)
     if (g_ld_schedule_diag) {
         fprintf(f, "present_id,guest_frame,qpc,process_kernel_100ns,"
                    "process_user_100ns,present_thread_kernel_100ns,"
-                   "present_thread_user_100ns,present_thread_id,cpu_work,shadow_compare,depth_export\n");
+                   "present_thread_user_100ns,present_thread_id,cpu_work,shadow_compare,depth_export,window_position\n");
     } else {
-        fprintf(f, "present_id,guest_frame,qpc,cpu_work,shadow_compare,depth_export\n");
+        fprintf(f, "present_id,guest_frame,qpc,cpu_work,shadow_compare,depth_export,window_position\n");
     }
     const u64 first =
         g_ld_present_total > LD_PRESENT_RING_CAP
@@ -792,18 +796,18 @@ static void ld_present_measure_dump(void)
                                (LD_PRESENT_RING_CAP - 1u)];
         if (sample->present_id == present_id) {
             if (g_ld_schedule_diag) {
-                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u,%u,%u\n",
+                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u\n",
                         (unsigned long long)sample->present_id,
                         sample->guest_frame, sample->qpc,
                         (unsigned long long)sample->process_kernel_100ns,
                         (unsigned long long)sample->process_user_100ns,
                         (unsigned long long)sample->present_thread_kernel_100ns,
                         (unsigned long long)sample->present_thread_user_100ns,
-                        sample->present_thread_id, sample->cpu_work, sample->shadow_compare, sample->depth_export);
+                        sample->present_thread_id, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position);
             } else {
-                fprintf(f, "%llu,%u,%lld,%u,%u,%u\n",
+                fprintf(f, "%llu,%u,%lld,%u,%u,%u,%u\n",
                         (unsigned long long)sample->present_id,
-                        sample->guest_frame, sample->qpc, sample->cpu_work, sample->shadow_compare, sample->depth_export);
+                        sample->guest_frame, sample->qpc, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position);
             }
         }
     }
@@ -4633,6 +4637,11 @@ static ID3D12PipelineState* get_pso(
     }
     const u32 fp_ctrl_key = fp_ctrl & (0x40u | RSX_FP_CTRL_DEPTH_EXPORT);
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
+    const u32 shader_window = g_ld_window_position
+        ? rsx_dsp_reg(&g.rsx, 0x1D88) & 0xFFFFFu : 0u;
+    key = fnv1a(&shader_window, sizeof(shader_window), key);
+    const u32 reciprocal_w = g_ld_window_position == 2;
+    key = fnv1a(&reciprocal_w, sizeof(reciprocal_w), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
     key = fnv1a(&shadow_mask, sizeof(shadow_mask), key);
     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
@@ -4799,6 +4808,9 @@ static ID3D12PipelineState* get_pso(
     g_ld_profile.total.decompile_qpc +=
         (u64)(ld_profile_qpc() - decompile_begin);
 #endif
+    if (fi > 0 && rsx_fp_apply_window_position_ex(
+            ps_hlsl, sizeof(ps_hlsl), shader_window, reciprocal_w) < 0)
+        fi = -1;
     /* LD_FORCE_GREEN=1: make every fragment program return solid green.
      *
      * The same trick as LD_CLEAR_TEST, applied one stage later. Clears are
@@ -4867,17 +4879,24 @@ static ID3D12PipelineState* get_pso(
     { static const char* hd = (const char*)-1;
       if (hd == (const char*)-1) hd = getenv("LD_HLSL_DUMP");
       if (hd) {
+        /* Compatibility names include runtime CONST bytes and omit some
+         * modern pipeline state. Opt in to exact live-key names for a capture
+         * that must correlate every selected pipeline without overwrites. */
+        const u64 dump_key = getenv("LD_HLSL_DUMP_LIVE_KEYS")
+            ? key : live_legacy_pso_key();
         char fn[MAX_PATH]; FILE* f;
-        snprintf(fn, sizeof fn, "%s/hlsl_%016llx.vs.txt", hd, (unsigned long long)live_legacy_pso_key());
+        snprintf(fn, sizeof fn, "%s/hlsl_%016llx.vs.txt", hd, (unsigned long long)dump_key);
         f = fopen(fn, "wb"); if (f) { fputs(vi > 0 ? vs_hlsl : "<vp fail>", f); fclose(f); }
-        snprintf(fn, sizeof fn, "%s/hlsl_%016llx.ps.txt", hd, (unsigned long long)live_legacy_pso_key());
+        snprintf(fn, sizeof fn, "%s/hlsl_%016llx.ps.txt", hd, (unsigned long long)dump_key);
         f = fopen(fn, "wb"); if (f) { fputs(fi > 0 ? ps_hlsl : "<fp fail>", f); fclose(f); }
-        snprintf(fn, sizeof fn, "%s/hlsl_%016llx.fp.bin", hd, (unsigned long long)live_legacy_pso_key());
+        snprintf(fn, sizeof fn, "%s/hlsl_%016llx.fp.bin", hd, (unsigned long long)dump_key);
         f = fopen(fn, "wb"); if (f) { fwrite(fp_uc, 1, fp_size, f); fclose(f); }
-        snprintf(fn, sizeof fn, "%s/hlsl_%016llx.state.txt", hd, (unsigned long long)live_legacy_pso_key());
+        snprintf(fn, sizeof fn, "%s/hlsl_%016llx.state.txt", hd, (unsigned long long)dump_key);
         f = fopen(fn, "w"); if (f) {
-            fprintf(f, "fp_location=%u fp_offset=%08X fp_size=%u fp_control=%08X\n",
-                    fp_loc, fp_off, fp_size, fp_ctrl);
+            fprintf(f, "fp_location=%u fp_offset=%08X fp_size=%u fp_control=%08X "
+                    "live_pso_key=%016llX cube_mask=%04X shadow_mask=%04X\n",
+                    fp_loc, fp_off, fp_size, fp_ctrl,
+                    (unsigned long long)key, cube_mask, shadow_mask);
             fclose(f);
         }
       } }
@@ -6499,7 +6518,7 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
                     "attr4_hash,attr5_hash,attr6_hash,attr7_hash,"
                     "attr8_hash,attr9_hash,attr10_hash,attr11_hash,"
                     "attr12_hash,attr13_hash,attr14_hash,attr15_hash,"
-                    "active_attr_mask,used_attr_mask,tex\n");
+                    "active_attr_mask,used_attr_mask,live_pso_key,fp_location,fp_offset,fp_size,fp_control,tex\n");
                 fprintf(stderr, "[live-diff] RSX_DRAW_CSV armed: %s\n", path);
             } else {
                 fprintf(stderr, "[live-diff] cannot open RSX_DRAW_CSV: %s\n",
@@ -6528,6 +6547,21 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
           char path[MAX_PATH * 2];
           snprintf(path, sizeof(path), "%s\\draw_f%06u_i%04u_%08X.ppm", dir, frame, idx, surf);
           ld_dump_surface_ppm(path, &g.surfaces[target]);
+          if (getenv("LD_DUMP_RAW")) {
+              /* A complete host-order register image preserves texture
+               * crossbars and window state omitted by the compact CSV. */
+              snprintf(path, sizeof(path), "%s\\draw_f%06u_i%04u_%08X.regs.bin", dir, frame, idx, surf);
+              FILE* raw = fopen(path, "wb");
+              if (raw) { fwrite(g.rsx.regs, 1, sizeof(g.rsx.regs), raw); fclose(raw); }
+              snprintf(path, sizeof(path), "%s\\draw_f%06u_i%04u_%08X.fp_constants.bin", dir, frame, idx, surf);
+              raw = fopen(path, "wb");
+              if (raw) {
+                  fwrite(&g.fp_constants.count, sizeof(g.fp_constants.count), 1, raw);
+                  fwrite(g.fp_constants.values, 16, g.fp_constants.count, raw);
+                  fwrite(&g.fp_alpha_ref, sizeof(g.fp_alpha_ref), 1, raw);
+                  fclose(raw);
+              }
+          }
       }
       idx++; }
     const u64 regs_hash = fnv1a(
@@ -6581,6 +6615,12 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
         fprintf(file, ",%016llx", (unsigned long long)attr_hash[attr]);
     fprintf(file, ",0x%04X,0x%04X,",
             active_attr_mask, dc.layout.mask & 0xFFFFu);
+    /* Unlike the compatibility key, the live key survives inline-constant
+     * changes and identifies the pipeline actually selected for this draw. */
+    fprintf(file, "%016llx,%u,0x%X,%u,0x%X,",
+            (unsigned long long)g_ld_current_pso.key,
+            g_ld_current_pso.fp_location, g_ld_current_pso.fp_offset,
+            g_ld_current_pso.fp_size, g_ld_current_pso.fp_control);
     /* Enabled fragment texture units, so a pass that samples a surface (or an
      * empty copy of one) is visible in the row: unit:loc:offset:fmt:WxH. */
     for (u32 u = 0; u < 16; u++) {
@@ -9139,6 +9179,22 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
     u8* px = NULL; D3D12_RANGE rr = {0, (SIZE_T)rb_size};
     if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, (void**)&px))) {
         nonblack = 0;
+        /* Preserve alpha and exact FP16 values when diagnosing mask targets.
+         * PPM deliberately displays RGB only; its preview cannot establish
+         * whether the other channel contains valid lighting/depth data.
+         * Files are tightly packed rows, in the surface's native host format.
+         * This remains inert for recordings and ordinary play. */
+        if (path && !g_ld_record_to && getenv("LD_DUMP_RAW")) {
+            char raw_path[MAX_PATH * 2];
+            snprintf(raw_path, sizeof(raw_path), "%s.%s", path,
+                     fp16 ? "rgba16f" : "rgba8");
+            FILE* raw = fopen(raw_path, "wb");
+            if (raw) {
+                for (u32 y = 0; y < height; ++y)
+                    fwrite(px + (SIZE_T)y * pitch, texel, width, raw);
+                fclose(raw);
+            }
+        }
         if (!g_ld_record_to) {   /* raw texels, to tell an FP16 target from 8-bit data read as one */
             const u8* r0 = px + (SIZE_T)(height / 4) * pitch + (width / 4) * texel;
             fprintf(stderr, "[dump-raw] %s fmt=%d texel=%u bytes:", path, (int)surface->fmt, texel);
@@ -9374,6 +9430,18 @@ void rsx_live_draw_present(u32 buffer_id)
             }
         }
         static const char* shadow_control=(const char*)-1;
+        static const char* window_control=(const char*)-1;
+        if (window_control==(const char*)-1) window_control=getenv("RSX_WINDOW_POSITION_FILE");
+        if (window_control) {
+            FILE* file=fopen(window_control,"r"); unsigned enabled;
+            if (file) {
+                if (fscanf(file,"%u",&enabled)==1 && enabled<=2 && enabled!=g_ld_window_position) {
+                    g_ld_window_position=enabled;
+                    fprintf(stderr,"[window-position] frame=%u enabled=%u\n",g_ld_frames,enabled);
+                }
+                fclose(file);
+            }
+        }
         static const char* export_control=(const char*)-1;
         if (export_control==(const char*)-1) export_control=getenv("RSX_DEPTH_EXPORT_FILE");
         if (export_control) {

@@ -170,6 +170,17 @@ const char* rsx_fp_opcode_name(u32 opcode);
  * the decompiler on where a program ends. */
 u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes);
 
+/* Convert Direct3D SV_POSITION XY to the RSX SET_SHADER_WINDOW contract.
+ * Bits 0..11 are window height, 12..15 select top/bottom origin (0/1),
+ * and 16..19 select half/integer pixel centers (0/1). Host Z and W
+ * are preserved. Returns 1 when WPOS reads were patched, 0 if unnecessary,
+ * or -1 for invalid state/source or insufficient output capacity. */
+int rsx_fp_apply_window_position(char* hlsl, u32 out_size, u32 window);
+/* Additionally convert host interpolated clip W to RSX reciprocal W when
+ * reciprocal_w is nonzero. Z remains unchanged. Same return contract. */
+int rsx_fp_apply_window_position_ex(char* hlsl, u32 out_size, u32 window,
+                                  int reciprocal_w);
+
 #ifdef __cplusplus
 }
 #endif
