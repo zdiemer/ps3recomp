@@ -25,7 +25,11 @@ static int callback(u32 port, CellPadHostInput* input, void* user)
 static u16 word(unsigned index) { return vm_read16(0x100+4+index*2); }
 static void read_packet(void)
 {
-    Sleep(10);
+    /* GetTickCount64 can retain the same value across a 10 ms sleep. Wait
+     * for the backend's actual clock to advance before requesting a report;
+     * otherwise a stale report can consume a diagnostic stick pulse. */
+    const unsigned long long begin=pad_now_ms();
+    do { Sleep(1); } while (pad_now_ms()-begin<PAD_POLL_INTERVAL_MS);
     assert(cellPadGetData(0,(CellPadData*)(uintptr_t)0x100)==CELL_OK);
     assert(vm_read32(0x100)==CELL_PAD_LEN_CHANGE_PRESS_ON);
 }

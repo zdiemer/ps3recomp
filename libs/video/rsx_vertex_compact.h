@@ -129,6 +129,9 @@ int rsx_vertex_fetch_one(
 /* Batch equivalent, with attribute state hoisted out of the vertex loop. */
 int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,
     const rsx_vertex_ref* refs, u32 count, u8* out);
+/* Diagnostic comparison of specialized SIMD loops and the previous batch path. */
+int rsx_vertex_fetch_many_ex(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out, int specialized);
 
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map
