@@ -34,7 +34,10 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
  * Backend selection
  * -----------------------------------------------------------------------*/
 
-#if defined(PS3RECOMP_AUDIO_USE_SDL2)
+#if defined(__EMSCRIPTEN__)
+  #define AUDIO_BACKEND_SDL2    0
+  #define AUDIO_BACKEND_WASAPI  0
+#elif defined(PS3RECOMP_AUDIO_USE_SDL2)
   #define AUDIO_BACKEND_SDL2    1
   #define AUDIO_BACKEND_WASAPI  0
 #elif defined(_WIN32)
@@ -159,6 +162,17 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
 /* ---------------------------------------------------------------------------
  * Host audio output backend
  * -----------------------------------------------------------------------*/
+
+#if defined(__EMSCRIPTEN__)
+/* The browser's main page owns Web Audio; the guest mixer only produces PCM. */
+extern int ps3_wasm_audio_init(void) __attribute__((weak));
+extern void ps3_wasm_audio_shutdown(void) __attribute__((weak));
+extern void ps3_wasm_audio_submit(const float*, u32) __attribute__((weak));
+static int audio_backend_init(void) { return ps3_wasm_audio_init ? ps3_wasm_audio_init() : -1; }
+static void audio_backend_shutdown(void) { if (ps3_wasm_audio_shutdown) ps3_wasm_audio_shutdown(); }
+static void audio_backend_submit(const float* samples, u32 frames)
+{ if (ps3_wasm_audio_submit) ps3_wasm_audio_submit(samples, frames); }
+#endif
 
 #if AUDIO_BACKEND_SDL2
 
@@ -617,17 +631,35 @@ static void* audio_mix_thread_func(void* arg)
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
+#ifdef __EMSCRIPTEN__
+    struct timespec anchor;
+    clock_gettime(CLOCK_MONOTONIC, &anchor);
+    uint64_t origin = (uint64_t)anchor.tv_sec * 1000000000ull + anchor.tv_nsec;
+    uint64_t blocks = 0;
+#endif
     while (s_mix_thread_running) {
+#ifdef __EMSCRIPTEN__
+        struct timespec current;
+        clock_gettime(CLOCK_MONOTONIC, &current);
+        uint64_t now = (uint64_t)current.tv_sec * 1000000000ull + current.tv_nsec;
+        uint64_t deadline = origin + blocks * CELL_AUDIO_BLOCK_SAMPLES * 1000000000ull / CELL_AUDIO_SAMPLE_RATE;
+        if (now < deadline) { usleep(1000); continue; }
+        /* A suspended tab must not advance thousands of guest blocks at once. */
+        if (now - deadline > 50000000ull) { origin = now; blocks = 0; }
+        ++blocks;
+#endif
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
 
+#ifndef __EMSCRIPTEN__
         u32 queued = audio_backend_queued_samples();
         if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
             usleep(5000);
         } else {
             usleep(2000);
         }
+#endif
     }
 
     printf("[cellAudio] Mixing thread stopped\n");

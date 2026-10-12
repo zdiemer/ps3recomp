@@ -133,6 +133,17 @@ static int dir_exists(const char* path)
  * so installation checks use the destination volume, without creating data. */
 static s32 content_free_kb(void)
 {
+#ifdef __EMSCRIPTEN__
+    /* The page supplies the origin's actual IndexedDB quota before startup.
+     * Emscripten's synthetic statvfs capacity is unrelated to that quota. */
+    const char* value = getenv("PS3_BROWSER_STORAGE_FREE_KB");
+    if (value && *value) {
+        char* end;
+        unsigned long long kb = strtoull(value, &end, 10);
+        if (!*end) return kb > INT32_MAX ? INT32_MAX : (s32)kb;
+    }
+    return 0;
+#endif
     char path[CELL_GAME_PATH_MAX];
     snprintf(path, sizeof(path), "%s", s_content_path[0] ? s_content_path : ".");
     for (;;) {
