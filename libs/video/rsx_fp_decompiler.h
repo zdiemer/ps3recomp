@@ -69,6 +69,7 @@ extern unsigned long long g_rsx_fp_nonfinite_constants;
  *          control word is available (standalone tests) to fall back to the
  *          legacy "whichever of r0/h0 was written" heuristic. */
 #define RSX_FP_CTRL_AUTO 0xFFFFFFFFu
+#define RSX_FP_CTRL_DEPTH_EXPORT 0x0Eu
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size);
 
 /* Apply the NV4097 fixed-function alpha test to an already-decompiled pixel

@@ -91,6 +91,7 @@ static int g_ld_apply_polygon_bias=1;
 /* -1 follows the guest state; 0/1 are explicit diagnostic overrides. */
 static int g_ld_depth_clip_probe=-1;
 static unsigned g_ld_shadow_compare;
+static unsigned g_ld_depth_export;
 /* Independently benchmark reference filling (1), dense remapping (2), and
  * texture hashing (4). Live changes apply at presentation boundaries. */
 static unsigned g_ld_cpu_work=259;
@@ -592,6 +593,7 @@ typedef struct {
     u32 guest_frame;
     u32 cpu_work;
     u32 shadow_compare;
+    u32 depth_export;
     LONGLONG qpc;
     u64 process_kernel_100ns;
     u64 process_user_100ns;
@@ -675,6 +677,7 @@ static void ld_present_measure_record(u32 guest_frame)
     sample->guest_frame = guest_frame;
     sample->cpu_work = g_ld_cpu_work;
     sample->shadow_compare = g_ld_shadow_compare;
+    sample->depth_export = g_ld_depth_export;
     sample->qpc = now.QuadPart;
     g_ld_frame_limiter.last_present = now.QuadPart;
     if (g_ld_schedule_diag) {
@@ -775,9 +778,9 @@ static void ld_present_measure_dump(void)
     if (g_ld_schedule_diag) {
         fprintf(f, "present_id,guest_frame,qpc,process_kernel_100ns,"
                    "process_user_100ns,present_thread_kernel_100ns,"
-                   "present_thread_user_100ns,present_thread_id,cpu_work,shadow_compare\n");
+                   "present_thread_user_100ns,present_thread_id,cpu_work,shadow_compare,depth_export\n");
     } else {
-        fprintf(f, "present_id,guest_frame,qpc,cpu_work,shadow_compare\n");
+        fprintf(f, "present_id,guest_frame,qpc,cpu_work,shadow_compare,depth_export\n");
     }
     const u64 first =
         g_ld_present_total > LD_PRESENT_RING_CAP
@@ -789,18 +792,18 @@ static void ld_present_measure_dump(void)
                                (LD_PRESENT_RING_CAP - 1u)];
         if (sample->present_id == present_id) {
             if (g_ld_schedule_diag) {
-                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u,%u\n",
+                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u,%u,%u\n",
                         (unsigned long long)sample->present_id,
                         sample->guest_frame, sample->qpc,
                         (unsigned long long)sample->process_kernel_100ns,
                         (unsigned long long)sample->process_user_100ns,
                         (unsigned long long)sample->present_thread_kernel_100ns,
                         (unsigned long long)sample->present_thread_user_100ns,
-                        sample->present_thread_id, sample->cpu_work, sample->shadow_compare);
+                        sample->present_thread_id, sample->cpu_work, sample->shadow_compare, sample->depth_export);
             } else {
-                fprintf(f, "%llu,%u,%lld,%u,%u\n",
+                fprintf(f, "%llu,%u,%lld,%u,%u,%u\n",
                         (unsigned long long)sample->present_id,
-                        sample->guest_frame, sample->qpc, sample->cpu_work, sample->shadow_compare);
+                        sample->guest_frame, sample->qpc, sample->cpu_work, sample->shadow_compare, sample->depth_export);
             }
         }
     }
@@ -1660,12 +1663,13 @@ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
     sd.Filter = D3D12_ENCODE_BASIC_FILTER(mnf, mgf, mpf,
         shadow ? D3D12_FILTER_REDUCTION_TYPE_COMPARISON : D3D12_FILTER_REDUCTION_TYPE_STANDARD);
     if (shadow) {
-        /* NV40 RCOMP numbering differs from the GL depth-test enum. */
+        /* RSX comparison numbering is the low bits of the GL depth enum.
+         * Older PC NV30/40 RCOMP tables reverse LESS/GREATER; do not use them. */
         static const D3D12_COMPARISON_FUNC compare[8]={
-            D3D12_COMPARISON_FUNC_NEVER,D3D12_COMPARISON_FUNC_GREATER,
-            D3D12_COMPARISON_FUNC_EQUAL,D3D12_COMPARISON_FUNC_GREATER_EQUAL,
-            D3D12_COMPARISON_FUNC_LESS,D3D12_COMPARISON_FUNC_NOT_EQUAL,
-            D3D12_COMPARISON_FUNC_LESS_EQUAL,D3D12_COMPARISON_FUNC_ALWAYS};
+            D3D12_COMPARISON_FUNC_NEVER,D3D12_COMPARISON_FUNC_LESS,
+            D3D12_COMPARISON_FUNC_EQUAL,D3D12_COMPARISON_FUNC_LESS_EQUAL,
+            D3D12_COMPARISON_FUNC_GREATER,D3D12_COMPARISON_FUNC_NOT_EQUAL,
+            D3D12_COMPARISON_FUNC_GREATER_EQUAL,D3D12_COMPARISON_FUNC_ALWAYS};
         sd.ComparisonFunc=compare[(t->wrap >> 28) & 7u];
     }
     sd.AddressU = gcm_wrap(t->wrap);
@@ -4622,7 +4626,9 @@ static ID3D12PipelineState* get_pso(
      * restores the old heuristic for the A/B. */
     static int ctrl_auto = -1;
     if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
-    const u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : rsx_dsp_shader_control(&g.rsx);
+    const u32 fp_ctrl_raw = ctrl_auto ? RSX_FP_CTRL_AUTO : rsx_dsp_shader_control(&g.rsx);
+    const u32 fp_ctrl = fp_ctrl_raw==RSX_FP_CTRL_AUTO || g_ld_depth_export ?
+        fp_ctrl_raw : (fp_ctrl_raw & ~RSX_FP_CTRL_DEPTH_EXPORT);
     u32 cube_mask = 0, shadow_mask = 0;
     for (u32 unit = 0; unit < RSX_DSP_NUM_TEXTURES; unit++) {
         rsx_dsp_texture texture;
@@ -4678,7 +4684,7 @@ static ID3D12PipelineState* get_pso(
         LD_PSO_BAIL("shader hash collapsed to zero");
         return NULL;
     }
-    const u32 fp_ctrl_key = fp_ctrl & 0x4Eu;   /* 32-bit exports, depth export */
+    const u32 fp_ctrl_key = fp_ctrl & (0x40u | RSX_FP_CTRL_DEPTH_EXPORT);
     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
     key = fnv1a(&shadow_mask, sizeof(shadow_mask), key);
@@ -4755,6 +4761,27 @@ static ID3D12PipelineState* get_pso(
     g_ld_current_pso.fp_offset = fp_off;
     g_ld_current_pso.fp_size = fp_size;
     g_ld_current_pso.fp_control = fp_ctrl;
+    {
+        static int trace=-1;
+        static u64 seen[32]; static u32 count;
+        if (trace<0) trace=getenv("RSX_DEPTH_TRACE")!=NULL;
+        if (trace && fp_ctrl_raw!=RSX_FP_CTRL_AUTO &&
+            (fp_ctrl_raw & RSX_FP_CTRL_DEPTH_EXPORT) && count<32u) {
+            u32 i;for(i=0;i<count;++i)if(seen[i]==key)break;
+            if(i==count) {
+                seen[count++]=key;
+                rsx_dsp_surface surface;rsx_dsp_get_surface(&g.rsx,&surface);
+                fprintf(stderr,"[depth-export-shader] frame=%u raw=%08X effective=%08X "
+                    "pso=%016llX size=%u surface=%08X zeta=%08X\n",g_ld_frames,
+                    fp_ctrl_raw,fp_ctrl,(unsigned long long)key,fp_size,
+                    surface.color_offset[0],surface.zeta_offset);
+                char path[80];snprintf(path,sizeof(path),"export_shader_%016llX.bin",
+                    (unsigned long long)key);
+                FILE* file=fopen(path,"wb");
+                if(file){fwrite(fp_uc,1,fp_size,file);fclose(file);}
+            }
+        }
+    }
     g_ld_current_pso.cube_mask = cube_mask;
     g_ld_current_pso.vtex_mask = vtex_mask;
     g_ld_current_pso.txl_mask = txl_mask;
@@ -9459,6 +9486,18 @@ void rsx_live_draw_present(u32 buffer_id)
             }
         }
         static const char* shadow_control=(const char*)-1;
+        static const char* export_control=(const char*)-1;
+        if (export_control==(const char*)-1) export_control=getenv("RSX_DEPTH_EXPORT_FILE");
+        if (export_control) {
+            FILE* file=fopen(export_control,"r"); unsigned enabled;
+            if (file) {
+                if (fscanf(file,"%u",&enabled)==1 && enabled<=1 && enabled!=g_ld_depth_export) {
+                    g_ld_depth_export=enabled;
+                    fprintf(stderr,"[depth-export] frame=%u enabled=%u\n",g_ld_frames,enabled);
+                }
+                fclose(file);
+            }
+        }
         if (shadow_control==(const char*)-1) shadow_control=getenv("RSX_SHADOW_COMPARE_FILE");
         if (shadow_control) {
             FILE* file=fopen(shadow_control,"r"); unsigned enabled;

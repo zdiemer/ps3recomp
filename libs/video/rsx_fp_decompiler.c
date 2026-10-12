@@ -1030,6 +1030,8 @@ static int rsx_fp_decompile_internal(
         half_exports = (ctrl & FP_CTRL_32BIT_EXPORTS) ? 0 : 1;
     }
     const char* export_file = half_exports ? "h" : "r";
+    const int depth_export = ctrl != RSX_FP_CTRL_AUTO &&
+        (ctrl & RSX_FP_CTRL_DEPTH_EXPORT) != 0;
 
     /* How many colour targets the program feeds: one past the highest export
      * register of the selected file it wrote. A program that writes only the
@@ -1042,14 +1044,6 @@ static int rsx_fp_decompile_internal(
     for (u32 t = FP_MAX_COLOR_TARGETS; t-- > 1; )
         if (wrote[half_exports][t]) { targets = t + 1; break; }
 
-    /* Depth export. SHADER_CONTROL bits 1-3 (0xE,
-     * CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT) make the program's depth the
-     * fragment depth: always the fp32 register r1.z, whatever the colour
-     * export width, clamped to [0,1]. Without SV_Depth the fragment keeps the
-     * interpolated depth of the primitive, so a full-screen pass that rebuilds
-     * a depth buffer writes the quad's constant depth instead. The output
-     * becomes a struct even for one colour target. */
-    const int depth_export = ctrl != RSX_FP_CTRL_AUTO && (ctrl & 0xEu) != 0u;
     if (targets == 1 && !depth_export) {
         char tail[96];
         snprintf(tail, sizeof(tail),
