@@ -96,6 +96,8 @@ static unsigned g_ld_shadow_compare;
 static unsigned g_ld_depth_export;
 /* Honor RSX XY by default. Probe: 0=legacy, 1=RSX XY, 2=XY+reciprocal W. */
 static unsigned g_ld_window_position = 1;
+/* Correct Z16 clear packing; the file control permits native A/B validation. */
+static unsigned g_ld_depth_clear = 1;
 /* Default: bulk references (1), dense remapping (2), specialized vertex
  * decoding (256), and validated triangle remap copies (1024). Live changes
  * apply at presentation boundaries for independent comparisons. */
@@ -621,6 +623,7 @@ typedef struct {
     u32 shadow_compare;
     u32 depth_export;
     u32 window_position;
+    u32 depth_clear;
     LONGLONG qpc;
     u64 process_kernel_100ns;
     u64 process_user_100ns;
@@ -709,6 +712,7 @@ static void ld_present_measure_record(u32 guest_frame)
     sample->shadow_compare = g_ld_shadow_compare;
     sample->depth_export = g_ld_depth_export;
     sample->window_position = g_ld_window_position;
+    sample->depth_clear = g_ld_depth_clear;
     sample->qpc = now.QuadPart;
     g_ld_frame_limiter.last_present = now.QuadPart;
     if (g_ld_schedule_diag) {
@@ -809,9 +813,9 @@ static void ld_present_measure_dump(void)
     if (g_ld_schedule_diag) {
         fprintf(f, "present_id,guest_frame,qpc,process_kernel_100ns,"
                    "process_user_100ns,present_thread_kernel_100ns,"
-                   "present_thread_user_100ns,present_thread_id,cpu_work,shadow_compare,depth_export,window_position\n");
+                   "present_thread_user_100ns,present_thread_id,cpu_work,shadow_compare,depth_export,window_position,depth_clear\n");
     } else {
-        fprintf(f, "present_id,guest_frame,qpc,cpu_work,shadow_compare,depth_export,window_position\n");
+        fprintf(f, "present_id,guest_frame,qpc,cpu_work,shadow_compare,depth_export,window_position,depth_clear\n");
     }
     const u64 first =
         g_ld_present_total > LD_PRESENT_RING_CAP
@@ -823,18 +827,18 @@ static void ld_present_measure_dump(void)
                                (LD_PRESENT_RING_CAP - 1u)];
         if (sample->present_id == present_id) {
             if (g_ld_schedule_diag) {
-                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u\n",
+                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u,%u\n",
                         (unsigned long long)sample->present_id,
                         sample->guest_frame, sample->qpc,
                         (unsigned long long)sample->process_kernel_100ns,
                         (unsigned long long)sample->process_user_100ns,
                         (unsigned long long)sample->present_thread_kernel_100ns,
                         (unsigned long long)sample->present_thread_user_100ns,
-                        sample->present_thread_id, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position);
+                        sample->present_thread_id, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position, sample->depth_clear);
             } else {
-                fprintf(f, "%llu,%u,%lld,%u,%u,%u,%u\n",
+                fprintf(f, "%llu,%u,%lld,%u,%u,%u,%u,%u\n",
                         (unsigned long long)sample->present_id,
-                        sample->guest_frame, sample->qpc, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position);
+                        sample->guest_frame, sample->qpc, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position, sample->depth_clear);
             }
         }
     }
@@ -8483,19 +8487,15 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_DEPTH);
         if (mask & RSX_CLEAR_STENCIL)
             clear_flags = (D3D12_CLEAR_FLAGS)(clear_flags | D3D12_CLEAR_FLAG_STENCIL);
-        /* ZSTENCIL_CLEAR_VALUE is laid out as the zeta is: depth24 << 8 |
-         * stencil8 for Z24S8, a bare depth16 for Z16 (SURFACE_FORMAT depth
-         * field 1). Read as Z24S8, a Z16 surface's 0xFFFF -- its far plane --
-         * would clear it to 255/16777215, nearly the near plane, and every
-         * LESS or LEQUAL draw into it would then fail. The nv40 reset
-         * 0xFFFFFF00 seeded by rsx_dispatch_init clears to 1.0 / 0. Same
-         * decode as the draw engine's clear. */
+        /* Z16 stores depth in the low 16 bits; Z24S8 stores it above the
+         * low stencil byte. Haze's shadow atlas uses Z16 with 0x0000FFFF:
+         * treating it as Z24S8 clears to near zero instead of far depth. */
         {
             const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
             const int z16 = sf.depth_format == 1u;
-            const float cd = !zs ? 1.0f
-                           : z16 ? (float)(zs & 0xFFFFu) / 65535.0f
-                                 : (float)(zs >> 8) / 16777215.0f;
+            const float cd = g_ld_depth_clear && sf.depth_format == 1u
+                ? (float)(zs & 0xFFFFu) / 65535.0f
+                : (float)(zs >> 8) / 16777215.0f;
             g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
                 clear_flags, cd, z16 ? (UINT8)0 : (UINT8)(zs & 0xFFu), 1, &clear_rect);
         }
@@ -9769,6 +9769,18 @@ void rsx_live_draw_present(u32 buffer_id)
     if (!g.ready) return;
     if (!ld_refresh_display_state()) return;
     if (g_ld_frames%60==0) {
+        static const char* clear_control=(const char*)-1;
+        if (clear_control==(const char*)-1) clear_control=getenv("RSX_DEPTH_CLEAR_FILE");
+        if (clear_control) {
+            FILE* file=fopen(clear_control,"r"); unsigned enabled;
+            if (file) {
+                if (fscanf(file,"%u",&enabled)==1 && enabled<=1 && enabled!=g_ld_depth_clear) {
+                    g_ld_depth_clear=enabled;
+                    fprintf(stderr,"[depth-clear] frame=%u enabled=%u\n",g_ld_frames,enabled);
+                }
+                fclose(file);
+            }
+        }
         static const char* work_control=(const char*)-1;
         if (work_control==(const char*)-1) work_control=getenv("RSX_CPU_WORK_FILE");
         if (work_control) {
