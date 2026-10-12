@@ -59,7 +59,19 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
     return k;
 }
 
-void spu_task_launch_check(spu_context* ctx, void* fn)
+static __attribute__((noinline, cold)) void spu_note_ls0_complete(const spu_context* ctx)
+{
+    static int n;
+    if (n++ < 8)
+        fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
+                ctx->image_id);
+}
+
+/* Keep optional trace/ring-recovery code out of the per-basic-block prologue.
+ * Every original hook remains available when its environment is configured or
+ * a policy-module flow recorder is armed dynamically. */
+static __attribute__((noinline, cold)) void
+spu_task_launch_check_diagnostic(spu_context* ctx, void* fn)
 {
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
@@ -85,10 +97,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
 
     if (!s_no_ls0 && ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
         !ctx->policy_mode && ctx->image_id > 0) {
-        static int _n = 0;
-        if (_n++ < 8)
-            fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
-                    ctx->image_id);
+        spu_note_ls0_complete(ctx);
         if (s_et >= 0 && ctx->image_id == s_et) {
             fprintf(stderr, "[spu-exit] img=%d last PCs:", ctx->image_id);
             for (int i = 32; i >= 1; i--)
@@ -158,6 +167,40 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     static int _n = 0;
     if (marked && _n++ < 12)
         fprintf(stderr, "[pm-jobdrain] ring-full spin: marked %d pending records done\n", marked);
+}
+
+static __attribute__((noinline, cold)) int spu_launch_probes_configured(void)
+{
+    const char* names[] = { "SPU_NO_LS0_END", "SPU_EXITTRACE", "SPU_STEPTRACE",
+                           "SPU_STEPTRACE_FROM", "SPU_STEPTRACE_REGS", "SPU_JOBDRAIN" };
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+        if (getenv(names[i])) return 1;
+    return 0;
+}
+
+void spu_task_launch_check(spu_context* ctx, void* fn)
+{
+    /* Environment settings are startup configuration, as in the diagnostic
+     * implementation. Concurrent first callers may resolve the same immutable
+     * settings; no partially initialized configuration is published. */
+    static _Atomic int probes = -1;
+    int configured = atomic_load_explicit(&probes, memory_order_relaxed);
+    if (configured < 0) {
+        configured = spu_launch_probes_configured();
+        atomic_store_explicit(&probes, configured, memory_order_relaxed);
+    }
+    if (configured || g_pm_flow_ctx) {
+        spu_task_launch_check_diagnostic(ctx, fn);
+        return;
+    }
+    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+    spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+    if (ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
+        !ctx->policy_mode && ctx->image_id > 0) {
+        spu_note_ls0_complete(ctx);
+        spu_halt(ctx);
+    }
 }
 
 /* Restore the active image after a lifted call bracket. The brsl/bisl emission
