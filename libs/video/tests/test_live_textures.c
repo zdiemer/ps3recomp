@@ -7,6 +7,8 @@ static u8* watch_guest;
 static int watch_fail_after = -1;
 static u32 geometry_source_shift;
 static int geometry_late_index_write;
+static DWORD resolver_owner_tid;
+static volatile LONG resolver_worker_calls;
 uint8_t* vm_base = guest;
 uint32_t vm_read32(uint64_t address)
 {
@@ -16,6 +18,8 @@ uint32_t vm_read32(uint64_t address)
 }
 static const u8* resolve(void* user, u32 location, u32 offset, u32 size)
 {
+    if (resolver_owner_tid && GetCurrentThreadId()!=resolver_owner_tid)
+        InterlockedIncrement(&resolver_worker_calls);
     (void)user; (void)location;
     if (watch_guest) {
         if (watch_fail_after == 0) return NULL;
@@ -1039,6 +1043,100 @@ static void native_geometry_cache_tests(void)
     VirtualFree(watch_guest,0,MEM_RELEASE); watch_guest=NULL;
     puts("Native geometry cache: 512 mutation/layout/divisor/restart cases, shared epochs, late index writes, remaps, fallback and independent hit auditing passed");
 }
+static void native_vertex_worker_tests(void)
+{
+    watch_guest=VirtualAlloc(NULL,65536,MEM_RESERVE|MEM_COMMIT|MEM_WRITE_WATCH,PAGE_READWRITE);
+    assert(watch_guest && rsx_live_draw_set_texture_write_watch(watch_guest,65536));
+    g.guest_ptr=resolve; g.guest_user=NULL;
+    resolver_owner_tid=GetCurrentThreadId(); resolver_worker_calls=0;
+    for (u32 i=0;i<65536;++i) watch_guest[i]=(u8)(i*71+3);
+    rsx_vertex_ref refs[1024];
+    u8 serial[1024*32+64],parallel[1024*32+64];
+    const u32 saved_mxcsr=_mm_getcsr();
+    _mm_setcsr((saved_mxcsr&~(3u<<13))|(1u<<13)|(1u<<15)|(1u<<6));
+    g_vertex_worker_min=64; g_vertex_worker_validate=1;
+    rsx_vertex_layout_plan layout; rsx_vertex_layout_plan_init(&layout,3);
+    rsx_vertex_fetch_plan plan;
+    u32 random=0x1c4567;
+    for (u32 trial=0;trial<84;++trial) {
+        memset(&g.rsx,0,sizeof(g.rsx));
+        const u32 type=1+trial%7,size=1+(trial/7)%4;
+        g.rsx.regs[0x1740/4]=type|(size<<4)|(16u<<8);
+        g.rsx.regs[0x1744/4]=trial%5?RSX_VTX_TYPE_SINT16|(4u<<4)|(16u<<8):0;
+        g.rsx.regs[0x1680/4]=4096; g.rsx.regs[0x1684/4]=32768;
+        g.rsx.regs[(0x1C00+16)/4]=trial*17;
+        const u32 count=64+(trial*37)%961;
+        for (u32 i=0;i<1024;++i) {
+            random=random*1664525u+1013904223u;
+            refs[i].vertex_id=random%1024+0x100000;
+            refs[i].base_index=0;
+        }
+        watch_guest[4096+trial]^=0x31;
+        rsx_vertex_fetch_plan_init(&plan,&g.rsx,&layout,resolve,NULL);
+        rsx_vertex_fetch_plan_prepare(&plan,refs,count);
+        const unsigned modes=trial%4;
+        memset(serial,0xA5,sizeof(serial));
+        const int ok=rsx_vertex_fetch_many_mode(&plan,refs,count,serial,modes);
+        for (int workers=1;workers<=3;++workers) {
+            g_ld_vertex_workers=workers;
+            memset(parallel,0xA5,sizeof(parallel));
+            assert(ld_vertex_fetch_parallel(&plan,refs,count,parallel,modes)==ok);
+            assert(!memcmp(serial,parallel,sizeof(serial)));
+            assert(!g_vertex_worker_failed && !g_vertex_worker_stats.failures);
+        }
+        // Live mode switches and small work retain the serial path.
+        g_ld_vertex_workers=0;
+        memset(parallel,0xA5,sizeof(parallel));
+        assert(ld_vertex_fetch_parallel(&plan,refs,count,parallel,modes)==ok);
+        assert(!memcmp(serial,parallel,sizeof(serial)));
+    }
+    assert(g_vertex_worker_stats.audits==84*3 && !g_vertex_worker_stats.races);
+    assert(!resolver_worker_calls && g_vertex_workers_created==3);
+    // Resolver-dependent and divider paths must remain on the renderer.
+    g_ld_vertex_workers=3;
+    plan.attr[0].stable_base=NULL;
+    u64 parallel_draws=g_vertex_worker_stats.parallel_draws;
+    const int ok=rsx_vertex_fetch_many_mode(&plan,refs,1024,serial,1);
+    assert(ld_vertex_fetch_parallel(&plan,refs,1024,parallel,1)==ok);
+    assert(!memcmp(serial,parallel,1024*32));
+    assert(g_vertex_worker_stats.parallel_draws==parallel_draws && !resolver_worker_calls);
+    plan.attr[0].desc.frequency=2;
+    assert(!ld_vertex_worker_eligible(&plan,refs,1024));
+    // An intervening source write is an unstable audit, not a cache bug.
+    rsx_vertex_fetch_plan_prepare(&plan,refs,1024);
+    plan.attr[0].desc.frequency=0;
+    rsx_vertex_fetch_plan_prepare(&plan,refs,1024);
+    ld_geom_source sources[16]; u32 n_sources; u64 before;
+    assert(ld_vertex_worker_sources(&plan,sources,&n_sources));
+    assert(ld_geom_stamp(sources,n_sources,&before));
+    assert(rsx_vertex_fetch_many_mode(&plan,refs,1024,serial,1));
+    memcpy(parallel,serial,1024*32);
+    // The final audit may be larger than the earlier variable-sized calls.
+    g_vertex_worker_audit_buffer=realloc(g_vertex_worker_audit_buffer,1024*32);
+    assert(g_vertex_worker_audit_buffer); g_vertex_worker_audit_capacity=1024*32;
+    watch_guest[4096]^=0x40;
+    assert(ld_vertex_worker_validate_output(&plan,refs,1024,parallel,1,1,sources,n_sources,before));
+    assert(g_vertex_worker_stats.races==1 && !g_vertex_worker_stats.failures);
+    assert(rsx_vertex_fetch_many_mode(&plan,refs,1024,serial,1));
+    assert(!memcmp(serial,parallel,1024*32));
+    // Audit corruption is detected and full serial output replaces it.
+    assert(ld_geom_stamp(sources,n_sources,&before));
+    parallel[0]^=1;
+    assert(ld_vertex_worker_validate_output(&plan,refs,1024,parallel,1,1,sources,n_sources,before));
+    assert(g_vertex_worker_failed && g_vertex_worker_stats.failures==1);
+    assert(!memcmp(serial,parallel,1024*32));
+    // Cleanup joins persistent threads; the pool can subsequently be recreated.
+    ld_vertex_workers_clear(); assert(!g_vertex_workers_created);
+    g_vertex_worker_failed=0; assert(ld_vertex_workers_reserve(1));
+    ld_vertex_workers_clear(); assert(!g_vertex_workers_created);
+    _mm_setcsr(saved_mxcsr);
+    resolver_owner_tid=0;
+    memset(&g_vertex_worker_stats,0,sizeof(g_vertex_worker_stats));
+    g_vertex_worker_validate=-1; g_ld_vertex_workers=-1; g_vertex_worker_min=0;
+    rsx_texture_write_watch_destroy(&g_texture_watch);
+    VirtualFree(watch_guest,0,MEM_RELEASE); watch_guest=NULL;
+    puts("Native vertex workers: 252 parallel format/size/mode comparisons, FP state, guards, resolver isolation, mutation audits, fault fallback and join/recreation passed");
+}
 int main(void)
 {
     shadow_sampler_tests();
@@ -1048,6 +1146,7 @@ int main(void)
     reference_batch_tests();
     native_texture_watch_cache_tests();
     native_geometry_cache_tests();
+    native_vertex_worker_tests();
     topology_copy_tests();
     topology_copy_benchmark();
     IDXGIFactory4* factory; IDXGIAdapter* warp;
