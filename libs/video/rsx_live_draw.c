@@ -4756,7 +4756,11 @@ static ID3D12PipelineState* get_pso(
     g.fp_alpha_ref = rsx_fp_alpha_ref(
         rs.alpha_ref_raw, rs.alpha_ref_format);
 
-    u64 key = cache_vp ? vp_info.hash : ld_vp_hash(vp_uc, vp_instrs * 16);
+    /* g.rsx.vp belongs to this renderer thread and does not change within
+     * get_pso. Keep this lookup's hash for the diagnostic identity below,
+     * rather than walking the same program bytes twice on every draw. */
+    const u64 vp_hash = cache_vp ? vp_info.hash : ld_vp_hash(vp_uc, vp_instrs * 16);
+    u64 key = vp_hash;
     if (ld_fp_constants_buffered())
         key = ld_fp_structural_hash(fp_uc, fp_size, key);
     else
@@ -4824,7 +4828,7 @@ static ID3D12PipelineState* get_pso(
 #endif
     g_ld_current_pso.valid = 1;
     g_ld_current_pso.key = key;
-    g_ld_current_pso.vp_hash = cache_vp ? vp_info.hash : ld_vp_hash(vp_uc, vp_instrs * 16);
+    g_ld_current_pso.vp_hash = vp_hash;
     g_ld_current_pso.vp_start = start;
     g_ld_current_pso.vp_instrs = vp_instrs;
     g_ld_current_pso.fp_location = fp_loc;
