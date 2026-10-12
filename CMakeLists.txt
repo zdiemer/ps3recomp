@@ -43,6 +43,11 @@ file(GLOB_RECURSE HLE_SOURCES
 )
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
+if(EMSCRIPTEN)
+    # Haze does not import cellFiber. POSIX ucontext is unavailable in Wasm;
+    # keep unsupported entry points explicit rather than linking fake switches.
+    list(FILTER HLE_SOURCES EXCLUDE REGEX "/cellFiber\\.c$")
+endif()
 
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
@@ -129,7 +134,14 @@ target_include_directories(ps3recomp_runtime PRIVATE
 )
 
 # Platform-specific link libraries
-if(WIN32)
+if(EMSCRIPTEN)
+    target_compile_options(ps3recomp_runtime PUBLIC -pthread -msimd128 -sMEMORY64=1 --use-port=sdl2)
+    target_link_options(ps3recomp_runtime PUBLIC -pthread -sMEMORY64=1 --use-port=sdl2)
+    # Shader translation uses Wasm exceptions. Match its longjmp mechanism in
+    # the three guest-stack unwind units; unrelated generated code need not change.
+    set_property(SOURCE runtime/syscalls/sys_ppu_thread.c runtime/spu/spu_channels.c
+        runtime/spu/spu_drain.c APPEND PROPERTY COMPILE_OPTIONS -sSUPPORT_LONGJMP=wasm)
+elseif(WIN32)
     target_link_libraries(ps3recomp_runtime PRIVATE
         ws2_32      # Winsock for network modules
         xinput      # XInput for gamepad

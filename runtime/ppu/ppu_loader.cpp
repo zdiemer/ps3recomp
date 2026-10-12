@@ -141,6 +141,10 @@ extern "C" void ps3_install_guest_ptr_trap(void)
     fprintf(stderr, "[ps3] guest-pointer trap armed (%zu MB of the low 4 GB reserved)\n",
             got >> 20);
 }
+#elif defined(__EMSCRIPTEN__)
+// WebAssembly traps are not POSIX signals. Never mmap the runtime's low heap
+// to install a diagnostic guest-pointer trap.
+extern "C" void ps3_install_guest_ptr_trap(void) {}
 #else  /* POSIX */
 
 /* Both signals a fault in the reserved window can arrive on, each with its own
@@ -1537,7 +1541,13 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
     fflush(stderr);
 }
 
-uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
+uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0;
+#ifdef __EMSCRIPTEN__
+    /* DEFLATE reads bytes in its inner loop. Match read32's uninstrumented
+     * path when memory probes are disabled; low-address diagnostics remain. */
+    if (!vm_memory_probes() && (uint32_t)a >= 0x10000u) return vm_base[(uint32_t)a];
+#endif
+    vm_hotmap((uint32_t)a,1);
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read8  0x%08X ra0=%p ra1=%p\n", (uint32_t)a, __builtin_return_address(0), __builtin_return_address(1)); }
