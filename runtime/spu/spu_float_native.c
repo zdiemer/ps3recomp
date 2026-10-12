@@ -82,11 +82,13 @@ static u128 validate_result(u128 result,u128 a,u128 b,u128 c,unsigned op) {
     }
     return expected;
 }
-static __m128i canonical(__m128i x) {
+/* RelWithDebInfo uses /Ob1: these small helpers otherwise become calls across
+ * the target-specific kernel boundary, spilling vectors and vzeroupper-ing. */
+static inline __attribute__((always_inline)) __m128i canonical(__m128i x) {
     __m128i exponent=_mm_and_si128(x,_mm_set1_epi32(0x7f800000));
     return _mm_andnot_si128(_mm_cmpeq_epi32(exponent,_mm_setzero_si128()),x);
 }
-static __m128i flush(__m128i x) { return canonical(x); }
+static inline __attribute__((always_inline)) __m128i flush(__m128i x) { return canonical(x); }
 #define NATIVE __attribute__((target("avx512f")))
 #define ROUND (_MM_FROUND_TO_ZERO|_MM_FROUND_NO_EXC)
 NATIVE u128 spu_float_native_add(u128 a,u128 b) {
@@ -99,7 +101,8 @@ NATIVE u128 spu_float_native_add(u128 a,u128 b) {
         _mm512_castps128_ps512(_mm_castsi128_ps(bb)),ROUND);
     u128 r; _mm_storeu_si128((__m128i*)&r,flush(_mm_castps_si128(_mm512_castps512_ps128(result))));
     for (int i=0;i<4;++i) if (slow&(1<<i)) r._u32[i]=spu_float_add(a._u32[i],b._u32[i]);
-    return validate_result(r,a,b,(u128){0},0);
+    if (validate) return validate_result(r,a,b,(u128){0},0);
+    return r;
 }
 NATIVE u128 spu_float_native_mul(u128 a,u128 b) {
     __m128i aa=canonical(_mm_loadu_si128((const __m128i*)&a)),bb=canonical(_mm_loadu_si128((const __m128i*)&b));
@@ -113,7 +116,8 @@ NATIVE u128 spu_float_native_mul(u128 a,u128 b) {
         _mm512_castps128_ps512(_mm_castsi128_ps(bb)),ROUND);
     u128 r; _mm_storeu_si128((__m128i*)&r,flush(_mm_castps_si128(_mm512_castps512_ps128(result))));
     for (int i=0;i<4;++i) if (slow&(1<<i)) r._u32[i]=spu_float_mul(a._u32[i],b._u32[i]);
-    return validate_result(r,a,b,(u128){0},1);
+    if (validate) return validate_result(r,a,b,(u128){0},1);
+    return r;
 }
 NATIVE u128 spu_float_native_madd(u128 a,u128 b,u128 c) {
     __m128i aa=canonical(_mm_loadu_si128((const __m128i*)&a)),bb=canonical(_mm_loadu_si128((const __m128i*)&b)),cc=canonical(_mm_loadu_si128((const __m128i*)&c));
@@ -129,7 +133,8 @@ NATIVE u128 spu_float_native_madd(u128 a,u128 b,u128 c) {
         _mm512_castps128_ps512(_mm_castsi128_ps(bb)),_mm512_castps128_ps512(_mm_castsi128_ps(cc)),ROUND);
     u128 r; _mm_storeu_si128((__m128i*)&r,flush(_mm_castps_si128(_mm512_castps512_ps128(result))));
     for (int i=0;i<4;++i) if (slow&(1<<i)) r._u32[i]=spu_float_madd(a._u32[i],b._u32[i],c._u32[i]);
-    return validate_result(r,a,b,c,2);
+    if (validate) return validate_result(r,a,b,c,2);
+    return r;
 }
 
 #else
