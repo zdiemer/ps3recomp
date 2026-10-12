@@ -32,7 +32,13 @@ static PPU_TLS int     s_exit_armed = 0;
 /* Host stack reserved per guest thread, for pthread_attr_setstacksize. The
  * same 256 MB the Win32 branch hands _beginthreadex a few hundred lines
  * down; keep the two in step so a stack-depth bug reproduces on both. */
+#ifdef __EMSCRIPTEN__
+/* Wasm stacks consume linear memory immediately; they are not sparse host
+ * reservations. Match the browser runtime's worker stack allocation. */
+#define PPU_HOST_STACK_BYTES  (4u * 1024u * 1024u)
+#else
 #define PPU_HOST_STACK_BYTES  (256u * 1024u * 1024u)
+#endif
 
 #ifdef _WIN32
 #include <process.h>   /* _beginthreadex: CRT-aware thread creation (raw CreateThread
