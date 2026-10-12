@@ -97,6 +97,7 @@ typedef struct {
     int n_depth_readback;
     u32 color_w, color_h;         /* size of the last colour surface created */
     float vp_xf[8];               /* viewport epilogue after the VS constants */
+    char fragment_source[16384];
 } StubState;
 
 static StubState stub;
@@ -173,6 +174,7 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
     if (!vs || !ps || !*vs || !*ps) return 0;
     stub.n_pipeline_create++;
     stub.pipeline_rt_count = rt_count;
+    snprintf(stub.fragment_source, sizeof stub.fragment_source, "%s", ps);
     return stub_handle();
 }
 
@@ -735,6 +737,49 @@ static void test_pipeline_key(void)
           stub.n_pipeline_create);
     m(M_DEPTH_BOUNDS_ENABLE, 0u);
 
+    engine_down();
+}
+
+static void test_unnormalized_texture_coordinates(void)
+{
+    engine_up();
+    /* MOV o0, ATTR0; TEX r0, TC0 on unit 0. The backend records the actual
+     * guest shader source, so this exercises both decompilation and caching. */
+    const u32 vp[4] = {1u << 30, 1u << 22, 2u << 23, (15u << 13) | 1u};
+    m(0x1E9C, 0);
+    for (u32 i = 0; i < 4; i++) m(0x0B80 + i * 4, vp[i]);
+    const u32 fp[4] = {(0x17u << 24) | (15u << 9) | (4u << 13) | 1u,
+        1u | (1u << 11) | (2u << 13) | (3u << 15) |
+        (7u << 18) | (1u << 23) | (2u << 25) | (3u << 27), 0, 0};
+    for (u32 i = 0; i < 4; i++) {
+        const u32 swapped = (fp[i] << 16) | (fp[i] >> 16);
+        u8* bytes = vm_base + 0x30000u + i * 4;
+        bytes[0] = (u8)(swapped >> 24); bytes[1] = (u8)(swapped >> 16);
+        bytes[2] = (u8)(swapped >> 8); bytes[3] = (u8)swapped;
+    }
+    m(0x08E4, 0x30000u | 2u); m(0x1D60, 0x40u);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    const u32 normalized = stub.bound_pipeline;
+    CHECK(strstr(stub.fragment_source, ".Sample(") != NULL,
+          "the coordinate regression uses a guest texture instruction");
+    m(M_TEX_UNIT + 0x04, 2u | (2u << 4) | (0xE5u << 8) | (1u << 16));
+    draw_triangle();
+    const u32 texel4 = stub.bound_pipeline;
+    CHECK(texel4 != normalized && strstr(stub.fragment_source, "* float2(0.25, 0.25)"),
+          "texel coordinates scale by the image dimensions");
+    draw_triangle();
+    CHECK(stub.bound_pipeline == texel4, "unchanged texel addressing reuses its pipeline");
+    m(M_TEX_UNIT + 0x18, (8u << 16) | 4u);
+    draw_triangle();
+    CHECK(stub.bound_pipeline != texel4 && strstr(stub.fragment_source, "* float2(0.125, 0.25)"),
+          "changing the image width rebuilds its baked coordinate divisor");
+    m(M_TEX_UNIT + 0x18, (4u << 16) | 4u);
+    draw_triangle();
+    CHECK(stub.bound_pipeline == texel4, "restoring dimensions reuses the earlier pipeline");
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    CHECK(stub.bound_pipeline == normalized, "normalized addressing keeps its original pipeline");
     engine_down();
 }
 
@@ -1409,6 +1454,7 @@ int main(void)
     test_mrt_set();
     test_texture_cache();
     test_pipeline_key();
+    test_unnormalized_texture_coordinates();
     test_restart_expansion();
     test_indexed_draws();
     test_scissor();

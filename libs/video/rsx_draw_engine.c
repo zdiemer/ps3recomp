@@ -1410,6 +1410,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             key = eng_fnv1a(shadow, sizeof shadow, key);
         }
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
+        /* Coordinate divisors are baked into the fragment source. A texture
+         * size or addressing-mode change must select a different pipeline. */
         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
     }
