@@ -483,6 +483,102 @@ static void bias_tests(void)
     puts("Coplanar decal GPU readback: zero/positive bias occluded, negative bias visible");
     puts("Guest depth clip reset/state/key and GPU readback: near/far clipped only when requested; valid depths preserved; negative W always clipped");
 }
+static void resolution_tests(void)
+{
+    rsx_render_resolution r;
+    const char* invalid[] = {"0x720","1280x0","1920","1920x1080junk","-1x720",
+        "8193x720","999999999999x720","1920X1080"," 1920x1080","1920x1080 "};
+    for (u32 i=0;i<sizeof(invalid)/sizeof(*invalid);++i)
+        assert(rsx_render_resolution_parse(&r,1280,720,invalid[i])<0);
+    assert(rsx_render_resolution_parse(&r,1280,720,NULL)==0 && r.host_w==1280 && r.host_h==720);
+    assert(rsx_render_resolution_parse(&r,1280,720,"1777x997")==0);
+    assert(rsx_render_extent(1280,1280,r.host_w)==1777);
+    assert(rsx_render_extent(720,720,r.host_h)==997);
+    r.reference_w=1024; r.reference_h=576;
+    u32 rw,rh;
+    rsx_render_surface_extent(&r,1024,576,&rw,&rh); assert(rw==1777 && rh==997);
+    rsx_render_surface_extent(&r,1280,720,&rw,&rh); assert(rw==1777 && rh==997);
+    rsx_render_surface_extent(&r,512,288,&rw,&rh); assert(rw==889 && rh==499);
+    rsx_render_resolution_parse(&r,1280,720,NULL); r.reference_w=1024; r.reference_h=576;
+    rsx_render_surface_extent(&r,1024,576,&rw,&rh); assert(rw==1024 && rh==576);
+    for (u32 i=0;i<=1280;++i) assert(rsx_render_edge(i,1280,1777)<=1777);
+    D3D12_DESCRIPTOR_HEAP_DESC hd={0}; hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors=LD_SWAP_BUFFERS+MAX_SURFACES;
+    OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.rtv_heap));
+    g.rtv_step=g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev,hd.Type);
+    hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors=SRV_CPU_HEAP_SLOTS;
+    OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.srv_cpu_heap));
+    g.srv_step=g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev,hd.Type);
+    hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV; hd.NumDescriptors=1+MAX_SURFACES;
+    OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.dsv_heap));
+    g.dsv_step=g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev,hd.Type);
+    g.width=g.height=8; g.ready=1;
+    const char* sizes[]={"8x8","12x12","16x16","11x13"};
+    ID3D12Resource* rb=buffer(D3D12_HEAP_TYPE_READBACK);
+    for (u32 mode=0;mode<4;++mode) {
+        assert(rsx_render_resolution_parse(&g_ld_resolution,8,8,sizes[mode])==0);
+        g_ld_resolution.reference_w=g_ld_resolution.reference_h=6;
+        OK(g.alloc->lpVtbl->Reset(g.alloc)); OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
+        g.n_surfaces=g.n_zdepths=0;
+        u32 source=surface_get(0,0x1000,8,8,DXGI_FORMAT_R8G8B8A8_UNORM);
+        u32 dest=surface_get(0,0x2000,8,8,DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert(source<MAX_SURFACES && dest<MAX_SURFACES);
+        assert(surface_get(0,0x1000,8,8,DXGI_FORMAT_R8G8B8A8_UNORM)==source);
+        const surface_t* sf=&g.surfaces[source];
+        D3D12_RESOURCE_DESC desc; sf->tex->lpVtbl->GetDesc(sf->tex,&desc);
+        assert(desc.Width==g_ld_resolution.host_w && desc.Height==g_ld_resolution.host_h);
+        u32 scene=surface_get(0,0x4000,6,6,DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert(g.surfaces[scene].w==desc.Width && g.surfaces[scene].h==desc.Height);
+        u32 ox,oy; assert(surface_containing(0,0x1000+32+4,32,7,7,&ox,&oy)==(int)source && ox==1 && oy==1);
+        assert(surface_containing(0,0x1000+32+4,32,8,8,&ox,&oy)<0);
+        u32 zslot=zdepth_get(0,0x3000,8,8); assert(zslot);
+        assert(g.zdepths[zslot-1].snapshot_w==desc.Width && g.zdepths[zslot-1].snapshot_h==desc.Height);
+        rsx_dispatch_init(&g.rsx,NULL);
+        rsx_dispatch_method(&g.rsx,0x0194,0xFEED0000);
+        rsx_dispatch_method(&g.rsx,0x0200,8u<<16); // surface clip
+        rsx_dispatch_method(&g.rsx,0x0204,8u<<16);
+        rsx_dispatch_method(&g.rsx,0x0208,8); // A8R8G8B8
+        rsx_dispatch_method(&g.rsx,0x020C,32);
+        rsx_dispatch_method(&g.rsx,0x0210,0x1000);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_HORIZONTAL,8u<<16);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_VERTICAL,8u<<16);
+        rsx_dispatch_method(&g.rsx,0x1D90,0xFF0000FF); // blue
+        sink_clear(NULL,&g.rsx,0xF0);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_HORIZONTAL,(3u<<16)|2u);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_VERTICAL,(4u<<16)|1u);
+        rsx_dispatch_method(&g.rsx,0x1D90,0xFFFF0000); // masked red, preserves blue/alpha
+        sink_clear(NULL,&g.rsx,0x10);
+        assert(ld_blit_gpu(0,0x1000,32,0,0x2000,32,8,8)==1);
+        D3D12_RESOURCE_BARRIER bar={0}; bar.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bar.Transition.pResource=g.surfaces[dest].tex; bar.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        bar.Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET; bar.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g.list->lpVtbl->ResourceBarrier(g.list,1,&bar);
+        read_subresource(g.surfaces[dest].tex,0,rb,0,DXGI_FORMAT_R8G8B8A8_UNORM,sf->w,sf->h);
+        OK(g.list->lpVtbl->Close(g.list)); ID3D12CommandList* lists[]={(ID3D12CommandList*)g.list};
+        g.queue->lpVtbl->ExecuteCommandLists(g.queue,1,lists);
+        OK(g.queue->lpVtbl->Signal(g.queue,g.fence,100+mode));
+        OK(g.fence->lpVtbl->SetEventOnCompletion(g.fence,100+mode,g.fence_event));
+        assert(WaitForSingleObject(g.fence_event,10000)==WAIT_OBJECT_0);
+        u8* bytes; OK(rb->lpVtbl->Map(rb,0,NULL,(void**)&bytes));
+        for(u32 y=0;y<sf->h;++y)for(u32 x=0;x<sf->w;++x) {
+            int inside=x>=2*sf->w/8 && x<5*sf->w/8 && y>=sf->h/8 && y<5*sf->h/8;
+            const u8* pixel=bytes+y*256+x*4;
+            assert(pixel[0]==(inside?255:0) && pixel[1]==0 && pixel[2]==255 && pixel[3]==255);
+        }
+        rb->lpVtbl->Unmap(rb,0,NULL);
+        for(u32 i=0;i<g.n_surfaces;++i)g.surfaces[i].tex->lpVtbl->Release(g.surfaces[i].tex);
+        for(u32 i=0;i<g.n_zdepths;++i) {
+            g.zdepths[i].tex->lpVtbl->Release(g.zdepths[i].tex);
+            g.zdepths[i].snapshot->lpVtbl->Release(g.zdepths[i].snapshot);
+        }
+        memset(g.surfaces,0,sizeof(g.surfaces)); memset(g.zdepths,0,sizeof(g.zdepths));
+    }
+    g.n_surfaces=g.n_zdepths=0; g.ready=0; memset(&g_ld_resolution,0,sizeof(g_ld_resolution));
+    rsx_color_clear_release(&g.color_clear);
+    rb->lpVtbl->Release(rb); g.rtv_heap->lpVtbl->Release(g.rtv_heap);
+    g.srv_cpu_heap->lpVtbl->Release(g.srv_cpu_heap); g.dsv_heap->lpVtbl->Release(g.dsv_heap);
+    g.rtv_heap=g.srv_cpu_heap=g.dsv_heap=NULL;
+    puts("Custom resolution GPU readbacks: native, 1.5x, 2x and fractional asymmetric targets; masked scissor clears, guest address bounds, depth dimensions and GPU blits passed.");
+}
 static void shadow_sampler_tests(void)
 {
     rsx_dsp_texture t={0};t.enabled=1;t.dimension=2;t.format=0xB2;
@@ -577,6 +673,7 @@ int main(void)
     assert(bytes[4096] == 0x35 && bytes[4097] == 0x79 && bytes[4098] == 0xB2 && bytes[4099] == 255);
     readback->lpVtbl->Unmap(readback,0,NULL);
     bias_tests();
+    resolution_tests();
     rgb->lpVtbl->Release(rgb); cube->lpVtbl->Release(cube); readback->lpVtbl->Release(readback);
     g.upload->lpVtbl->Unmap(g.upload,0,NULL); g.upload->lpVtbl->Release(g.upload);
     g.list->lpVtbl->Release(g.list); g.alloc->lpVtbl->Release(g.alloc);
