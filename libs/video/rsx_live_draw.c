@@ -1173,6 +1173,7 @@ typedef struct {
     u64 previous_evictions;
     u64 previous_refreshes;
     LONGLONG previous_present_qpc;
+    LONGLONG first_draw_qpc, last_draw_qpc;
     LONGLONG qpc_frequency;
     IDXGIAdapter3* adapter;
     u64 rejected_pso_keys[MAX_REJECTED_PSO_KEYS];
@@ -5446,7 +5447,7 @@ static void ld_profile_present(u32 frame)
                 "create_pso_ms,texture_decode_ms,draws,vertices,texture_upload_bytes,"
                 "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
                 "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work,"
-                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels\n");
+                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc\n");
         }
     }
     if (csv) {
@@ -5455,7 +5456,7 @@ static void ld_profile_present(u32 frame)
         u64 blit_ticks,blit_pixels,blit_row_pixels;
         cellGcmGetBlitProfile(&blit_ticks,&blit_pixels,&blit_row_pixels);
         fprintf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu\n", frame, now, frame_ms,
+            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
@@ -5482,7 +5483,8 @@ static void ld_profile_present(u32 frame)
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_decode_qpc)),g_ld_cpu_work,
             ld_profile_ticks_ms(blit_ticks-previous_ticks),
             (unsigned long long)(blit_pixels-previous_pixels),
-            (unsigned long long)(blit_row_pixels-previous_row_pixels));
+            (unsigned long long)(blit_row_pixels-previous_row_pixels),
+            g_ld_profile.qpc_frequency,g_ld_profile.first_draw_qpc,g_ld_profile.last_draw_qpc);
         previous_ticks=blit_ticks; previous_pixels=blit_pixels; previous_row_pixels=blit_row_pixels;
         if ((frame & 63u) == 0) fflush(csv);
     }
@@ -5741,6 +5743,7 @@ static void ld_profile_present(u32 frame)
     g_ld_profile.previous_evictions = g_ld_texture_cache_evictions;
     g_ld_profile.previous_refreshes = g_ld_vtex_refreshes;
     g_ld_profile.previous_present_qpc = now;
+    g_ld_profile.first_draw_qpc=g_ld_profile.last_draw_qpc=0;
     g_ld_profile.frame_upload_high = 0;
     g_ld_profile.frame_vb_high = 0;
     g_ld_profile.frame_retired_high = 0;
@@ -7875,10 +7878,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
 {
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG begin = ld_profile_qpc();
+    if (!g_ld_profile.first_draw_qpc) g_ld_profile.first_draw_qpc=begin;
 #endif
     sink_end_impl(user, r);
 #if defined(YZ_PERF_PROFILE)
-    g_ld_profile.total.sink_end_qpc += (u64)(ld_profile_qpc() - begin);
+    g_ld_profile.last_draw_qpc=ld_profile_qpc();
+    g_ld_profile.total.sink_end_qpc += (u64)(g_ld_profile.last_draw_qpc - begin);
 #endif
 }
 
