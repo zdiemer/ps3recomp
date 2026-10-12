@@ -495,14 +495,14 @@ static void shadow_sampler_tests(void)
     assert(ld_texture_shadow(&t));
     D3D12_SAMPLER_DESC sd=decode_sampler(&t);
     assert(sd.Filter==D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT);
-    assert(sd.ComparisonFunc==D3D12_COMPARISON_FUNC_LESS_EQUAL);
+    assert(sd.ComparisonFunc==D3D12_COMPARISON_FUNC_GREATER_EQUAL);
     assert(sd.AddressU==D3D12_TEXTURE_ADDRESS_MODE_CLAMP && sd.AddressV==sd.AddressU && sd.AddressW==sd.AddressU);
     assert(sd.MinLOD==0 && sd.MaxLOD==0);
     const u64 key=sampler_key(&t);assert(key!=raw_key);
     const D3D12_COMPARISON_FUNC expected[8]={D3D12_COMPARISON_FUNC_NEVER,
-        D3D12_COMPARISON_FUNC_GREATER,D3D12_COMPARISON_FUNC_EQUAL,
-        D3D12_COMPARISON_FUNC_GREATER_EQUAL,D3D12_COMPARISON_FUNC_LESS,
-        D3D12_COMPARISON_FUNC_NOT_EQUAL,D3D12_COMPARISON_FUNC_LESS_EQUAL,
+        D3D12_COMPARISON_FUNC_LESS,D3D12_COMPARISON_FUNC_EQUAL,
+        D3D12_COMPARISON_FUNC_LESS_EQUAL,D3D12_COMPARISON_FUNC_GREATER,
+        D3D12_COMPARISON_FUNC_NOT_EQUAL,D3D12_COMPARISON_FUNC_GREATER_EQUAL,
         D3D12_COMPARISON_FUNC_ALWAYS};
     for(u32 c=1;c<7;++c) {
         t.wrap=(t.wrap&0x0FFFFFFFu)|(c<<28);
@@ -521,7 +521,7 @@ static void shadow_sampler_tests(void)
     t.format=0xB2;t.wrap=0x00030303;assert(!ld_texture_shadow(&t));
     t.wrap=0x70030303;assert(!ld_texture_shadow(&t));
     g_ld_shadow_compare=saved;
-    puts("Shadow sampler: Haze LEQUAL/linear state, six NV40 comparisons, exact LOD/R identity, raw/cube/color exclusions passed");
+    puts("Shadow sampler: Haze GEQUAL/linear state, six RSX comparisons, exact LOD/R identity, raw/cube/color/alpha-kill exclusions passed");
 }
 int main(void)
 {

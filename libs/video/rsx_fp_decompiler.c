@@ -837,6 +837,8 @@ static int rsx_fp_decompile_internal(
         half_exports = (ctrl & FP_CTRL_32BIT_EXPORTS) ? 0 : 1;
     }
     const char* export_file = half_exports ? "h" : "r";
+    const int depth_export = ctrl != RSX_FP_CTRL_AUTO &&
+        (ctrl & RSX_FP_CTRL_DEPTH_EXPORT) != 0;
 
     /* How many colour targets the program feeds: one past the highest export
      * register of the selected file it wrote. A program that writes only the
@@ -849,7 +851,7 @@ static int rsx_fp_decompile_internal(
     for (u32 t = FP_MAX_COLOR_TARGETS; t-- > 1; )
         if (wrote[half_exports][t]) { targets = t + 1; break; }
 
-    if (targets == 1) {
+    if (targets == 1 && !depth_export) {
         char tail[96];
         snprintf(tail, sizeof(tail),
                  "    float4 _o = %s[0];\n"
@@ -869,6 +871,8 @@ static int rsx_fp_decompile_internal(
                      t, t, t, t);
             out_puts(&o, line);
         }
+        if (depth_export)
+            out_puts(&o, "    _out.depth = r[1].z;\n");
         out_puts(&o, "    return _out;\n}\n");
     }
 
@@ -921,7 +925,7 @@ static int rsx_fp_decompile_internal(
             buffered_constant_count ? buffered_constant_count : 1u);
         out_puts(&p, constants_decl);
     }
-    if (targets == 1) {
+    if (targets == 1 && !depth_export) {
         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
     } else {
         out_puts(&p, "struct PSOutput {\n");
@@ -931,6 +935,7 @@ static int rsx_fp_decompile_internal(
                      "    float4 t%u : SV_TARGET%u;\n", t, t);
             out_puts(&p, member);
         }
+        if (depth_export) out_puts(&p, "    float depth : SV_DEPTH;\n");
         out_puts(&p, "};\n"
                      "PSOutput main(PSInput input) {\n");
     }
