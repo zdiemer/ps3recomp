@@ -921,6 +921,43 @@ static void test_scissor(void)
 
 /* ---- 8. the presented pixel ---------------------------------------------- */
 
+static u32 feedback_calls, feedback_surface, feedback_texture;
+static u32 stub_color_snapshot(void* user, u32 surface)
+{
+    (void)user;
+    feedback_calls++; feedback_surface = surface;
+    if (!feedback_texture) feedback_texture = stub_handle();
+    return feedback_texture;
+}
+
+static void test_color_feedback(void)
+{
+    engine_up();
+    rsx_draw_backend precise = g_stub_backend;
+    precise.color_snapshot = stub_color_snapshot;
+    rsx_draw_engine_set_backend(&precise);
+    feedback_calls = feedback_surface = feedback_texture = 0;
+    m(M_CONTEXT_DMA_COLOR_A, DMA_MAIN);
+    m(M_COLOR_A_OFFSET, TEX_OFFSET);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    const u32 surface = stub.last_created_color;
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    m(M_TEX_UNIT + 0x20, TEX_OFFSET);
+    m(M_TEX_UNIT + 0x24, 2u | (2u << 4) | (0xA5u << 8) | (1u << 16));
+    m(M_TEX_UNIT + 0x2C, 0x80000000u);
+    m(M_TEX_UNIT + 0x30, 0xAAE4u);
+    m(M_TEX_UNIT + 0x38, (4u << 16) | 4u);
+    draw_triangle();
+    CHECK(feedback_calls == 1 && feedback_surface == surface &&
+          stub.bound_tex[0] == feedback_texture && stub.bound_tex[1] == feedback_texture &&
+          stub.n_texture_create == 0,
+          "units sampling their render target share one pre-draw snapshot, not stale guest bytes");
+    draw_triangle();
+    CHECK(feedback_calls == 2 && stub.bound_tex[0] == feedback_texture,
+          "the next feedback draw refreshes the reusable snapshot");
+    engine_down();
+}
+
 static void test_color_clear_mask(void)
 {
     engine_up();
@@ -1066,6 +1103,7 @@ int main(void)
     test_indexed_draws();
     test_scissor();
     test_color_clear_mask();
+    test_color_feedback();
     test_readback();
     test_custom_guest_mapping();
     test_queued_flip_buffer();

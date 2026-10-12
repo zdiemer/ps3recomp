@@ -1301,6 +1301,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES])
 {
     u32 mask = 0;
+    u32 feedback[RSX_BE_MAX_COLOR_TARGETS] = {0};
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
@@ -1313,15 +1314,28 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
                 g.surfaces[i].offset != t.offset)
                 continue;
-            /* Not one this draw writes: reading a target a pass is writing
-             * is undefined on every API, and an MRT set writes more than
-             * one of them. */
+            /* RSX texture caches permit a read-before-write pass. Host APIs
+             * need a separate snapshot; guest VRAM does not contain the
+             * pixels rendered by earlier GPU draws. */
             int own = 0;
-            for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) own = 1;
+            for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) {
+                own = 1;
+                if (g.be->color_snapshot) {
+                    if (!feedback[k]) feedback[k] =
+                        g.be->color_snapshot(g.be->user, g.surfaces[i].handle);
+                    const u32 copy = feedback[k];
+                    const u32 view = copy && g.be->surface_view
+                        ? g.be->surface_view(g.be->user, copy, t.remap & 0xFFFFu, t.format)
+                        : 0;
+                    textures[u] = view ? view : copy;
+                }
+                break;
+            }
             if (own) break;
             sampled = (int)i;
             break;
         }
+        if (textures[u]) continue;
         if (sampled >= 0) {
             const u32 view = g.be->surface_view
                 ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
