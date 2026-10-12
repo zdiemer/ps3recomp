@@ -1147,6 +1147,7 @@ typedef struct {
     u64 vertex_remap_qpc;
     u64 vertex_plan_qpc;
     u64 vertex_decode_qpc;
+    u64 topology_index_qpc;
     u64 flush_qpc;
     u64 fence_wait_qpc;
     u64 flush_reason[LD_FLUSH_REASON_COUNT];
@@ -5640,7 +5641,7 @@ static void ld_profile_present(u32 frame)
                 "create_pso_ms,texture_decode_ms,draws,vertices,texture_upload_bytes,"
                 "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
                 "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work,"
-                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses\n");
+                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses,topology_index_ms\n");
         }
     }
     if (csv) {
@@ -5650,7 +5651,7 @@ static void ld_profile_present(u32 frame)
         cellGcmGetBlitProfile(&blit_ticks,&blit_pixels,&blit_row_pixels);
         static u64 previous_limit_ticks;
         fprintf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu\n", frame, now, frame_ms,
+            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu,%.6f\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
@@ -5683,7 +5684,8 @@ static void ld_profile_present(u32 frame)
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vp_prepare_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(fp_prepare_qpc)),
             (unsigned long long)LD_PROFILE_DELTA(vp_cache_hits),
-            (unsigned long long)LD_PROFILE_DELTA(vp_cache_misses));
+            (unsigned long long)LD_PROFILE_DELTA(vp_cache_misses),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(topology_index_qpc)));
         previous_limit_ticks=g_ld_frame_limit_wait_ticks;
         previous_ticks=blit_ticks; previous_pixels=blit_pixels; previous_row_pixels=blit_row_pixels;
         if ((frame & 63u) == 0) fflush(csv);
@@ -7068,6 +7070,17 @@ static void write_topology_indices(u32 prim, u32* indices)
     case PRIM_TRIANGLES: {
         const u32 count =
             dc.n_source_refs - dc.n_source_refs % 3u;
+        /* The remapper already emits the triangle list's complete occurrence
+         * order. Copy that validated prefix instead of calling the external
+         * bounds-checked accessor for every index. Other topologies still need
+         * their winding/restart conversion. Bit 1024 is an opt-in comparison. */
+        if ((g_ld_cpu_work & 1024u) && dc.refs_remapped &&
+            dc.ref_remap.occurrence_to_unique &&
+            dc.ref_remap.occurrence_capacity >= count) {
+            memcpy(indices, dc.ref_remap.occurrence_to_unique,
+                   (size_t)count * sizeof(*indices));
+            break;
+        }
         for (u32 occurrence = 0; occurrence < count; occurrence++)
             indices[write++] = topology_vertex_index(occurrence);
         break;
@@ -7241,9 +7254,16 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         memcpy(
             g.vb_mapped + g.vb_used, vertex_data,
             (size_t)draw_vb_bytes);
-    if (indexed)
+    if (indexed) {
+#if defined(YZ_PERF_PROFILE)
+        const LONGLONG topology_begin = ld_profile_qpc();
+#endif
         write_topology_indices(
             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
+#if defined(YZ_PERF_PROFILE)
+        g_ld_profile.total.topology_index_qpc += ld_profile_qpc() - topology_begin;
+#endif
+    }
 
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG pso_begin=ld_profile_qpc();
@@ -9422,7 +9442,7 @@ void rsx_live_draw_present(u32 buffer_id)
         if (work_control) {
             FILE* file=fopen(work_control,"r"); unsigned flags;
             if (file) {
-                if (fscanf(file,"%u",&flags)==1 && flags<=1023 && flags!=g_ld_cpu_work) {
+                if (fscanf(file,"%u",&flags)==1 && flags<=2047 && flags!=g_ld_cpu_work) {
                     g_ld_cpu_work=flags;
                     fprintf(stderr,"[cpu-work] frame=%u flags=%u\n",g_ld_frames,flags);
                 }
