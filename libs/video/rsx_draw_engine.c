@@ -1567,8 +1567,25 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         /* Every target the set names, not only A: a deferred pass clears its
          * whole G-buffer in one CLEAR_SURFACE, and B, C and D would otherwise
          * keep whatever the last frame left in them. */
-        for (u32 i = 0; i < n_targets; i++)
-            g.be->clear_color(g.be->user, g.surfaces[targets[i]].handle, rgba);
+        for (u32 i = 0; i < n_targets; i++) {
+            const eng_surface* surface = &g.surfaces[targets[i]];
+            if (!g.be->clear_color_rect) {
+                g.be->clear_color(g.be->user, surface->handle, rgba);
+                continue;
+            }
+            u32 x = 0, y = 0, right = surface->w, bottom = surface->h;
+            if (g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] ||
+                g.rsx.seen[M_SCISSOR_VERTICAL >> 2]) {
+                const u32 h = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+                const u32 v = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+                x = h & 0xFFFFu; y = v & 0xFFFFu;
+                if (x + (h >> 16) < right) right = x + (h >> 16);
+                if (y + (v >> 16) < bottom) bottom = y + (v >> 16);
+            }
+            if (right > x && bottom > y)
+                g.be->clear_color_rect(g.be->user, surface->handle, rgba,
+                    (mask >> 4) & 15u, x, y, right - x, bottom - y);
+        }
     }
     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
         rsx_dsp_surface sf;

@@ -71,6 +71,7 @@ typedef struct {
     int n_pipeline_create;
     int n_draw, n_clear_color, n_clear_ds, n_present;
     u32 cleared[STUB_MAX_CLEARED];
+    u32 clear_channels, clear_rect[4];
 
     /* the last draw's bindings */
     u32 bound_tex[RSX_BE_MAX_TEXTURES];
@@ -231,6 +232,15 @@ static void stub_clear_color(void* u, u32 s, const float rgba[4])
 static void stub_clear_ds(void* u, u32 d, u32 f, float z, u8 s)
 { (void)u; (void)d; (void)f; (void)z; (void)s; stub.n_clear_ds++; }
 
+static void stub_clear_color_rect(void* u, u32 surface, const float rgba[4],
+                                  u32 channels, u32 x, u32 y, u32 w, u32 h)
+{
+    stub_clear_color(u, surface, rgba);
+    stub.clear_channels = channels;
+    stub.clear_rect[0] = x; stub.clear_rect[1] = y;
+    stub.clear_rect[2] = w; stub.clear_rect[3] = h;
+}
+
 static u32 presented_surface;
 static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.n_present++; }
 
@@ -275,6 +285,7 @@ static const rsx_draw_backend g_stub_backend = {
     .clear_depth_stencil = stub_clear_ds,
     .present = stub_present,
     .readback = stub_readback,
+    .clear_color_rect = stub_clear_color_rect,
 };
 
 /* ---- driving the engine -------------------------------------------------- */
@@ -910,6 +921,31 @@ static void test_scissor(void)
 
 /* ---- 8. the presented pixel ---------------------------------------------- */
 
+static void test_color_clear_mask(void)
+{
+    engine_up();
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.clear_channels == 15 && stub.clear_rect[0] == 0 &&
+          stub.clear_rect[1] == 0 && stub.clear_rect[2] == 256 && stub.clear_rect[3] == 256,
+          "an unwritten clear scissor covers the full surface");
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    m(M_CLEAR_BUFFERS, RSX_CLEAR_COLOR_A);
+    CHECK(stub.clear_channels == 8 && stub.clear_rect[0] == 16 &&
+          stub.clear_rect[1] == 8 && stub.clear_rect[2] == 64 && stub.clear_rect[3] == 32,
+          "an alpha-only clear preserves its channel mask and guest rectangle");
+    m(M_SCISSOR_H, (10u << 16) | 250u);
+    m(M_SCISSOR_V, (10u << 16) | 252u);
+    m(M_CLEAR_BUFFERS, RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G);
+    CHECK(stub.clear_channels == 3 && stub.clear_rect[2] == 6 && stub.clear_rect[3] == 4,
+          "a masked clear clips at the surface edge");
+    const int clears = stub.n_clear_color;
+    m(M_SCISSOR_H, 0);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_clear_color == clears, "an explicitly empty clear scissor writes no pixels");
+    engine_down();
+}
+
 static void test_readback(void)
 {
     printf("-- readback\n");
@@ -1029,6 +1065,7 @@ int main(void)
     test_restart_expansion();
     test_indexed_draws();
     test_scissor();
+    test_color_clear_mask();
     test_readback();
     test_custom_guest_mapping();
     test_queued_flip_buffer();
