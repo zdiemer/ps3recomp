@@ -3,6 +3,8 @@
 #include "../rsx_live_draw.c"
 #define OK(x) do { HRESULT hr_ = (x); assert(SUCCEEDED(hr_)); } while (0)
 static u8 guest[2048];
+static u8* watch_guest;
+static int watch_fail_after = -1;
 uint8_t* vm_base = guest;
 uint32_t vm_read32(uint64_t address)
 {
@@ -13,6 +15,11 @@ uint32_t vm_read32(uint64_t address)
 static const u8* resolve(void* user, u32 location, u32 offset, u32 size)
 {
     (void)user; (void)location;
+    if (watch_guest) {
+        if (watch_fail_after == 0) return NULL;
+        if (watch_fail_after > 0) --watch_fail_after;
+        return (u64)offset + size <= 65536 ? watch_guest + offset : NULL;
+    }
     return (u64)offset + size <= sizeof(guest) ? guest + offset : NULL;
 }
 static ID3D12Resource* buffer(D3D12_HEAP_TYPE type)
@@ -865,6 +872,68 @@ static void topology_copy_benchmark(void)
     dc.ref_remap=saved_remap; dc_reset(); g_ld_cpu_work=saved_flags;
     free(output); free(map);
 }
+static void native_texture_watch_cache_tests(void)
+{
+    watch_guest = VirtualAlloc(NULL,65536,MEM_RESERVE|MEM_COMMIT|MEM_WRITE_WATCH,PAGE_READWRITE);
+    assert(watch_guest);
+    assert(rsx_live_draw_set_texture_write_watch(watch_guest,65536));
+    _putenv_s("RSX_TEXTURE_WRITE_WATCH_VALIDATE","1");
+    const unsigned saved_flags=g_ld_cpu_work, saved_frame=g_ld_frames;
+    memset(g.textures,0,sizeof(g.textures)); memset(g.texture_buckets,0,sizeof(g.texture_buckets));
+    g.n_textures=2; g.guest_ptr=resolve; g_ld_cpu_work=4096;
+    rsx_dsp_texture textures[2]={{0},{0}};
+    for(unsigned i=0;i<2;++i) {
+        rsx_dsp_texture* t=&textures[i];
+        t->dimension=2; t->width=t->height=t->mipmaps=1;
+        t->format=0xBE; t->pitch=4; t->offset=i*64;
+        texcache_t* e=&g.textures[i];
+        e->dimension=2; e->width=e->height=e->mipmaps=1;
+        e->format=t->format; e->pitch=4; e->offset=t->offset;
+        // A sentinel must never be used by the unchanged/failed-decode paths.
+        e->tex=(ID3D12Resource*)(uintptr_t)1;
+        int readable=0; e->content_hash=texture_content_hash(t,&readable); assert(readable);
+        texture_cache_link(i,texture_cache_bucket(t));
+    }
+    ++g_ld_frames;
+    texture_srv_slot(&textures[0]); texture_srv_slot(&textures[1]);
+    assert(g.textures[0].write_watch_valid && g.textures[1].write_watch_valid);
+    u64 skipped=g_texture_watch_skips;
+    ++g_ld_frames;
+    texture_srv_slot(&textures[0]); texture_srv_slot(&textures[1]);
+    assert(g_texture_watch_skips==skipped+2 && g_texture_watch_audits>=2);
+    // A write outside both spans shares their page. Neither query may hide it.
+    skipped=g_texture_watch_skips; watch_guest[512]^=1; ++g_ld_frames;
+    texture_srv_slot(&textures[0]); texture_srv_slot(&textures[1]);
+    assert(g_texture_watch_skips==skipped);
+    ++g_ld_frames; texture_srv_slot(&textures[0]); texture_srv_slot(&textures[1]);
+    assert(g_texture_watch_skips==skipped+2);
+    // Algorithm transitions must use the old identity before adopting the new.
+    for(unsigned kind=0;kind<2;++kind) {
+        g_ld_cpu_work=4096|(kind*4); ++g_ld_frames;
+        texture_srv_slot(&textures[0]);
+        assert(g.textures[0].content_hash_kind==kind && g.textures[0].write_watch_valid);
+    }
+    g_ld_cpu_work=4096; ++g_ld_frames; texture_srv_slot(&textures[0]);
+    const u64 old_hash=g.textures[0].content_hash;
+    watch_guest[0]^=1;
+    for(unsigned retry=0;retry<2;++retry) {
+        // Query/hash readable, decode unreadable. A later frame must retry.
+        watch_fail_after=2; ++g_ld_frames; texture_srv_slot(&textures[0]);
+        assert(watch_fail_after==0 && !g.textures[0].write_watch_valid && g.textures[0].content_hash==old_hash);
+    }
+    watch_fail_after=-1; watch_guest[0]^=1; ++g_ld_frames;
+    texture_srv_slot(&textures[0]); assert(g.textures[0].write_watch_valid);
+    g_ld_cpu_work=0; ++g_ld_frames; texture_srv_slot(&textures[0]);
+    assert(!g.textures[0].write_watch_valid);
+    g_texture_watch.healthy=0; g_ld_cpu_work=4096; ++g_ld_frames;
+    texture_srv_slot(&textures[0]); assert(!g.textures[0].write_watch_valid);
+    assert(!g_texture_watch_failures);
+    rsx_texture_write_watch_destroy(&g_texture_watch);
+    VirtualFree(watch_guest,0,MEM_RELEASE); watch_guest=NULL;
+    memset(g.textures,0,sizeof(g.textures)); memset(g.texture_buckets,0,sizeof(g.texture_buckets));
+    g.n_textures=0; g_ld_cpu_work=saved_flags; g_ld_frames=saved_frame;
+    puts("Native texture tracking: audited skips, shared-page writes, hash switches, failed refresh retry and disabled-mode fallback passed");
+}
 int main(void)
 {
     shadow_sampler_tests();
@@ -872,6 +941,7 @@ int main(void)
     cache_tests();
     fetch_tests();
     reference_batch_tests();
+    native_texture_watch_cache_tests();
     topology_copy_tests();
     topology_copy_benchmark();
     IDXGIFactory4* factory; IDXGIAdapter* warp;

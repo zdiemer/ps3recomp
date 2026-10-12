@@ -31,6 +31,7 @@
 #define PS3RECOMP_RSX_LIVE_DRAW_H
 
 #include "ps3emu/ps3types.h"
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,6 +56,10 @@ void rsx_live_draw_set_render_reference(u32 width, u32 height);
 /* Optional square shadow atlas size. Independent shadow scaling applies to
  * all raster attachments of this exact guest extent. Call before init. */
 void rsx_live_draw_set_shadow_reference(u32 size);
+/* Experimental: explicitly register a MEM_WRITE_WATCH reservation before init.
+ * The renderer is its sole reset/query owner. CPU-work bit 4096 selects reuse;
+ * RSX_TEXTURE_WRITE_WATCH_VALIDATE=1 checks proposed skips against full hashes. */
+int rsx_live_draw_set_texture_write_watch(void* base, size_t bytes);
 
 /* Bring up the D3D12 device + swap chain bound to an existing HWND (the
  * runtime already opens the present window). Returns 0 on success. Safe to
