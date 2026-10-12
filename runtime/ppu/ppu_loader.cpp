@@ -3127,7 +3127,13 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */
+#ifdef __EMSCRIPTEN__
+    /* The native host-PC inverse map cannot resolve Wasm code offsets from
+     * its function-table pointers. Avoid a JS stack walk on every syscall. */
+    ppu_prof_stamp(ctx, (uint32_t)ctx->lr);
+#else
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
+#endif
     /* PS3_SCTRACE_TID: trace every lv2 syscall made by the loader/worker thread
      * (tid=1) so we can see what it does AFTER receiving its q=1 event and why
      * it never registers handlers / loads assets. */

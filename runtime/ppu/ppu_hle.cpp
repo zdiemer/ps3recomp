@@ -256,7 +256,14 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
+#ifdef __EMSCRIPTEN__
+    /* Wasm return addresses require a JS stack walk and are code offsets,
+     * not the function-table indices used by the native inverse map. Keep
+     * the guest LR as an approximate breadcrumb without walking each call. */
+    ppu_prof_stamp(ctx, (uint32_t)ctx->lr);
+#else
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
+#endif
     g_last_hle_nid = nid;
     /* Stamp the NAME here too, not only where a handler is found below.
      *
