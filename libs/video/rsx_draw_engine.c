@@ -1023,6 +1023,17 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 cube_mask = eng_cube_mask();
     const u32 vtex_mask = eng_vtex_mask();
+    u32 unnorm_mask = 0;
+    u32 unnorm_dim[16][2] = {{0}};
+    if (!fixed) for (u32 unit = 0; unit < 16; unit++) {
+        rsx_dsp_texture texture;
+        rsx_dsp_get_texture(&g.rsx, unit, &texture);
+        if (!texture.enabled || !(texture.format & RSX_TEX_FMT_UNNORM) ||
+            !texture.width || !texture.height) continue;
+        unnorm_mask |= 1u << unit;
+        unnorm_dim[unit][0] = texture.width;
+        unnorm_dim[unit][1] = texture.height;
+    }
 
     memset(&g.fp_constants, 0, sizeof g.fp_constants);
     if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
@@ -1045,6 +1056,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
+        /* Coordinate divisors are baked into the fragment source. A texture
+         * size or addressing-mode change must select a different pipeline. */
+        key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
+        if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
@@ -1074,6 +1089,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
+        if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl,
+                unnorm_mask, unnorm_dim, cube_mask) < 0) fi = -1;
         if (fi > 0 && rs->alpha_test_enable &&
             rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
                                              rs->alpha_func) < 0)
