@@ -134,6 +134,10 @@ target_include_directories(ps3recomp_runtime PRIVATE
 )
 
 # Platform-specific link libraries
+option(PS3RECOMP_NATIVE_FLOAT_RUNTIME "Build opt-in AVX-512 SPU float kernels" OFF)
+if(PS3RECOMP_NATIVE_FLOAT_RUNTIME AND WIN32 AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+    target_compile_definitions(ps3recomp_runtime PUBLIC SPU_FLOAT_NATIVE_RUNTIME=1)
+endif()
 if(EMSCRIPTEN)
     target_compile_options(ps3recomp_runtime PUBLIC -pthread -msimd128 -sMEMORY64=1 --use-port=sdl2)
     target_link_options(ps3recomp_runtime PUBLIC -pthread -sMEMORY64=1 --use-port=sdl2)
