@@ -27,8 +27,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-extern void vm_write32(u32 addr, u32 value);
-extern u32  vm_read32(u32 addr);
+extern void vm_write32(u64 addr, u32 value);
+extern u32  vm_read32(u64 addr);
 extern unsigned char* vm_base;
 
 /* Fixed guest EA for the virtual camera's frame memory (RAW8 VGA = 300KB).

@@ -835,6 +835,12 @@ static void park_handler(int sig, siginfo_t* si, void* uctx)
 /* Call with s_lock held. Returns 0 if the thread could not be stopped. */
 static int park_thread_locked(ps3_obj* t)
 {
+#ifdef __EMSCRIPTEN__
+    // Browser workers cannot receive POSIX signals or expose machine registers.
+    (void)t;
+    SetLastError(50u); // ERROR_NOT_SUPPORTED
+    return 0;
+#else
     if (!t->park_ready) return 0;
     if (!s_park_installed) {
         struct sigaction sa;
@@ -853,6 +859,7 @@ static int park_thread_locked(ps3_obj* t)
     sem_wait_uninterrupted(&t->park_ack);
     __atomic_store_n(&s_park_target, NULL, __ATOMIC_RELEASE);
     return 1;
+#endif
 }
 
 static void unpark_thread_locked(ps3_obj* t) { sem_post(&t->park_go); }

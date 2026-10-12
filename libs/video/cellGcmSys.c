@@ -201,7 +201,6 @@ static u32 s_second_v_handler_opd = 0;
  * game's per-flip/vblank callback never fires -> render/advance loop stalls. We
  * capture the code at Set*Handler time (OPD still valid) and restore the OPD word
  * before each invocation if it's been clobbered. */
-extern u32 vm_read32(unsigned int);
 static u32 s_flip_handler_code    = 0;
 static u32 s_vblank_handler_code  = 0;
 static void ydkj_restore_handler_opd(u32 opd, u32 code) {
