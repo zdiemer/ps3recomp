@@ -28,6 +28,7 @@
 
 /* Non-Windows: the whole path is a no-op (D3D12 is Windows-only). */
 int  rsx_live_draw_enabled(void) { return 0; }
+void rsx_live_draw_set_render_reference(u32 w, u32 h) { (void)w; (void)h; }
 int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void* u)
 { (void)hwnd; (void)w; (void)h; (void)f; (void)u; return 0; }
 void rsx_live_draw_seed_registers(const u32* r, u32 n) { (void)r; (void)n; }
@@ -128,6 +129,13 @@ static int ld_vertex_cache_enabled(void)
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 #include "rsx_color_clear.h"
+#include "rsx_render_resolution.h"
+static rsx_render_resolution g_ld_resolution;
+static u32 g_ld_reference_w, g_ld_reference_h;
+void rsx_live_draw_set_render_reference(u32 width, u32 height)
+{
+    g_ld_reference_w = width; g_ld_reference_h = height;
+}
 #include "rsx_vertex_formats.h"
 #include <sys/stat.h>
 
@@ -229,7 +237,8 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 typedef struct {
     u32 location, offset;
     ID3D12Resource* tex;
-    u32 w, h;
+    u32 w, h; /* host resource dimensions */
+    u32 guest_w, guest_h; /* identity and guest address arithmetic */
     DXGI_FORMAT fmt;
     ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
 #if !defined(YZ_PERF_CLEAN)
@@ -3112,6 +3121,8 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
 {
     if (!want_w) want_w = g.width;
     if (!want_h) want_h = g.height;
+    u32 host_w, host_h;
+    rsx_render_surface_extent(&g_ld_resolution, want_w, want_h, &host_w, &host_h);
     /* Key on the DIMENSIONS as well as location/offset.
      *
      * Keying on location/offset alone meant a redeclaration of the same offset
@@ -3136,7 +3147,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     u32 slot = MAX_SURFACES;
     for (u32 i = 0; i < g.n_surfaces; i++)
         if (g.surfaces[i].location == location && g.surfaces[i].offset == offset &&
-            g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
+            g.surfaces[i].guest_w == want_w && g.surfaces[i].guest_h == want_h &&
             g.surfaces[i].fmt == want_fmt)
             return i;
     /* Never destroy a usable render target because a malformed live command
@@ -3145,7 +3156,8 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      * 1280x16452 declaration and the old path then dereferenced a null
      * resource.  Preserve the prior surface so diagnostics can capture the
      * actual world pass while the bad command link is isolated. */
-    if (want_w > 8192u || want_h > 8192u) {
+    if (want_w > 8192u || want_h > 8192u ||
+        host_w > 16384u || host_h > 16384u) {
         static u32 invalid_surface_logs = 0;
         if (invalid_surface_logs++ < 32u)
             fprintf(stderr,
@@ -3173,7 +3185,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = want_w; rd.Height = want_h; rd.DepthOrArraySize = 1;
+    rd.Width = host_w; rd.Height = host_h; rd.DepthOrArraySize = 1;
     rd.MipLevels = 1; rd.Format = want_fmt; rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_CLEAR_VALUE cv = {0}; cv.Format = rd.Format;
@@ -3207,7 +3219,11 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         s->fb_tex = NULL;
     }
     s->tex = replacement;
-    s->location = location; s->offset = offset; s->w = want_w; s->h = want_h;
+    s->location = location; s->offset = offset;
+    s->guest_w = want_w; s->guest_h = want_h;
+    s->w = host_w; s->h = host_h;
+    fprintf(stderr, "[render-resolution] surface %u guest=%ux%u host=%ux%u\n",
+        slot, want_w, want_h, s->w, s->h);
     s->fmt = want_fmt;
 #if !defined(YZ_PERF_CLEAN)
     s->resource_serial = ++g_ld_surface_resource_serial;
@@ -3278,7 +3294,7 @@ static int surface_containing(u32 location, u32 abs, u32 pitch, u32 w, u32 h,
         const surface_t* s = &g.surfaces[i];
         if (!s->tex || s->location != location || abs < s->offset) continue;
         const u32 d = abs - s->offset, y = d / pitch, x = (d % pitch) / 4u;
-        if (x + w <= s->w && y + h <= s->h) { *ox = x; *oy = y; return (int)i; }
+        if (x + w <= s->guest_w && y + h <= s->guest_h) { *ox = x; *oy = y; return (int)i; }
     }
     return -1;
 }
@@ -3356,7 +3372,7 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, 
         const surface_t* s = &g.surfaces[i];
         if (!s->tex || s->location != src_loc || src_abs < s->offset) continue;
         const u32 d = src_abs - s->offset;
-        if (d / src_pitch >= 2u * s->h) continue;
+        if (d / src_pitch >= 2u * s->guest_h) continue;
         if (si >= 0 && g.surfaces[si].offset > s->offset) continue;
         si = (int)i; gx = (d % src_pitch) / 4u; gy = d / src_pitch;
     }
@@ -3370,8 +3386,8 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, 
     }
     if (bi < 0) return 0;
     const display_buffer_t* db = &g.display_buffers[bi];
-    const u32 dx = (dst_abs - db->offset) % db->pitch / 4u + out_x;
-    const u32 dy = (dst_abs - db->offset) / db->pitch + out_y;
+    u32 dx = (dst_abs - db->offset) % db->pitch / 4u + out_x;
+    u32 dy = (dst_abs - db->offset) / db->pitch + out_y;
     const u32 slot = surface_get(db->location, db->offset, db->width, db->height, g.surfaces[si].fmt);
     if (slot == LD_INVALID_SURFACE || (int)slot == si) return 0;
     surface_t* dst = &g.surfaces[slot];
@@ -3380,6 +3396,14 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, 
     const u32 k = ds >> 20;                       /* 20.12 fixed -> integer factor */
     u32 sx = gx / (k ? k : 1), sy = gy / (k ? k : 1);
     u32 w = out_w, h = out_h;
+    const surface_t* source = &g.surfaces[si];
+    const u32 ex = rsx_render_edge(sx+w, source->guest_w, source->w);
+    const u32 ey = rsx_render_edge(sy+h, source->guest_h, source->h);
+    sx = rsx_render_edge(sx, source->guest_w, source->w);
+    sy = rsx_render_edge(sy, source->guest_h, source->h);
+    dx = rsx_render_edge(dx, dst->guest_w, dst->w);
+    dy = rsx_render_edge(dy, dst->guest_h, dst->h);
+    w = ex-sx; h = ey-sy;
     if (dx >= dst->w || dy >= dst->h || sx >= g.surfaces[si].w || sy >= g.surfaces[si].h) return 0;
     if (dx + w > dst->w) w = dst->w - dx;
     if (dy + h > dst->h) h = dst->h - dy;
@@ -3446,10 +3470,21 @@ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
                                      g.surfaces[si].fmt);
         if (slot == LD_INVALID_SURFACE) return -2;
         di = (int)slot;
-        if (w > g.surfaces[di].w || h > g.surfaces[di].h) return -3;
+        if (w > g.surfaces[di].guest_w || h > g.surfaces[di].guest_h) return -3;
     }
     if (di == si) return -4;
     if (g.surfaces[di].fmt != g.surfaces[si].fmt) return -5;
+    const surface_t* ss = &g.surfaces[si];
+    const surface_t* ds = &g.surfaces[di];
+    u32 ex = rsx_render_edge(sx+w, ss->guest_w, ss->w);
+    u32 ey = rsx_render_edge(sy+h, ss->guest_h, ss->h);
+    sx = rsx_render_edge(sx, ss->guest_w, ss->w);
+    sy = rsx_render_edge(sy, ss->guest_h, ss->h);
+    dx = rsx_render_edge(dx, ds->guest_w, ds->w);
+    dy = rsx_render_edge(dy, ds->guest_h, ds->h);
+    w = ex-sx; h = ey-sy;
+    if (dx+w > ds->w || dy+h > ds->h) return -6;
+    if (!w || !h) return 1;
     ID3D12Resource* src = g.surfaces[si].tex;
     ID3D12Resource* dst = g.surfaces[di].tex;
     D3D12_RESOURCE_BARRIER b[2] = {0};
@@ -3520,8 +3555,12 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
      * allocating only that clip causes the D3D device to reject later
      * surface/PSO creation.  Sampling a declared-size window from this padded
      * backing remains a separate SRV concern. */
-    u32 want_w = rt_w > g.width ? rt_w : g.width;
-    u32 want_h = rt_h > g.height ? rt_h : g.height;
+    u32 snapshot_w, snapshot_h;
+    rsx_render_surface_extent(&g_ld_resolution, rt_w ? rt_w : g.width,
+        rt_h ? rt_h : g.height, &snapshot_w, &snapshot_h);
+    u32 want_w = snapshot_w > g_ld_resolution.host_w ? snapshot_w : g_ld_resolution.host_w;
+    u32 want_h = snapshot_h > g_ld_resolution.host_h ? snapshot_h : g_ld_resolution.host_h;
+    if (want_w > 16384u || want_h > 16384u) return 0;
     u32 slot = MAX_SURFACES;
     for (u32 i = 0; i < g.n_zdepths; i++) {
         zdepth_t* z = &g.zdepths[i];
@@ -3592,8 +3631,8 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->h = want_h;
     z->had_write = 0;
     z->snapshot_valid = 0;
-    z->snapshot_w = rt_w ? rt_w : want_w;
-    z->snapshot_h = rt_h ? rt_h : want_h;
+    z->snapshot_w = snapshot_w;
+    z->snapshot_h = snapshot_h;
     if (z->snapshot_w > want_w) z->snapshot_w = want_w;
     if (z->snapshot_h > want_h) z->snapshot_h = want_h;
     D3D12_DEPTH_STENCIL_VIEW_DESC dsvd = {0};
@@ -4644,6 +4683,14 @@ static ID3D12PipelineState* get_pso(
     key = fnv1a(&shader_window, sizeof(shader_window), key);
     const u32 reciprocal_w = g_ld_window_position == 2;
     key = fnv1a(&reciprocal_w, sizeof(reciprocal_w), key);
+    rsx_dsp_surface raster_surface; rsx_dsp_get_surface(&g.rsx, &raster_surface);
+    const u32 raster_w = raster_surface.clip_w ? raster_surface.clip_w : g.width;
+    const u32 raster_h = raster_surface.clip_h ? raster_surface.clip_h : g.height;
+    u32 raster_host_w, raster_host_h;
+    rsx_render_surface_extent(&g_ld_resolution, raster_w, raster_h, &raster_host_w, &raster_host_h);
+    const float raster_scale[2] = {(float)raster_w / raster_host_w,
+                                  (float)raster_h / raster_host_h};
+    key = fnv1a(raster_scale, sizeof(raster_scale), key);
     key = fnv1a(&cube_mask, sizeof(cube_mask), key);
     key = fnv1a(&shadow_mask, sizeof(shadow_mask), key);
     key = fnv1a(&vtex_mask, sizeof(vtex_mask), key);
@@ -4810,8 +4857,8 @@ static ID3D12PipelineState* get_pso(
     g_ld_profile.total.decompile_qpc +=
         (u64)(ld_profile_qpc() - decompile_begin);
 #endif
-    if (fi > 0 && rsx_fp_apply_window_position_ex(
-            ps_hlsl, sizeof(ps_hlsl), shader_window, reciprocal_w) < 0)
+    if (fi > 0 && rsx_fp_apply_window_position_scaled(
+            ps_hlsl, sizeof(ps_hlsl), shader_window, reciprocal_w, raster_scale[0], raster_scale[1]) < 0)
         fi = -1;
     /* LD_FORCE_GREEN=1: make every fragment program return solid green.
      *
@@ -6117,8 +6164,8 @@ static int ld_movie_overlay_ensure(void)
         g.movie_overlay_mask)
         return 1;
 
-    g.movie_overlay_pitch = (g.width * 4 + 255) & ~255u;
-    const UINT64 rb_size = (UINT64)g.movie_overlay_pitch * g.height;
+    g.movie_overlay_pitch = (g_ld_resolution.host_w * 4 + 255) & ~255u;
+    const UINT64 rb_size = (UINT64)g.movie_overlay_pitch * g_ld_resolution.host_h;
     D3D12_HEAP_PROPERTIES hp = {0};
     D3D12_RESOURCE_DESC bd = {0};
     hp.Type = D3D12_HEAP_TYPE_READBACK;
@@ -6137,8 +6184,8 @@ static int ld_movie_overlay_ensure(void)
         fprintf(stderr, "[movie-ui] readback allocation failed\n");
         return 0;
     }
-    g.movie_overlay_rgba = (u8*)malloc((size_t)g.width * g.height * 4);
-    g.movie_overlay_mask = (u8*)malloc((size_t)g.width * g.height);
+    g.movie_overlay_rgba = (u8*)malloc((size_t)g_ld_resolution.host_w * g_ld_resolution.host_h * 4);
+    g.movie_overlay_mask = (u8*)malloc((size_t)g_ld_resolution.host_w * g_ld_resolution.host_h);
     if (!g.movie_overlay_rgba || !g.movie_overlay_mask) {
         free(g.movie_overlay_rgba);
         free(g.movie_overlay_mask);
@@ -6204,7 +6251,7 @@ static void ld_movie_overlay_begin(void)
     if (g.n_surfaces) ld_flush(LD_FLUSH_MOVIE);
     ld_movie_reset_rings();
     fprintf(stderr, "[movie-ui] compositor armed (%ux%u, %u guest surfaces)\n",
-            g.width, g.height, g.n_surfaces);
+            g_ld_resolution.host_w, g_ld_resolution.host_h, g.n_surfaces);
     fflush(stderr);
 }
 
@@ -6237,8 +6284,8 @@ static void ld_movie_capture_overlay(void)
     dst.pResource = g.movie_overlay_readback;
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    dst.PlacedFootprint.Footprint.Width = g.width;
-    dst.PlacedFootprint.Footprint.Height = g.height;
+    dst.PlacedFootprint.Footprint.Width = g_ld_resolution.host_w;
+    dst.PlacedFootprint.Footprint.Height = g_ld_resolution.host_h;
     dst.PlacedFootprint.Footprint.Depth = 1;
     dst.PlacedFootprint.Footprint.RowPitch = g.movie_overlay_pitch;
     g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
@@ -6248,7 +6295,7 @@ static void ld_movie_capture_overlay(void)
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
     ld_flush(LD_FLUSH_MOVIE);
 
-    const SIZE_T rb_size = (SIZE_T)g.movie_overlay_pitch * g.height;
+    const SIZE_T rb_size = (SIZE_T)g.movie_overlay_pitch * g_ld_resolution.host_h;
     u8* mapped = NULL;
     D3D12_RANGE rr = {0, rb_size};
     if (FAILED(g.movie_overlay_readback->lpVtbl->Map(
@@ -6256,19 +6303,19 @@ static void ld_movie_capture_overlay(void)
         g.movie_overlay_valid = 0;
         return;
     }
-    for (u32 y = 0; y < g.height; y++)
-        memcpy(g.movie_overlay_rgba + (size_t)y * g.width * 4,
+    for (u32 y = 0; y < g_ld_resolution.host_h; y++)
+        memcpy(g.movie_overlay_rgba + (size_t)y * g_ld_resolution.host_w * 4,
                mapped + (size_t)y * g.movie_overlay_pitch,
-               (size_t)g.width * 4);
+               (size_t)g_ld_resolution.host_w * 4);
     D3D12_RANGE wr = {0, 0};
     g.movie_overlay_readback->lpVtbl->Unmap(
         g.movie_overlay_readback, 0, &wr);
 
-    const u64 total = (u64)g.width * g.height;
-    const u32 band_y0 = g.height * 52 / 100;
-    const u32 band_y1 = g.height * 96 / 100;
-    const u32 band_x0 = g.width * 5 / 100;
-    const u32 band_x1 = g.width * 95 / 100;
+    const u64 total = (u64)g_ld_resolution.host_w * g_ld_resolution.host_h;
+    const u32 band_y0 = g_ld_resolution.host_h * 52 / 100;
+    const u32 band_y1 = g_ld_resolution.host_h * 96 / 100;
+    const u32 band_x0 = g_ld_resolution.host_w * 5 / 100;
+    const u32 band_x1 = g_ld_resolution.host_w * 95 / 100;
     const u64 band_pixels =
         (u64)(band_y1 - band_y0) * (band_x1 - band_x0);
     u64 glyph_pixels = 0;
@@ -6276,7 +6323,7 @@ static void ld_movie_capture_overlay(void)
 
     for (u32 y = band_y0; y < band_y1; y++) {
         for (u32 x = band_x0; x < band_x1; x++) {
-            const u64 i = (u64)y * g.width + x;
+            const u64 i = (u64)y * g_ld_resolution.host_w + x;
             const u8* p = g.movie_overlay_rgba + i * 4;
             const int hi = p[0] > p[1]
                 ? (p[0] > p[2] ? p[0] : p[2])
@@ -6300,16 +6347,16 @@ static void ld_movie_capture_overlay(void)
     if (glyph_pixels >= 8 && glyph_pixels < band_pixels / 6) {
         for (u32 y = band_y0; y < band_y1; y++) {
             for (u32 x = band_x0; x < band_x1; x++) {
-                const u64 i = (u64)y * g.width + x;
+                const u64 i = (u64)y * g_ld_resolution.host_w + x;
                 if (g.movie_overlay_mask[i] < 64)
                     continue;
                 const u32 ya = y > 1 ? y - 2 : 0;
-                const u32 yb = y + 2 < g.height ? y + 2 : g.height - 1;
+                const u32 yb = y + 2 < g_ld_resolution.host_h ? y + 2 : g_ld_resolution.host_h - 1;
                 const u32 xa = x > 1 ? x - 2 : 0;
-                const u32 xb = x + 2 < g.width ? x + 2 : g.width - 1;
+                const u32 xb = x + 2 < g_ld_resolution.host_w ? x + 2 : g_ld_resolution.host_w - 1;
                 for (u32 oy = ya; oy <= yb; oy++)
                     for (u32 ox = xa; ox <= xb; ox++) {
-                        u8* m = &g.movie_overlay_mask[(u64)oy * g.width + ox];
+                        u8* m = &g.movie_overlay_mask[(u64)oy * g_ld_resolution.host_w + ox];
                         if (!*m) *m = 1;
                     }
             }
@@ -7611,7 +7658,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
               if (sf_i->location != t.location || sf_i->offset != t.offset ||
                   i == target)
                   continue;
-              if (sf_i->w == t.width && sf_i->h == t.height) { sampled = (int)i; break; }
+              if (sf_i->guest_w == t.width && sf_i->guest_h == t.height) { sampled = (int)i; break; }
               if (sampled < 0 || sf_i->last_draw_generation > best_gen) {
                   sampled = (int)i;
                   best_gen = sf_i->last_draw_generation;
@@ -7987,11 +8034,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             g.list, 3, vtex_table);
     g.cb_used += CB_BLOCK_ALIGNED;
 
-    D3D12_VIEWPORT dvp = {0, 0, W, H, 0.0f, 1.0f};
+    D3D12_VIEWPORT dvp = {0, 0, (float)g.surfaces[target].w, (float)g.surfaces[target].h, 0.0f, 1.0f};
     D3D12_RECT sc = {
         0, 0,
-        (LONG)(g.surfaces[target].w ? g.surfaces[target].w : g.width),
-        (LONG)(g.surfaces[target].h ? g.surfaces[target].h : g.height)
+        (LONG)(g.surfaces[target].guest_w ? g.surfaces[target].guest_w : g.width),
+        (LONG)(g.surfaces[target].guest_h ? g.surfaces[target].guest_h : g.height)
     };
     /* Guest scissor, intersected with the surface rect. The nv40 reset value
      * is a full-window 4096x4096; never-written regs read 0 here, so an
@@ -8016,6 +8063,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             if (sc.bottom < sc.top)      sc.bottom = sc.top;
         }
     }
+    sc.left = rsx_render_edge(sc.left, (u32)W, (u32)dvp.Width);
+    sc.right = rsx_render_edge(sc.right, (u32)W, (u32)dvp.Width);
+    sc.top = rsx_render_edge(sc.top, (u32)H, (u32)dvp.Height);
+    sc.bottom = rsx_render_edge(sc.bottom, (u32)H, (u32)dvp.Height);
     g.list->lpVtbl->RSSetViewports(g.list, 1, &dvp);
     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
     /* Dynamic stencil reference (kept out of the PSO key on purpose). */
@@ -8200,9 +8251,14 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         fflush(s_csv_file);
     }
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
-    const D3D12_RECT clear_rect = rsx_clear_rect(g.surfaces[target].w, g.surfaces[target].h,
+    D3D12_RECT clear_rect = rsx_clear_rect(g.surfaces[target].guest_w, g.surfaces[target].guest_h,
         rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL), rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL),
         g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] || g.rsx.seen[M_SCISSOR_VERTICAL >> 2]);
+    const surface_t* clear_surface = &g.surfaces[target];
+    clear_rect.left = rsx_render_edge(clear_rect.left, clear_surface->guest_w, clear_surface->w);
+    clear_rect.right = rsx_render_edge(clear_rect.right, clear_surface->guest_w, clear_surface->w);
+    clear_rect.top = rsx_render_edge(clear_rect.top, clear_surface->guest_h, clear_surface->h);
+    clear_rect.bottom = rsx_render_edge(clear_rect.bottom, clear_surface->guest_h, clear_surface->h);
     if (clear_rect.left >= clear_rect.right || clear_rect.top >= clear_rect.bottom) return;
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A)) {
         const u32 c = rsx_dsp_clear_color(&g.rsx);
@@ -8447,6 +8503,18 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     }
 #endif
     g.width = width; g.height = height;
+    const char* render_option = getenv("RSX_RENDER_RESOLUTION");
+    if (rsx_render_resolution_parse(&g_ld_resolution, width, height, render_option) < 0) {
+        fprintf(stderr, "[render-resolution] invalid RSX_RENDER_RESOLUTION='%s'; expected WIDTHxHEIGHT (1..8192)\n", render_option ? render_option : "");
+        return -1;
+    }
+    if (g_ld_reference_w && g_ld_reference_h) {
+        g_ld_resolution.reference_w = g_ld_reference_w;
+        g_ld_resolution.reference_h = g_ld_reference_h;
+    }
+    fprintf(stderr, "[render-resolution] guest=%ux%u scene=%ux%u host=%ux%u custom=%d\n", width, height,
+        g_ld_resolution.reference_w, g_ld_resolution.reference_h,
+        g_ld_resolution.host_w, g_ld_resolution.host_h, g_ld_resolution.custom);
     g.guest_ptr = guest_fn; g.guest_user = guest_user;
     {
         const char* requested = getenv("RSX_FP_CONSTANT_MODE");
@@ -8582,7 +8650,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 
     /* swap chain bound to the runtime's HWND */
     DXGI_SWAP_CHAIN_DESC1 scd = {0};
-    scd.Width = width; scd.Height = height; scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scd.Width = g_ld_resolution.host_w; scd.Height = g_ld_resolution.host_h; scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.SampleDesc.Count = 1; scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.BufferCount = LD_SWAP_BUFFERS; scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     IDXGISwapChain1* sc1 = NULL;
@@ -8688,7 +8756,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
         D3D12_HEAP_PROPERTIES dhp = {0}; dhp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC drd = {0};
         drd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        drd.Width = width; drd.Height = height; drd.DepthOrArraySize = 1;
+        drd.Width = g_ld_resolution.host_w; drd.Height = g_ld_resolution.host_h; drd.DepthOrArraySize = 1;
         drd.MipLevels = 1; drd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; drd.SampleDesc.Count = 1;
         drd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         D3D12_CLEAR_VALUE dcv = {0}; dcv.Format = drd.Format; dcv.DepthStencil.Depth = 1.0f;
@@ -8928,7 +8996,7 @@ void rsx_live_draw_note_inline_transfer(u32 dma, u32 offset, u32 value)
     for (u32 i = 0; i < g.n_surfaces; ++i) {
         surface_t* surface = &g.surfaces[i];
         const u64 begin = surface->offset;
-        const u64 end = begin + (u64)surface->w * surface->h * 4u;
+        const u64 end = begin + (u64)surface->guest_w * surface->guest_h * 4u;
         if (surface->location != location || offset < begin || offset >= end)
             continue;
         surface->last_guest_blit_generation = ++g_ld_guest_blit_generation;
@@ -9026,8 +9094,15 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
         InterlockedExchange(&g_ld_host_waiting, 0);
         return;
     }
-    if (w > g.width)  w = g.width;
-    if (h > g.height) h = g.height;
+    const u32 input_w = w, input_h = h;
+    if (!input_w || !input_h) {
+        if (serialized) {
+            ReleaseSRWLockExclusive(&g_ld_access_lock);
+            InterlockedExchange(&g_ld_host_waiting, 0);
+        }
+        return;
+    }
+    w = g_ld_resolution.host_w; h = g_ld_resolution.host_h;
     const u32 pitch = (w * 4 + 255) & ~255u;          /* D3D12 copy pitch align */
     if ((UINT64)pitch * h > UPLOAD_SIZE) {
         if (serialized) {
@@ -9040,12 +9115,15 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
     u8* host_upload = composite ? g.movie_upload_mapped : g.upload_mapped;
     for (u32 y = 0; y < h; y++) {
         u8* dstrow = host_upload + (size_t)y * pitch;
-        memcpy(dstrow, rgba + (size_t)y * w * 4, (size_t)w * 4);
+        const u8* input_row = rgba + (size_t)((u64)y * input_h / h) * input_w * 4;
+        if (w == input_w) memcpy(dstrow, input_row, (size_t)w * 4);
+        else for (u32 x=0; x<w; ++x)
+            memcpy(dstrow + (size_t)x*4, input_row + (size_t)((u64)x*input_w/w)*4, 4);
         if (composite && g.movie_overlay_valid && g.movie_overlay_rgba &&
             g.movie_overlay_mask) {
-            const u8* ov = g.movie_overlay_rgba + (size_t)y * g.width * 4;
+            const u8* ov = g.movie_overlay_rgba + (size_t)y * g_ld_resolution.host_w * 4;
             const u8* mask =
-                g.movie_overlay_mask + (size_t)y * g.width;
+                g.movie_overlay_mask + (size_t)y * g_ld_resolution.host_w;
             for (u32 x = 0; x < w; x++, ov += 4) {
                 const int coverage = mask[x];
                 if (!coverage) continue;
