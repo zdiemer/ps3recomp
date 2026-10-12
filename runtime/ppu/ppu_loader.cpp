@@ -1529,10 +1529,32 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
     static int s_on = -1;
     if (s_on < 0) { const char* e = getenv("PS3_NULL_READ"); s_on = (e && *e == '0') ? 0 : 1; }
     if (!s_on) return;
+    /* Opt-in context for one suspect reader, independent of the generic
+     * sixteen-line cap (boot NULL accesses must not consume the useful trace).
+     * Resolve only on the already-cold NULL path; ordinary VM reads are unchanged.
+     * Keep the process-wide dump bound even when several guest threads hit it. */
+    static const uint32_t trace_fn = []() -> uint32_t {
+        const char* e = getenv("PPU_NULL_READ_STACK");
+        return e ? (uint32_t)strtoul(e, nullptr, 16) : 0;
+    }();
+    uint32_t reader = 0;
+    if (trace_fn) {
+        reader = ppu_prof_resolve_host(ra);
+        static volatile LONG trace_count = 0;
+        if (reader == trace_fn && g_active_ctx &&
+            InterlockedIncrement(&trace_count) <= 4) {
+            LARGE_INTEGER qpc;
+            QueryPerformanceCounter(&qpc);
+            fprintf(stderr, "[null-read-context] qpc=%lld read%d addr=%08X guest-fn=%08X\n",
+                    (long long)qpc.QuadPart, width * 8, a, reader);
+            ppu_dump_guest_stack(g_active_ctx, "null-read");
+            fflush(stderr);
+        }
+    }
     static long s_n = 0;
     if (s_n++ >= 16) return;
     fprintf(stderr, "[null-read] guest read%d from 0x%08X (NULL+0x%X) by guest-fn=0x%08X%s" "\n",
-            width * 8, a, a, ppu_prof_resolve_host(ra),
+            width * 8, a, a, trace_fn ? reader : ppu_prof_resolve_host(ra),
             s_n == 16 ? "  [further NULL reads not reported]" : "");
     fflush(stderr);
 }
