@@ -89,7 +89,7 @@ static rsx_vertex_payload_cache g_ld_vertex_cache;
 static int g_ld_apply_polygon_bias=1;
 /* Independently benchmark reference filling (1), dense remapping (2), and
  * texture hashing (4). Live changes apply at presentation boundaries. */
-static unsigned g_ld_cpu_work=3;
+static unsigned g_ld_cpu_work=259;
 static int g_ld_vertex_cache_enabled=-1;
 static int ld_vertex_cache_enabled(void)
 {
@@ -602,6 +602,9 @@ static int g_ld_schedule_diag = 0;
 static HANDLE g_ld_present_thread_handle = NULL;
 #endif
 
+#include "rsx_frame_limiter.h"
+static rsx_frame_limiter g_ld_frame_limiter;
+static u64 g_ld_frame_limit_wait_ticks;
 static void ld_present_measure_dump(void);
 #if defined(YZ_PERF_PROFILE) && defined(YZ_SPU_PROFILE)
 extern void spu_perf_window_begin(u32 guest_frame);
@@ -625,6 +628,19 @@ static void ld_present_measure_init(void)
         g_ld_qpc_frequency = frequency.QuadPart;
     else
         g_ld_qpc_frequency = 0;
+    unsigned max_fps = 0;
+    const char* limit_text = getenv("RSX_MAX_FPS");
+    if (limit_text && *limit_text) {
+        char* end;
+        const unsigned long parsed = strtoul(limit_text, &end, 10);
+        if (!*end && parsed <= 240) max_fps = (unsigned)parsed;
+        else fprintf(stderr,"[frame-limit] invalid RSX_MAX_FPS; limiter disabled\n");
+    }
+    rsx_frame_limiter_init(&g_ld_frame_limiter, g_ld_qpc_frequency, max_fps);
+    g_ld_frame_limit_wait_ticks = 0;
+    fprintf(stderr,"[frame-limit] max_fps=%u timer=%s present_sync=%u\n", max_fps,
+        g_ld_frame_limiter.high_resolution ? "high-resolution" : "fallback",
+        g_ld_frame_limiter.period ? 0u : 1u);
 }
 
 static void ld_present_measure_record(u32 guest_frame)
@@ -651,6 +667,7 @@ static void ld_present_measure_record(u32 guest_frame)
     sample->present_id = present_id;
     sample->guest_frame = guest_frame;
     sample->qpc = now.QuadPart;
+    g_ld_frame_limiter.last_present = now.QuadPart;
     if (g_ld_schedule_diag) {
         FILETIME creation = {0}, exit = {0}, kernel = {0}, user = {0};
         ULARGE_INTEGER value;
@@ -5275,7 +5292,8 @@ static void fetch_batches_hoisted(
         if (!scalar) {
             dc.fetch_ok = ld_vertex_cache_enabled()
                 ? rsx_vertex_fetch_cached(&g_ld_vertex_cache,&dc.fetch_plan,dc.refs,dc.n_refs,dc.compact_verts)
-                : rsx_vertex_fetch_many(&dc.fetch_plan,dc.refs,dc.n_refs,dc.compact_verts);
+                : rsx_vertex_fetch_many_ex(&dc.fetch_plan,dc.refs,dc.n_refs,dc.compact_verts,
+                    (g_ld_cpu_work & 256u) != 0);
         } else for (u32 i = 0; i < dc.n_refs; i++) {
             u8* destination = layout->stride
                 ? dc.compact_verts + (u64)i * layout->stride : NULL;
@@ -5531,7 +5549,7 @@ static void ld_profile_present(u32 frame)
                 "create_pso_ms,texture_decode_ms,draws,vertices,texture_upload_bytes,"
                 "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
                 "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work,"
-                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc\n");
+                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms\n");
         }
     }
     if (csv) {
@@ -5539,8 +5557,9 @@ static void ld_profile_present(u32 frame)
         static u64 previous_ticks,previous_pixels,previous_row_pixels;
         u64 blit_ticks,blit_pixels,blit_row_pixels;
         cellGcmGetBlitProfile(&blit_ticks,&blit_pixels,&blit_row_pixels);
+        static u64 previous_limit_ticks;
         fprintf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld\n", frame, now, frame_ms,
+            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
@@ -5568,7 +5587,9 @@ static void ld_profile_present(u32 frame)
             ld_profile_ticks_ms(blit_ticks-previous_ticks),
             (unsigned long long)(blit_pixels-previous_pixels),
             (unsigned long long)(blit_row_pixels-previous_row_pixels),
-            g_ld_profile.qpc_frequency,g_ld_profile.first_draw_qpc,g_ld_profile.last_draw_qpc);
+            g_ld_profile.qpc_frequency,g_ld_profile.first_draw_qpc,g_ld_profile.last_draw_qpc,
+            ld_profile_ticks_ms(g_ld_frame_limit_wait_ticks-previous_limit_ticks));
+        previous_limit_ticks=g_ld_frame_limit_wait_ticks;
         previous_ticks=blit_ticks; previous_pixels=blit_pixels; previous_row_pixels=blit_row_pixels;
         if ((frame & 63u) == 0) fflush(csv);
     }
@@ -8942,7 +8963,9 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
 
     ld_flush(LD_FLUSH_MOVIE_PRESENT);
     {
-        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
+        g_ld_frame_limit_wait_ticks += rsx_frame_limiter_wait(&g_ld_frame_limiter);
+        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap,
+            g_ld_frame_limiter.period ? 0 : 1, 0);
         if (SUCCEEDED(present_hr))
             ld_present_measure_record(g_ld_frames);
         else {
@@ -9268,7 +9291,7 @@ void rsx_live_draw_present(u32 buffer_id)
         if (work_control) {
             FILE* file=fopen(work_control,"r"); unsigned flags;
             if (file) {
-                if (fscanf(file,"%u",&flags)==1 && flags<=255 && flags!=g_ld_cpu_work) {
+                if (fscanf(file,"%u",&flags)==1 && flags<=511 && flags!=g_ld_cpu_work) {
                     g_ld_cpu_work=flags;
                     fprintf(stderr,"[cpu-work] frame=%u flags=%u\n",g_ld_frames,flags);
                 }
@@ -9544,7 +9567,9 @@ void rsx_live_draw_present(u32 buffer_id)
 
     ld_flush(LD_FLUSH_PRESENT);
     {
-        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
+        g_ld_frame_limit_wait_ticks += rsx_frame_limiter_wait(&g_ld_frame_limiter);
+        const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap,
+            g_ld_frame_limiter.period ? 0 : 1, 0);
         if (SUCCEEDED(present_hr))
             ld_present_measure_record(g_ld_frames + 1u);
         else {
@@ -10416,6 +10441,7 @@ void rsx_live_draw_shutdown(void)
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
+    rsx_frame_limiter_destroy(&g_ld_frame_limiter);
 #if defined(YZ_PERF_PROFILE)
     fprintf(stderr,
             "[rsx-perf-summary] frames=%u "

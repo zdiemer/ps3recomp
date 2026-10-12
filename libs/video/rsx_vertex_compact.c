@@ -335,7 +335,7 @@ static inline int rsx_vertex_decode_batch_element(
     return rsx_vertex_decode_element(type,size,source,value);
 }
 
-int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,
+static int rsx_vertex_fetch_many_reference(const rsx_vertex_fetch_plan* plan,
     const rsx_vertex_ref* refs, u32 count, u8* out)
 {
     if (!plan || (!refs && count) || (!out && plan->layout.stride && count)) return 0;
@@ -374,6 +374,131 @@ int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,
         }
     }
     return 1;
+}
+
+#ifdef RSX_COMPACT_SIMD
+/* Constant sizes at the call sites let the compiler keep only the exact-width
+ * loads required by each kernel. In particular, a three-component position
+ * must not read a fourth component beyond a protected guest buffer tail. */
+static inline __m128 rsx_compact_float_lanes(const u8* source, u32 size)
+{
+    __m128i packed;
+    if (size == 4) packed = _mm_loadu_si128((const __m128i*)source);
+    else if (size == 3) {
+        u64 low; u32 high;
+        memcpy(&low, source, 8); memcpy(&high, source + 8, 4);
+        packed = _mm_insert_epi32(_mm_cvtsi64_si128((long long)low), (int)high, 2);
+    } else if (size == 2) {
+        u64 low; memcpy(&low, source, 8);
+        packed = _mm_cvtsi64_si128((long long)low);
+    } else {
+        u32 low; memcpy(&low, source, 4);
+        packed = _mm_cvtsi32_si128((int)low);
+    }
+    packed = _mm_shuffle_epi8(packed,
+        _mm_setr_epi8(3,2,1,0,7,6,5,4,11,10,9,8,15,14,13,12));
+    if (size < 4) packed = _mm_insert_epi32(packed, 0x3F800000, 3);
+    return _mm_castsi128_ps(packed);
+}
+
+static inline __m128 rsx_compact_byte_lanes(const u8* source, u32 size, int normalized)
+{
+    u32 packed = 0;
+    if (size == 4) memcpy(&packed, source, 4);
+    else if (size == 3) {
+        u16 low; memcpy(&low, source, 2);
+        packed = (u32)low | ((u32)source[2] << 16);
+    } else if (size == 2) {
+        u16 low; memcpy(&low, source, 2); packed = low;
+    } else packed = source[0];
+    __m128 value = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)packed)));
+    /* Division preserves the reference decoder's rounding, including values
+     * for which multiplying by a rounded reciprocal gives a different bit. */
+    if (normalized) value = _mm_div_ps(value, _mm_set1_ps(255.0f));
+    if (size < 4) value = _mm_blend_ps(value, _mm_set1_ps(1.0f), 8);
+    return value;
+}
+#endif
+
+int rsx_vertex_fetch_many_ex(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out, int specialized)
+{
+#ifndef RSX_COMPACT_SIMD
+    (void)specialized;
+#else
+    if (specialized && plan && refs && out && count && !plan->inline_data) {
+        /* Validate the whole batch once before writing anything. Callers can
+         * reuse a prepared plan with different references; those still retain
+         * the original resolver/failure behavior rather than overreading. */
+        u32 first = UINT_MAX, last = 0;
+        for (u32 i = 0; i < count; ++i) {
+            const u32 element = (refs[i].vertex_id + refs[i].base_index) & 0xFFFFFu;
+            if (element < first) first = element;
+            if (element > last) last = element;
+        }
+        for (u32 slot = 0; slot < plan->layout.count; ++slot) {
+            const rsx_vertex_fetch_attr* f = &plan->attr[plan->layout.attrs[slot]];
+            if (f->desc.type && f->desc.size &&
+                (!f->stable_base || f->desc.frequency > 1 ||
+                 first < f->stable_first || last > f->stable_last))
+                return rsx_vertex_fetch_many_reference(plan, refs, count, out);
+        }
+        for (u32 slot = 0; slot < plan->layout.count; ++slot) {
+            const u32 attr = plan->layout.attrs[slot];
+            const rsx_vertex_fetch_attr* f = &plan->attr[attr];
+            const u32 type = f->desc.type, size = f->desc.size;
+            u8* destination = out + slot * 16;
+            const u32 output_stride = plan->layout.stride;
+            if (!type || !size) {
+                for (u32 i = 0; i < count; ++i, destination += output_stride)
+                    memcpy(destination, f->default_value, 16);
+                continue;
+            }
+            /* Dispatch once per attribute, rather than testing format and
+             * component count inside every vertex. Each expression below has
+             * constant type/size and is inlined into its own small loop. */
+#define RSX_DECODE_BATCH(expression) do { \
+                for (u32 i = 0; i < count; ++i, destination += output_stride) { \
+                    const u32 element = (refs[i].vertex_id + refs[i].base_index) & 0xFFFFFu; \
+                    const u8* source = f->stable_base + (u64)(element - f->stable_first) * f->stride; \
+                    _mm_storeu_ps((float*)destination, (expression)); \
+                } \
+            } while (0)
+#define RSX_FLOAT_CASE(n) case (RSX_VTX_TYPE_FLOAT * 8 + n): \
+                RSX_DECODE_BATCH(rsx_compact_float_lanes(source, n)); break
+#define RSX_BYTE_CASE(t,n) case (t * 8 + n): \
+                RSX_DECODE_BATCH(rsx_compact_byte_lanes(source, n, t == RSX_VTX_TYPE_UNORM8)); break
+            switch (size <= 4 && type <= RSX_VTX_TYPE_UINT8 ? type * 8 + size : 0) {
+            RSX_FLOAT_CASE(1); RSX_FLOAT_CASE(2); RSX_FLOAT_CASE(3); RSX_FLOAT_CASE(4);
+            RSX_BYTE_CASE(RSX_VTX_TYPE_UNORM8,1); RSX_BYTE_CASE(RSX_VTX_TYPE_UNORM8,2);
+            RSX_BYTE_CASE(RSX_VTX_TYPE_UNORM8,3); RSX_BYTE_CASE(RSX_VTX_TYPE_UNORM8,4);
+            RSX_BYTE_CASE(RSX_VTX_TYPE_UINT8,1); RSX_BYTE_CASE(RSX_VTX_TYPE_UINT8,2);
+            RSX_BYTE_CASE(RSX_VTX_TYPE_UINT8,3); RSX_BYTE_CASE(RSX_VTX_TYPE_UINT8,4);
+            default:
+                for (u32 i = 0; i < count; ++i, destination += output_stride) {
+                    const u32 element = (refs[i].vertex_id + refs[i].base_index) & 0xFFFFFu;
+                    const u8* source = f->stable_base + (u64)(element - f->stable_first) * f->stride;
+                    if (!rsx_vertex_decode_batch_element(type,size,source,(float*)destination)) {
+                        if (attr == 0) return 0;
+                        memcpy(destination, f->default_value, 16);
+                    }
+                }
+                break;
+            }
+#undef RSX_BYTE_CASE
+#undef RSX_FLOAT_CASE
+#undef RSX_DECODE_BATCH
+        }
+        return 1;
+    }
+#endif
+    return rsx_vertex_fetch_many_reference(plan, refs, count, out);
+}
+
+int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out)
+{
+    return rsx_vertex_fetch_many_ex(plan, refs, count, out, 1);
 }
 
 enum { VERTEX_CACHE_SLOTS=2048 };

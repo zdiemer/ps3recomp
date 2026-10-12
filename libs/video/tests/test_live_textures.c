@@ -150,6 +150,8 @@ static void fetch_tests(void)
             for (u32 i=0; i<64; ++i) assert(rsx_vertex_fetch_one(&p,&refs[i],scalar+i*48));
             assert(rsx_vertex_fetch_many(&p,refs,64,batch));
             assert(memcmp(scalar,batch,sizeof(batch))==0);
+            assert(rsx_vertex_fetch_many_ex(&p,refs,64,batch,0));
+            assert(memcmp(scalar,batch,sizeof(batch))==0);
         }
     puts("Batch vertex fetch matches scalar: types, sizes, divisors, disabled attributes, 20-bit wrap");
     {
@@ -220,6 +222,64 @@ static void fetch_tests(void)
         }
         VirtualFree(page,0,MEM_RELEASE);
         puts("SINT16 batch: every signed value/lane matches; protected tails do not overread");
+    }
+    {
+        /* Raw F32 bits include NaN payloads, signed zeros, infinities and
+         * subnormals: this path must perform no floating-point arithmetic. */
+        static const u32 special[] = {0,0x80000000,0x3F800000,0xBF800000,
+            0x7F800000,0xFF800000,0x7FC12345,0x7F812345,0xFFC12345,0xFF812345,
+            1,0x80000001,0x007FFFFF,0x00800000,0x7F7FFFFF,0xFF7FFFFF};
+        const u32 types[] = {RSX_VTX_TYPE_FLOAT,RSX_VTX_TYPE_UNORM8,RSX_VTX_TYPE_UINT8};
+        rsx_vertex_fetch_plan exact={0}; rsx_vertex_ref ref={0};
+        rsx_vertex_layout_plan_init(&exact.layout,1);
+        u32 random=0xC34193DA;
+        for (u32 t=0; t<3; ++t) for (u32 size=1; size<=4; ++size) {
+            exact.attr[0].desc.type=types[t]; exact.attr[0].desc.size=size;
+            for (u32 trial=0; trial<4096; ++trial) {
+                u8* source=guest+(trial%16); // Include unaligned reads.
+                for (u32 lane=0; lane<4; ++lane) {
+                    random=random*1664525u+1013904223u;
+                    const u32 word=trial<16?special[(trial+lane)%16]:random;
+                    source[lane*4]=(u8)(word>>24); source[lane*4+1]=(u8)(word>>16);
+                    source[lane*4+2]=(u8)(word>>8); source[lane*4+3]=(u8)word;
+                }
+                if (types[t]!=RSX_VTX_TYPE_FLOAT)
+                    for (u32 lane=0; lane<4; ++lane) source[lane]=(u8)(trial+lane*73);
+                exact.attr[0].stable_base=source;
+                float expected[4], actual[4];
+                assert(rsx_vertex_decode_element(types[t],size,source,expected));
+                assert(rsx_vertex_fetch_many_ex(&exact,&ref,1,(u8*)actual,1));
+                assert(memcmp(expected,actual,sizeof(actual))==0);
+            }
+        }
+        u8* page=VirtualAlloc(NULL,8192,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+        assert(page); DWORD old;
+        assert(VirtualProtect(page+4096,4096,PAGE_NOACCESS,&old));
+        for (u32 t=0; t<3; ++t) for (u32 size=1; size<=4; ++size) {
+            const u32 bytes=size*(types[t]==RSX_VTX_TYPE_FLOAT?4:1);
+            exact.attr[0].desc.type=types[t]; exact.attr[0].desc.size=size;
+            exact.attr[0].stable_base=page+4096-bytes;
+            memset((void*)exact.attr[0].stable_base,0xF3,bytes);
+            /* Destination ends at a protected page as well. */
+            float expected[4];
+            assert(rsx_vertex_decode_element(types[t],size,exact.attr[0].stable_base,expected));
+            assert(rsx_vertex_fetch_many_ex(&exact,&ref,1,page+4096-16,1));
+            assert(!memcmp(expected,page+4096-16,16));
+        }
+        VirtualFree(page,0,MEM_RELEASE);
+        /* A reused prepared plan whose references escape its stable interval
+         * must resolve from guest memory, including 20-bit wrapping. */
+        exact.guest_ptr=resolve; exact.attr[0].stable_base=guest;
+        exact.attr[0].desc.type=RSX_VTX_TYPE_FLOAT; exact.attr[0].desc.size=4;
+        exact.attr[0].stride=16; exact.attr[0].elem_size=16;
+        for (u32 i=0; i<16; ++i) {
+            ref.vertex_id=i+1; ref.base_index=0x100000;
+            float expected[4],actual[4];
+            assert(rsx_vertex_fetch_one(&exact,&ref,(u8*)expected));
+            assert(rsx_vertex_fetch_many_ex(&exact,&ref,1,(u8*)actual,1));
+            assert(!memcmp(expected,actual,sizeof(actual)));
+        }
+        puts("Specialized F32/byte batches: 49152 exact comparisons, protected tails, reused plans");
     }
     rsx_vertex_remap remap={0};
     for (u32 trial=0; trial<256; ++trial) {
