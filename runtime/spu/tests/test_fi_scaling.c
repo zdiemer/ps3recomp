@@ -1,4 +1,4 @@
-/* Compare FI against its pre-optimization implementation, including all
+/* Compare FI against an independent exact-integer reference, including all
  * exponent/step fields, sign/base boundaries and host FP environment modes.
  * Define SPU_FI_BENCHMARK for a pinned local-cost comparison instead. */
 #include "spu_helpers.h"
@@ -14,16 +14,25 @@ static __attribute__((noinline)) u128 reference_fi(u128 a, u128 b)
 {
     u128 r;
     for (int i = 0; i < 4; i++) {
-        uint32_t rb = b._u32[i];
-        uint32_t ra = a._u32[i];
-        uint32_t exp = (rb >> 23) & 0xFFu;
-        uint32_t base_bits = rb & 0xFFFFFC00u;
-        float base; memcpy(&base, &base_bits, sizeof base);
-        uint32_t step_frac = rb & 0x3FFu;
-        float step = ldexpf((float)step_frac, (int)exp - 127 - 13);
-        if (base < 0.0f) step = -step;
-        float y = ldexpf((float)(ra & 0x7FFFFu), -19);
-        r._f32[i] = base - step * y;
+        uint32_t rb = b._u32[i], exp = (rb >> 23) & 255u;
+        /* Both encoded terms share the unit 2^(exp-159). The entire
+         * subtraction fits in 34 signed bits, including exponent 255. */
+        int64_t base = exp ? (int64_t)(0x800000u | (rb & 0x7ffc00u)) << 9 : 0;
+        int64_t value = base - (int64_t)(rb & 1023u) * (a._u32[i] & 0x7ffffu);
+        if (rb >> 31) value = -value;
+        uint32_t sign = value < 0 ? 0x80000000u : 0;
+        uint64_t magnitude = (uint64_t)(value < 0 ? -value : value);
+        if (!magnitude) { r._u32[i] = 0; continue; }
+        unsigned top = 0;
+        for (uint64_t n = magnitude; n >>= 1;) ++top;
+        int exponent = (int)exp + (int)top - 32;
+        if (exponent <= 0) r._u32[i] = 0;
+        else if (exponent > 255) r._u32[i] = sign | 0x7fffffffu;
+        else {
+            uint32_t fraction = (uint32_t)(top > 23 ? magnitude >> (top - 23)
+                                                               : magnitude << (23 - top));
+            r._u32[i] = sign | ((uint32_t)exponent << 23) | (fraction & 0x7fffffu);
+        }
     }
     return r;
 }
@@ -125,7 +134,7 @@ int main(void)
     }
     const unsigned order[]={0,1,1,0,1,0,0,1};
     for(unsigned n=0;n<8;++n)
-        measure(order[n]?optimized_fi:reference_fi,order[n]?"optimized":"baseline");
+        measure(order[n]?optimized_fi:reference_fi,order[n]?"runtime":"reference");
     assert(SetThreadAffinityMask(GetCurrentThread(),previous));
     return 0;
 }

@@ -723,6 +723,11 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
     /* Report ~1GB free by default */
     u64 free_blocks = (u64)(1024ULL * 1024 * 1024 / 4096);
 
+#ifdef __EMSCRIPTEN__
+    const char* quota = getenv("PS3_BROWSER_STORAGE_FREE_KB");
+    free_blocks = quota && *quota ? strtoull(quota, NULL, 10) / 4 : 0;
+#endif
+
 #ifdef _WIN32
     {
         char host_path[CELL_FS_MAX_FS_PATH_LENGTH];

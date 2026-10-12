@@ -141,6 +141,10 @@ extern "C" void ps3_install_guest_ptr_trap(void)
     fprintf(stderr, "[ps3] guest-pointer trap armed (%zu MB of the low 4 GB reserved)\n",
             got >> 20);
 }
+#elif defined(__EMSCRIPTEN__)
+// WebAssembly traps are not POSIX signals. Never mmap the runtime's low heap
+// to install a diagnostic guest-pointer trap.
+extern "C" void ps3_install_guest_ptr_trap(void) {}
 #else  /* POSIX */
 
 /* Both signals a fault in the reserved window can arrive on, each with its own
@@ -1559,7 +1563,13 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
     fflush(stderr);
 }
 
-uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
+uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0;
+#ifdef __EMSCRIPTEN__
+    /* DEFLATE reads bytes in its inner loop. Match read32's uninstrumented
+     * path when memory probes are disabled; low-address diagnostics remain. */
+    if (!vm_memory_probes() && (uint32_t)a >= 0x10000u) return vm_base[(uint32_t)a];
+#endif
+    vm_hotmap((uint32_t)a,1);
     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
 #ifdef VM_SAMPLE_READS
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read8  0x%08X ra0=%p ra1=%p\n", (uint32_t)a, __builtin_return_address(0), __builtin_return_address(1)); }
@@ -1595,7 +1605,13 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
           n=0; } }
       else { last=(uint32_t)a; n=0; } }
     return vm_base[(uint32_t)a]; }
-uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
+uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0;
+#ifdef __EMSCRIPTEN__
+    if (!vm_memory_probes() && (uint32_t)a >= 0x10000u) {
+        uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2); return __builtin_bswap16(v);
+    }
+#endif
+    ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
@@ -3050,7 +3066,13 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */
+#ifdef __EMSCRIPTEN__
+    /* The native host-PC inverse map cannot resolve Wasm code offsets from
+     * its function-table pointers. Avoid a JS stack walk on every syscall. */
+    ppu_prof_stamp(ctx, (uint32_t)ctx->lr);
+#else
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
+#endif
     /* PS3_SCTRACE_TID: trace every lv2 syscall made by the loader/worker thread
      * (tid=1) so we can see what it does AFTER receiving its q=1 event and why
      * it never registers handlers / loads assets. */

@@ -355,7 +355,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     { static u32 s_sem_off = 0;
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
       if (method == 0x1D70) {
-        extern void vm_write32(uint32_t a, uint32_t v);
+        extern void vm_write32(uint64_t a, uint32_t v);
         /* The RSX back-end semaphore write swaps bytes 0<->2 of the value (hw
          * quirk); libgcm's cellGcmSetWriteBackEndLabel PRE-swaps to compensate
          * (SDK gcm_implementation_sub.h: "// swap byte 0 and 2"). Writing the
@@ -369,7 +369,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
       }
       if (method == 0x1D74) {
-        extern void vm_write32(uint32_t a, uint32_t v);
+        extern void vm_write32(uint64_t a, uint32_t v);
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
         return 0;
       } }

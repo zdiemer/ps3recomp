@@ -101,6 +101,15 @@ jobs:
           .\test_spu_helpers.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - name: Check SPU extended single precision against exact arithmetic
+        run: |
+          python runtime/spu/tests/test_spu_float_oracle.py spu-float-oracle.bin
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          clang-cl /nologo /W0 /O2 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_spu_float.exe runtime/spu/tests/test_spu_float.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_spu_float.exe spu-float-oracle.bin
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test

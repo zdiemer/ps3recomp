@@ -5634,7 +5634,7 @@ static const float* dc_vertex_attr_canonical(
  * Keep two independently balanced ledgers instead:
  *
  *   packets_seen = packets_queued + packets_movie + packets_queue_full
- *   groups_seen  = groups_executed + every group_drop_* outcome
+ *   groups_seen  = groups_executed + groups_probe_skipped + every group_drop_* outcome
  *
  * An END with no accepted packet is counted separately as groups_empty and is
  * not a render attempt. This makes every early return explicit. */
@@ -5646,6 +5646,7 @@ typedef struct ld_stats {
     unsigned long long groups_seen;
     unsigned long long groups_empty;
     unsigned long long groups_executed;
+    unsigned long long groups_probe_skipped;
     unsigned long long group_drop_fetch;
     unsigned long long group_drop_degenerate;
     unsigned long long group_drop_primitive;
@@ -5722,7 +5723,8 @@ int rsx_live_draw_a010_world_ready(void)
 
 static unsigned long long ld_groups_accounted(void)
 {
-    return g_ld_stats.groups_executed + g_ld_stats.group_drop_fetch +
+    return g_ld_stats.groups_executed + g_ld_stats.groups_probe_skipped +
+           g_ld_stats.group_drop_fetch +
            g_ld_stats.group_drop_degenerate + g_ld_stats.group_drop_primitive +
            g_ld_stats.group_drop_alloc + g_ld_stats.group_drop_pso +
            g_ld_stats.group_drop_ring + g_ld_stats.group_drop_surface;
@@ -7459,23 +7461,59 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g_ld_stats.group_drop_surface++;
         return;
     }
-    /* LD_SKIP_SAMPLING=<hex offset>: drop draws that sample a texture at that
-     * offset. Debug only -- removing a post-process pass shows whether the
-     * scene under it has any colour at all. */
+    /* Debug-only texture suppression. LD_SKIP_SAMPLING sets a fixed hex
+     * offset; LD_SKIP_SAMPLING_FILE overrides it live so a probe can use an
+     * address measured in this run. Missing/invalid files and "off" disable
+     * suppression. Polling is amortized across draws, outside the normal path. */
     { static int64_t skip = -2;
+      static const char* skip_file = (const char*)-1;
+      static u32 skip_poll;
       if (skip == -2) { const char* e = getenv("LD_SKIP_SAMPLING"); skip = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+      if (skip_file == (const char*)-1) skip_file = getenv("LD_SKIP_SAMPLING_FILE");
+      if (skip_file && (skip_poll++ & 511u) == 0) {
+          int64_t next = -1;
+          FILE* probe = fopen(skip_file, "r");
+          if (probe) {
+              unsigned long long offset;
+              char trailing;
+              if (fscanf(probe, "%llx %c", &offset, &trailing) == 1 &&
+                  offset <= UINT32_MAX)
+                  next = (int64_t)offset;
+              fclose(probe);
+          }
+          if (next != skip) {
+              skip = next;
+              fprintf(stderr, "[live-probe] skip sampling offset=%lld frame=%u\n",
+                      (long long)skip, g_ld_frames);
+              fflush(stderr);
+          }
+      }
       if (skip >= 0)
           for (u32 u = 0; u < 16; u++) {
               rsx_dsp_texture st; rsx_dsp_get_texture(&g.rsx, u, &st);
-              if (st.enabled && st.offset == (u32)skip) return;
+              if (st.enabled && st.offset == (u32)skip) {
+                  live_draw_csv_emit(prim, n_tri, "probe_skip_sampling");
+                  g_ld_stats.groups_probe_skipped++;
+                  return;
+              }
           } }
     /* LD_TRACE_PSO=<hex key>: raw vertex attributes + unit-0 texels of the
-     * first three draws with that CSV pso_key. */
+     * first three draws with that CSV pso_key. LD_TRACE_SOURCE_VERTS=<decimal>
+     * selects a source occurrence count instead, useful before a mesh's PSO
+     * is known. Both selectors honor LD_TRACE_SURFACE_GATE. */
     { static u64 tk = 1; static int tn;
       static u32 trace_surf = ~0u;
+      static u32 trace_source_verts = ~0u;
       if (trace_surf == ~0u) { const char* e = getenv("LD_TRACE_SURFACE");
           trace_surf = e ? (u32)strtoul(e, 0, 16) : 0; }
+      if (trace_source_verts == ~0u) { const char* e = getenv("LD_TRACE_SOURCE_VERTS");
+          trace_source_verts = e ? (u32)strtoul(e, 0, 10) : 0; }
       if (tk == 1) { const char* e = getenv("LD_TRACE_PSO"); tk = e ? _strtoui64(e, 0, 16) : 0; }
+      const int trace_match =
+          (tk && live_legacy_pso_key() == tk) ||
+          (trace_surf && target < g.n_surfaces && g.surfaces[target].offset == trace_surf) ||
+          (trace_source_verts &&
+           (dc.n_source_refs ? dc.n_source_refs : dc.n_verts) == trace_source_verts);
       if (tk && live_legacy_pso_key() == tk && tn >= 3) {
           static u32 every;
           if (dc.inl && (++every % 60) == 0)
@@ -7489,15 +7527,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
       static const char* trace_gate = (const char*)-1;
       if (trace_gate == (const char*)-1) trace_gate = getenv("LD_TRACE_SURFACE_GATE");
       int trace_open = 1;
-      if (trace_gate && tn < 3 &&
-          ((tk && live_legacy_pso_key() == tk) ||
-           (trace_surf && target < g.n_surfaces && g.surfaces[target].offset == trace_surf))) {
+      if (trace_gate && tn < 3 && trace_match) {
           FILE* gate = fopen(trace_gate, "rb"); trace_open = gate != NULL;
           if (gate) fclose(gate);
       }
-      if (tn < 3 && trace_open && (long)g_ld_frames >= tfrom &&
-          ((tk && live_legacy_pso_key() == tk) ||
-           (trace_surf && target < g.n_surfaces && g.surfaces[target].offset == trace_surf))) {
+      if (tn < 3 && trace_open && (long)g_ld_frames >= tfrom && trace_match) {
           tn++;
           fprintf(stderr, "[pso-trace] frame=%u surface=%08X key=%016llX decoded=%u\n",
                   g_ld_frames, g.surfaces[target].offset,
@@ -10392,7 +10426,8 @@ void rsx_live_draw_present(u32 buffer_id)
                 "textures[cached=%u/%u full=%llu decodefail=%llu depthSRV=%llu rejectZ=%llu] "
                 "vtex[cached=%u enabled=%llu binds=%llu uploads=%llu refresh=%llu "
                 "unsupported=%llu missingTXL=%llu] divider=%llu "
-                "balance[p=%s g=%s] binds[white=%llu real=%llu surf=%llu] (cumulative)\n",
+                "balance[p=%s g=%s] binds[white=%llu real=%llu surf=%llu] "
+                "probe_skip_sampling=%llu (cumulative)\n",
                 g_ld_frames,
                 g_ld_stats.packets_seen, g_ld_stats.packets_queued,
                 g_ld_stats.packets_movie, g_ld_stats.packets_queue_full,
@@ -10419,7 +10454,8 @@ void rsx_live_draw_present(u32 buffer_id)
                 g_ld_stats.packets_seen == g_ld_stats.packets_queued +
                     g_ld_stats.packets_movie + g_ld_stats.packets_queue_full ? "ok" : "BAD",
                 g_ld_stats.groups_seen == ld_groups_accounted() ? "ok" : "BAD",
-                g_ld_bind_white, g_ld_bind_real, g_ld_bind_surf);
+                g_ld_bind_white, g_ld_bind_real, g_ld_bind_surf,
+                g_ld_stats.groups_probe_skipped);
     /* [fps] heartbeat: direct frame-rate logging, one line per ~5s wall.
      * Exists because pace repeatedly had to be inferred from frame-counter
      * arithmetic and log ordering, and two such inferences were wrong in one

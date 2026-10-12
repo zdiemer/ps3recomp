@@ -1023,6 +1023,17 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 fp_ctrl  = rsx_dsp_shader_control(&g.rsx);
     const u32 cube_mask = eng_cube_mask();
     const u32 vtex_mask = eng_vtex_mask();
+    u32 unnorm_mask = 0;
+    u32 unnorm_dim[16][2] = {{0}};
+    if (!fixed) for (u32 unit = 0; unit < 16; unit++) {
+        rsx_dsp_texture texture;
+        rsx_dsp_get_texture(&g.rsx, unit, &texture);
+        if (!texture.enabled || !(texture.format & RSX_TEX_FMT_UNNORM) ||
+            !texture.width || !texture.height) continue;
+        unnorm_mask |= 1u << unit;
+        unnorm_dim[unit][0] = texture.width;
+        unnorm_dim[unit][1] = texture.height;
+    }
 
     memset(&g.fp_constants, 0, sizeof g.fp_constants);
     if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
@@ -1045,6 +1056,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
         key = eng_fnv1a(&vtex_mask, sizeof vtex_mask, key);
+        /* Coordinate divisors are baked into the fragment source. A texture
+         * size or addressing-mode change must select a different pipeline. */
+        key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
+        if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
     key = eng_fnv1a(&layout->stride, sizeof layout->stride, key);
@@ -1074,6 +1089,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         fi = rsx_fp_decompile_buffered_ex(fp_uc, fp_size, fp_ctrl, cube_mask,
                                           s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
+        if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl,
+                unnorm_mask, unnorm_dim, cube_mask) < 0) fi = -1;
         if (fi > 0 && rs->alpha_test_enable &&
             rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
                                              rs->alpha_func) < 0)
@@ -1284,6 +1301,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES])
 {
     u32 mask = 0;
+    u32 feedback[RSX_BE_MAX_COLOR_TARGETS] = {0};
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
@@ -1296,15 +1314,28 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             if (!g.surfaces[i].handle || g.surfaces[i].location != t.location ||
                 g.surfaces[i].offset != t.offset)
                 continue;
-            /* Not one this draw writes: reading a target a pass is writing
-             * is undefined on every API, and an MRT set writes more than
-             * one of them. */
+            /* RSX texture caches permit a read-before-write pass. Host APIs
+             * need a separate snapshot; guest VRAM does not contain the
+             * pixels rendered by earlier GPU draws. */
             int own = 0;
-            for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) own = 1;
+            for (u32 k = 0; k < n_targets; k++) if (target_slots[k] == i) {
+                own = 1;
+                if (g.be->color_snapshot) {
+                    if (!feedback[k]) feedback[k] =
+                        g.be->color_snapshot(g.be->user, g.surfaces[i].handle);
+                    const u32 copy = feedback[k];
+                    const u32 view = copy && g.be->surface_view
+                        ? g.be->surface_view(g.be->user, copy, t.remap & 0xFFFFu, t.format)
+                        : 0;
+                    textures[u] = view ? view : copy;
+                }
+                break;
+            }
             if (own) break;
             sampled = (int)i;
             break;
         }
+        if (textures[u]) continue;
         if (sampled >= 0) {
             const u32 view = g.be->surface_view
                 ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
@@ -1550,8 +1581,25 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         /* Every target the set names, not only A: a deferred pass clears its
          * whole G-buffer in one CLEAR_SURFACE, and B, C and D would otherwise
          * keep whatever the last frame left in them. */
-        for (u32 i = 0; i < n_targets; i++)
-            g.be->clear_color(g.be->user, g.surfaces[targets[i]].handle, rgba);
+        for (u32 i = 0; i < n_targets; i++) {
+            const eng_surface* surface = &g.surfaces[targets[i]];
+            if (!g.be->clear_color_rect) {
+                g.be->clear_color(g.be->user, surface->handle, rgba);
+                continue;
+            }
+            u32 x = 0, y = 0, right = surface->w, bottom = surface->h;
+            if (g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] ||
+                g.rsx.seen[M_SCISSOR_VERTICAL >> 2]) {
+                const u32 h = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+                const u32 v = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+                x = h & 0xFFFFu; y = v & 0xFFFFu;
+                if (x + (h >> 16) < right) right = x + (h >> 16);
+                if (y + (v >> 16) < bottom) bottom = y + (v >> 16);
+            }
+            if (right > x && bottom > y)
+                g.be->clear_color_rect(g.be->user, surface->handle, rgba,
+                    (mask >> 4) & 15u, x, y, right - x, bottom - y);
+        }
     }
     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
         rsx_dsp_surface sf;
@@ -1562,12 +1610,14 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         u32 flags = 0;
         if (mask & RSX_CLEAR_DEPTH)   flags |= RSX_BE_CLEAR_DEPTH;
         if (mask & RSX_CLEAR_STENCIL) flags |= RSX_BE_CLEAR_STENCIL;
-        /* ZSTENCIL_CLEAR_VALUE is Z24S8: depth24 << 8 | stencil8, with the
-         * nv40 reset 0xFFFFFF00 seeded by rsx_dispatch_init, so a stream that
-         * never writes it still clears to 1.0 / 0. */
+        /* Z16 stores depth in the low word; Z24S8 puts it above stencil.
+         * Match the live renderer's shadow-clear correction. Zero is a valid
+         * near-depth clear; the dispatcher already supplies the reset value. */
         const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
         g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
-                                  zs ? (float)(zs >> 8) / 16777215.0f : 1.0f,
+                                  sf.depth_format == 1u
+                                    ? (float)(zs & 0xFFFFu) / 65535.0f
+                                    : (float)(zs >> 8) / 16777215.0f,
                                   (u8)(zs & 0xFFu));
         g.zdepths[zslot].cleared = 1;
         if (mask & RSX_CLEAR_DEPTH) {
