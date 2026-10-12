@@ -52,6 +52,9 @@ int  rsx_live_draw_enabled(void);
  * Call before init. Custom RSX_RENDER_RESOLUTION scales this scene to the
  * requested size; an unset option preserves all native dimensions. */
 void rsx_live_draw_set_render_reference(u32 width, u32 height);
+/* Optional square shadow atlas size. Independent shadow scaling applies to
+ * all raster attachments of this exact guest extent. Call before init. */
+void rsx_live_draw_set_shadow_reference(u32 size);
 
 /* Bring up the D3D12 device + swap chain bound to an existing HWND (the
  * runtime already opens the present window). Returns 0 on success. Safe to

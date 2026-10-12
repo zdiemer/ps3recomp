@@ -512,11 +512,13 @@ static void resolution_tests(void)
     OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.dsv_heap));
     g.dsv_step=g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev,hd.Type);
     g.width=g.height=8; g.ready=1;
-    const char* sizes[]={"8x8","12x12","16x16","11x13"};
+    const char* sizes[]={"8x8","12x12","16x16","11x13","12x12","native"};
     ID3D12Resource* rb=buffer(D3D12_HEAP_TYPE_READBACK);
-    for (u32 mode=0;mode<4;++mode) {
+    for (u32 mode=0;mode<6;++mode) {
         assert(rsx_render_resolution_parse(&g_ld_resolution,8,8,sizes[mode])==0);
         g_ld_resolution.reference_w=g_ld_resolution.reference_h=6;
+        g_ld_resolution.shadow_guest=4;
+        g_ld_resolution.shadow_host=mode==4 ? 3 : mode==5 ? 10 : 0;
         OK(g.alloc->lpVtbl->Reset(g.alloc)); OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
         g.n_surfaces=g.n_zdepths=0;
         u32 source=surface_get(0,0x1000,8,8,DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -527,12 +529,37 @@ static void resolution_tests(void)
         D3D12_RESOURCE_DESC desc; sf->tex->lpVtbl->GetDesc(sf->tex,&desc);
         assert(desc.Width==g_ld_resolution.host_w && desc.Height==g_ld_resolution.host_h);
         u32 scene=surface_get(0,0x4000,6,6,DXGI_FORMAT_R8G8B8A8_UNORM);
-        assert(g.surfaces[scene].w==desc.Width && g.surfaces[scene].h==desc.Height);
+        assert(g.surfaces[scene].w==(mode==5 ? 6 : desc.Width) &&
+            g.surfaces[scene].h==(mode==5 ? 6 : desc.Height));
+        u32 atlas_w,atlas_h;
+        rsx_render_surface_extent(&g_ld_resolution,4,4,&atlas_w,&atlas_h);
+        u32 atlas=surface_get(0,0x5000,4,4,DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert(g.surfaces[atlas].w==atlas_w && g.surfaces[atlas].h==atlas_h);
+        u32 atlas_z=zdepth_get(0,0x6000,4,4); assert(atlas_z);
+        assert(g.zdepths[atlas_z-1].snapshot_w==atlas_w && g.zdepths[atlas_z-1].snapshot_h==atlas_h);
         u32 ox,oy; assert(surface_containing(0,0x1000+32+4,32,7,7,&ox,&oy)==(int)source && ox==1 && oy==1);
         assert(surface_containing(0,0x1000+32+4,32,8,8,&ox,&oy)<0);
         u32 zslot=zdepth_get(0,0x3000,8,8); assert(zslot);
         assert(g.zdepths[zslot-1].snapshot_w==desc.Width && g.zdepths[zslot-1].snapshot_h==desc.Height);
         rsx_dispatch_init(&g.rsx,NULL);
+        rsx_dispatch_method(&g.rsx,0x0200,4u<<16);
+        rsx_dispatch_method(&g.rsx,0x0204,4u<<16);
+        rsx_dispatch_method(&g.rsx,0x0208,8);
+        rsx_dispatch_method(&g.rsx,0x020C,16);
+        rsx_dispatch_method(&g.rsx,0x0210,0x5000);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_HORIZONTAL,4u<<16);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_VERTICAL,4u<<16);
+        rsx_dispatch_method(&g.rsx,0x1D90,0xFF000000); sink_clear(NULL,&g.rsx,0xF0);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_HORIZONTAL,(2u<<16)|1u);
+        rsx_dispatch_method(&g.rsx,M_SCISSOR_VERTICAL,(2u<<16)|1u);
+        rsx_dispatch_method(&g.rsx,0x1D90,0xFF00FF00); sink_clear(NULL,&g.rsx,0xF0);
+        D3D12_RESOURCE_BARRIER atlas_bar={0}; atlas_bar.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        atlas_bar.Transition.pResource=g.surfaces[atlas].tex;
+        atlas_bar.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        atlas_bar.Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET;
+        atlas_bar.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g.list->lpVtbl->ResourceBarrier(g.list,1,&atlas_bar);
+        read_subresource(g.surfaces[atlas].tex,0,rb,65536,DXGI_FORMAT_R8G8B8A8_UNORM,atlas_w,atlas_h);
         rsx_dispatch_method(&g.rsx,0x0194,0xFEED0000);
         rsx_dispatch_method(&g.rsx,0x0200,8u<<16); // surface clip
         rsx_dispatch_method(&g.rsx,0x0204,8u<<16);
@@ -564,6 +591,11 @@ static void resolution_tests(void)
             const u8* pixel=bytes+y*256+x*4;
             assert(pixel[0]==(inside?255:0) && pixel[1]==0 && pixel[2]==255 && pixel[3]==255);
         }
+        for(u32 y=0;y<atlas_h;++y)for(u32 x=0;x<atlas_w;++x) {
+            const int inside=x>=atlas_w/4 && x<3*atlas_w/4 && y>=atlas_h/4 && y<3*atlas_h/4;
+            const u8* pixel=bytes+65536+y*256+x*4;
+            assert(pixel[0]==0 && pixel[1]==(inside?255:0) && pixel[2]==0 && pixel[3]==255);
+        }
         rb->lpVtbl->Unmap(rb,0,NULL);
         for(u32 i=0;i<g.n_surfaces;++i)g.surfaces[i].tex->lpVtbl->Release(g.surfaces[i].tex);
         for(u32 i=0;i<g.n_zdepths;++i) {
@@ -577,7 +609,95 @@ static void resolution_tests(void)
     rb->lpVtbl->Release(rb); g.rtv_heap->lpVtbl->Release(g.rtv_heap);
     g.srv_cpu_heap->lpVtbl->Release(g.srv_cpu_heap); g.dsv_heap->lpVtbl->Release(g.dsv_heap);
     g.rtv_heap=g.srv_cpu_heap=g.dsv_heap=NULL;
-    puts("Custom resolution GPU readbacks: native, 1.5x, 2x and fractional asymmetric targets; masked scissor clears, guest address bounds, depth dimensions and GPU blits passed.");
+    puts("Custom resolution GPU readbacks: native, 1.5x, 2x, fractional asymmetric targets and independent shadow atlases; masked scissor clears, guest address bounds, depth dimensions and GPU blits passed.");
+}
+static void graphics_sampler_tests(void)
+{
+    rsx_dsp_texture t={0}; t.dimension=2; t.format=0x86; t.mipmaps=8;
+    t.filter=0x02060000; t.control0=0x80000000u|(7u*256u<<7);
+    for (u32 af=1;af<=16;af*=2) {
+        g_ld_anisotropy=af; g_ld_mip_bias=-0.5f;
+        D3D12_SAMPLER_DESC sd=decode_sampler(&t);
+        assert(sd.MaxAnisotropy==af && sd.MipLODBias==-0.5f);
+        assert(sd.Filter==(af==1 ? D3D12_FILTER_MIN_MAG_MIP_LINEAR : D3D12_FILTER_ANISOTROPIC));
+    }
+    const u64 quality_key=sampler_key(&t);
+    t.filter=0x01010000; assert(decode_sampler(&t).MaxAnisotropy==1 && decode_sampler(&t).MipLODBias==0);
+    t.filter=0x02060000; t.format=0xB2; assert(decode_sampler(&t).MaxAnisotropy==1 && decode_sampler(&t).MipLODBias==0 && sampler_key(&t)!=quality_key);
+    t.format=0x86|TEX_FMT_UNNORM; assert(decode_sampler(&t).MaxAnisotropy==1 && sampler_key(&t)!=quality_key);
+    t.format=0x86|TEX_FMT_LINEAR; assert(decode_sampler(&t).MaxAnisotropy==1 && sampler_key(&t)!=quality_key);
+    t.format=0x86; t.mipmaps=1; assert(decode_sampler(&t).MaxAnisotropy==1 && sampler_key(&t)!=quality_key);
+    g_ld_anisotropy=1; g_ld_mip_bias=0;
+    puts("Graphics samplers: 1/2/4/8/16x AF and negative mip bias; point/UI/depth/single-mip exclusions passed.");
+}
+static void postprocess_tests(void)
+{
+    const u32 w=19,h=13; // Non-multiple dispatch dimensions exercise bounds.
+    rsx_postprocess p={0}; assert(rsx_postprocess_init(&p,g.dev,w,h)==0);
+    ID3D12Resource* rb=buffer(D3D12_HEAP_TYPE_READBACK);
+    D3D12_HEAP_PROPERTIES hp={0}; hp.Type=D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd={0}; rd.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width=w; rd.Height=h; rd.DepthOrArraySize=rd.MipLevels=1;
+    rd.Format=DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count=1;
+    rd.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource* image;
+    OK(g.dev->lpVtbl->CreateCommittedResource(g.dev,&hp,D3D12_HEAP_FLAG_NONE,&rd,
+        D3D12_RESOURCE_STATE_COPY_DEST,NULL,&IID_ID3D12Resource,(void**)&image));
+    for(u32 y=0;y<h;++y)for(u32 x=0;x<w;++x) {
+        u8* px=g.upload_mapped+y*256+x*4;
+        px[0]=px[1]=px[2]=x<=y ? 64:192; px[3]=137;
+        if (x==15) px[0]=px[1]=px[2]=128;
+        if (x==16) px[0]=px[1]=px[2]=144;
+    }
+    for(u32 mode=0;mode<4;++mode) {
+        OK(g.alloc->lpVtbl->Reset(g.alloc)); OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
+        D3D12_RESOURCE_BARRIER bar={0}; bar.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bar.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        if (!mode) {
+            D3D12_TEXTURE_COPY_LOCATION src={0},dst={0};
+            src.pResource=g.upload; src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint.Footprint.Format=rd.Format; src.PlacedFootprint.Footprint.Width=w;
+            src.PlacedFootprint.Footprint.Height=h; src.PlacedFootprint.Footprint.Depth=1;
+            src.PlacedFootprint.Footprint.RowPitch=256;
+            dst.pResource=image; dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            g.list->lpVtbl->CopyTextureRegion(g.list,&dst,0,0,0,&src,NULL);
+            bar.Transition.pResource=image; bar.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_DEST;
+            bar.Transition.StateAfter=D3D12_RESOURCE_STATE_RENDER_TARGET; g.list->lpVtbl->ResourceBarrier(g.list,1,&bar);
+        }
+        ID3D12Resource* out=rsx_postprocess_run(&p,g.dev,g.list,image,mode==1,mode==2 ? 1.0f:0,mode==3 ? -1.0f:0);
+        bar.Transition.pResource=out; bar.Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET;
+        bar.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; g.list->lpVtbl->ResourceBarrier(g.list,1,&bar);
+        read_subresource(out,0,rb,0,rd.Format,w,h);
+        bar.Transition.pResource=image; g.list->lpVtbl->ResourceBarrier(g.list,1,&bar);
+        read_subresource(image,0,rb,65536,rd.Format,w,h);
+        bar.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE; bar.Transition.StateAfter=D3D12_RESOURCE_STATE_RENDER_TARGET;
+        g.list->lpVtbl->ResourceBarrier(g.list,1,&bar);
+        bar.Transition.pResource=out; g.list->lpVtbl->ResourceBarrier(g.list,1,&bar);
+        OK(g.list->lpVtbl->Close(g.list)); ID3D12CommandList* lists[]={(ID3D12CommandList*)g.list};
+        g.queue->lpVtbl->ExecuteCommandLists(g.queue,1,lists);
+        OK(g.queue->lpVtbl->Signal(g.queue,g.fence,200+mode));
+        OK(g.fence->lpVtbl->SetEventOnCompletion(g.fence,200+mode,g.fence_event));
+        assert(WaitForSingleObject(g.fence_event,10000)==WAIT_OBJECT_0);
+        u8* bytes; OK(rb->lpVtbl->Map(rb,0,NULL,(void**)&bytes));
+        u32 smoothed=0,sharpened=0;
+        for(u32 y=0;y<h;++y)for(u32 x=0;x<w;++x) {
+            u8* px=bytes+y*256+x*4; const u8 expected=g.upload_mapped[y*256+x*4];
+            assert(!memcmp(bytes+65536+y*256+x*4,g.upload_mapped+y*256+x*4,4)); // Guest image unchanged.
+            assert(px[3]==137);
+            if(mode==0) assert(abs((int)px[0]-expected)<=1);
+            if(mode==2) {
+                assert(px[0]>=64 && px[0]<=192);
+                if(abs((int)px[0]-expected)>2) ++sharpened;
+            }
+            if(mode==3) assert(abs((int)px[0]-expected/2)<=1);
+            if(mode==1 && px[0]>65 && px[0]<191) ++smoothed;
+        }
+        if(mode==1) assert(smoothed>8);
+        if(mode==2) assert(sharpened>=h);
+        rb->lpVtbl->Unmap(rb,0,NULL);
+    }
+    rsx_postprocess_destroy(&p); image->lpVtbl->Release(image); rb->lpVtbl->Release(rb);
+    puts("Presentation GPU readbacks: FXAA smooths diagonal edges, sharpening increases detail within local bounds, exposure halves RGB, alpha and guest image preserved.");
 }
 static void shadow_sampler_tests(void)
 {
@@ -683,6 +803,7 @@ static void topology_copy_benchmark(void)
 int main(void)
 {
     shadow_sampler_tests();
+    graphics_sampler_tests();
     cache_tests();
     fetch_tests();
     reference_batch_tests();
@@ -737,6 +858,7 @@ int main(void)
     readback->lpVtbl->Unmap(readback,0,NULL);
     bias_tests();
     resolution_tests();
+    postprocess_tests();
     rgb->lpVtbl->Release(rgb); cube->lpVtbl->Release(cube); readback->lpVtbl->Release(readback);
     g.upload->lpVtbl->Unmap(g.upload,0,NULL); g.upload->lpVtbl->Release(g.upload);
     g.list->lpVtbl->Release(g.list); g.alloc->lpVtbl->Release(g.alloc);

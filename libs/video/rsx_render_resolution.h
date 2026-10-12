@@ -3,11 +3,13 @@
 #ifndef RSX_RENDER_RESOLUTION_H
 #define RSX_RENDER_RESOLUTION_H
 #include <stdint.h>
+#include <string.h>
 
 typedef struct {
     uint32_t guest_w, guest_h, host_w, host_h;
     uint32_t reference_w, reference_h;
     int custom;
+    uint32_t shadow_guest, shadow_host;
 } rsx_render_resolution;
 
 static int rsx_render_resolution_parse(rsx_render_resolution* r,
@@ -15,7 +17,7 @@ static int rsx_render_resolution_parse(rsx_render_resolution* r,
 {
     *r = (rsx_render_resolution){w, h, w, h, w, h, 0};
     if (!w || !h) return -1;
-    if (!option || !*option) return 0;
+    if (!option || !*option || !strcmp(option,"native")) return 0;
     /* Strict decimal WIDTHxHEIGHT; reject partial values and overflow. */
     uint32_t values[2] = {0, 0};
     const char* at = option;
@@ -50,6 +52,9 @@ static uint32_t rsx_render_edge(uint32_t n, uint32_t guest, uint32_t host)
 static void rsx_render_surface_extent(const rsx_render_resolution* r,
     uint32_t w, uint32_t h, uint32_t* host_w, uint32_t* host_h)
 {
+    if (r->shadow_guest && r->shadow_host && w==r->shadow_guest && h==r->shadow_guest) {
+        *host_w=*host_h=r->shadow_host; return;
+    }
     if (!r->custom) { *host_w=w; *host_h=h; return; }
     /* A title can render below scanout size. Both its main scene and its
      * final display target should reach the selected dimensions. */
