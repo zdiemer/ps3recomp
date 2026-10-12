@@ -91,6 +91,9 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <stdlib.h>
 #include "rsx_texture_write_watch.h"
 
+/* Bulk references, dense remapping, specialized vertex decoding and triangle
+ * copies. Registering a native write tracker also enables regional reuse. */
+static unsigned g_ld_cpu_work=1283;
 static rsx_texture_write_watch g_texture_watch;
 static u64 g_texture_watch_queries, g_texture_watch_dirty_pages;
 static u64 g_texture_watch_skips, g_texture_watch_skip_bytes;
@@ -98,7 +101,9 @@ static u64 g_texture_watch_audits, g_texture_watch_races, g_texture_watch_failur
 int rsx_live_draw_set_texture_write_watch(void* base, size_t bytes)
 {
     if (g_texture_watch.base) return 0;
-    return rsx_texture_write_watch_init(&g_texture_watch, base, bytes);
+    const int registered = rsx_texture_write_watch_init(&g_texture_watch, base, bytes);
+    if (registered) g_ld_cpu_work |= 4096u;
+    return registered;
 }
 static void ld_texture_watch_summary(void)
 {
@@ -188,10 +193,6 @@ static unsigned g_ld_depth_export;
 static unsigned g_ld_window_position = 1;
 /* Correct Z16 clear packing; the file control permits native A/B validation. */
 static unsigned g_ld_depth_clear = 1;
-/* Default: bulk references (1), dense remapping (2), specialized vertex
- * decoding (256), and validated triangle remap copies (1024). Live changes
- * apply at presentation boundaries for independent comparisons. */
-static unsigned g_ld_cpu_work=1283;
 static rsx_vp_program_cache g_ld_vp_program_cache;
 static int g_ld_vertex_cache_enabled=-1;
 static int ld_vertex_cache_enabled(void)
