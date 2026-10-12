@@ -113,6 +113,14 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
 int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size);
 
+/* Depth-comparison variant. Selected 2D units use comparison samplers and
+ * compare TEX's source Z, or TXP's projected source Z/W. Other units retain
+ * ordinary sampling. A selected cube unit or unsupported shadow texture
+ * opcode returns -1 rather than silently emitting a raw depth read. */
+int rsx_fp_decompile_shadow_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
+    u32 tex_cube_mask, u32 tex_shadow_mask, int buffered,
+    char* out, u32 out_size, u32* out_constant_count);
+
 /* Buffered-constant variant of rsx_fp_decompile_ex. Inline CONST payloads are
  * represented as fp_constants[N] in a b1 PSConstants cbuffer rather than
  * printed as HLSL literals. `out_constant_count` receives the exact slot

@@ -483,8 +483,49 @@ static void bias_tests(void)
     puts("Coplanar decal GPU readback: zero/positive bias occluded, negative bias visible");
     puts("Guest depth clip reset/state/key and GPU readback: near/far clipped only when requested; valid depths preserved; negative W always clipped");
 }
+static void shadow_sampler_tests(void)
+{
+    rsx_dsp_texture t={0};t.enabled=1;t.dimension=2;t.format=0xB2;
+    t.wrap=0x60030303;t.filter=0x02022000;t.control0=0x80000000;
+    const unsigned saved=g_ld_shadow_compare;g_ld_shadow_compare=0;
+    const u64 raw_key=sampler_key(&t);
+    assert(!ld_texture_shadow(&t));
+    assert(decode_sampler(&t).Filter==D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT);
+    g_ld_shadow_compare=1;
+    assert(ld_texture_shadow(&t));
+    D3D12_SAMPLER_DESC sd=decode_sampler(&t);
+    assert(sd.Filter==D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT);
+    assert(sd.ComparisonFunc==D3D12_COMPARISON_FUNC_LESS_EQUAL);
+    assert(sd.AddressU==D3D12_TEXTURE_ADDRESS_MODE_CLAMP && sd.AddressV==sd.AddressU && sd.AddressW==sd.AddressU);
+    assert(sd.MinLOD==0 && sd.MaxLOD==0);
+    const u64 key=sampler_key(&t);assert(key!=raw_key);
+    const D3D12_COMPARISON_FUNC expected[8]={D3D12_COMPARISON_FUNC_NEVER,
+        D3D12_COMPARISON_FUNC_GREATER,D3D12_COMPARISON_FUNC_EQUAL,
+        D3D12_COMPARISON_FUNC_GREATER_EQUAL,D3D12_COMPARISON_FUNC_LESS,
+        D3D12_COMPARISON_FUNC_NOT_EQUAL,D3D12_COMPARISON_FUNC_LESS_EQUAL,
+        D3D12_COMPARISON_FUNC_ALWAYS};
+    for(u32 c=1;c<7;++c) {
+        t.wrap=(t.wrap&0x0FFFFFFFu)|(c<<28);
+        assert(decode_sampler(&t).ComparisonFunc==expected[c]);
+        if(c!=6)assert(sampler_key(&t)!=key);
+    }
+    t.wrap=0x60030303;
+    for(u32 bit=7;bit<=30;++bit) {
+        t.control0=0x80000000u|(1u<<bit);assert(sampler_key(&t)!=key);
+    }
+    t.control0=0x80000004;assert(!ld_texture_shadow(&t));
+    t.control0=0x80000000;t.wrap^=1u<<16;assert(sampler_key(&t)!=key);
+    t.wrap=0x60030303;t.cubemap=1;assert(!ld_texture_shadow(&t));
+    t.cubemap=0;t.dimension=3;assert(!ld_texture_shadow(&t));
+    t.dimension=2;t.format=0x85;assert(!ld_texture_shadow(&t));
+    t.format=0xB2;t.wrap=0x00030303;assert(!ld_texture_shadow(&t));
+    t.wrap=0x70030303;assert(!ld_texture_shadow(&t));
+    g_ld_shadow_compare=saved;
+    puts("Shadow sampler: Haze LEQUAL/linear state, six NV40 comparisons, exact LOD/R identity, raw/cube/color exclusions passed");
+}
 int main(void)
 {
+    shadow_sampler_tests();
     cache_tests();
     fetch_tests();
     reference_batch_tests();
