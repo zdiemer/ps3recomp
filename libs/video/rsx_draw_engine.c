@@ -1610,12 +1610,14 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         u32 flags = 0;
         if (mask & RSX_CLEAR_DEPTH)   flags |= RSX_BE_CLEAR_DEPTH;
         if (mask & RSX_CLEAR_STENCIL) flags |= RSX_BE_CLEAR_STENCIL;
-        /* ZSTENCIL_CLEAR_VALUE is Z24S8: depth24 << 8 | stencil8, with the
-         * nv40 reset 0xFFFFFF00 seeded by rsx_dispatch_init, so a stream that
-         * never writes it still clears to 1.0 / 0. */
+        /* Z16 stores depth in the low word; Z24S8 puts it above stencil.
+         * Match the live renderer's shadow-clear correction. Zero is a valid
+         * near-depth clear; the dispatcher already supplies the reset value. */
         const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
         g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
-                                  zs ? (float)(zs >> 8) / 16777215.0f : 1.0f,
+                                  sf.depth_format == 1u
+                                    ? (float)(zs & 0xFFFFu) / 65535.0f
+                                    : (float)(zs >> 8) / 16777215.0f,
                                   (u8)(zs & 0xFFu));
         g.zdepths[zslot].cleared = 1;
         if (mask & RSX_CLEAR_DEPTH) {

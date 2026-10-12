@@ -72,6 +72,8 @@ typedef struct {
     int n_draw, n_clear_color, n_clear_ds, n_present;
     u32 cleared[STUB_MAX_CLEARED];
     u32 clear_channels, clear_rect[4];
+    float clear_depth;
+    u8 clear_stencil;
 
     /* the last draw's bindings */
     u32 bound_tex[RSX_BE_MAX_TEXTURES];
@@ -230,7 +232,7 @@ static void stub_clear_color(void* u, u32 s, const float rgba[4])
 }
 
 static void stub_clear_ds(void* u, u32 d, u32 f, float z, u8 s)
-{ (void)u; (void)d; (void)f; (void)z; (void)s; stub.n_clear_ds++; }
+{ (void)u; (void)d; (void)f; stub.clear_depth=z; stub.clear_stencil=s; stub.n_clear_ds++; }
 
 static void stub_clear_color_rect(void* u, u32 surface, const float rgba[4],
                                   u32 channels, u32 x, u32 y, u32 w, u32 h)
@@ -313,6 +315,7 @@ static const rsx_draw_backend g_stub_backend = {
 #define M_TEX_UNIT            0x1A00   /* + unit * 0x20 */
 #define M_STENCIL_FUNC_REF    0x0334
 #define M_CLEAR_BUFFERS       0x1D94
+#define M_ZSTENCIL_CLEAR      0x1D8C
 #define M_VP_UPLOAD_CONST_ID  0x1EFC
 #define M_VP_UPLOAD_CONST     0x1F00
 
@@ -1081,6 +1084,31 @@ static void test_inline_array(void)
     engine_down();
 }
 
+static void test_depth_clear_packing(void)
+{
+    printf("-- depth clear packing\n");
+    engine_up();
+    m(M_ZETA_OFFSET, 0x60000u);
+    m(M_SURFACE_FORMAT, 1u << 5); /* Z16 shadow atlas */
+    m(M_ZSTENCIL_CLEAR, 0x0000FFFFu);
+    m(M_CLEAR_BUFFERS, 1u);
+    CHECK(stub.n_clear_ds == 1 && stub.clear_depth == 1.0f,
+          "Z16 shadow clear uses the low 16 bits as far depth");
+    m(M_ZSTENCIL_CLEAR, 0);
+    m(M_CLEAR_BUFFERS, 1u);
+    CHECK(stub.clear_depth == 0.0f, "zero is a valid Z16 near-depth clear");
+    m(M_SURFACE_FORMAT, 2u << 5); /* Z24S8 */
+    m(M_ZSTENCIL_CLEAR, 0xFFFFFF37u);
+    m(M_CLEAR_BUFFERS, 3u);
+    CHECK(stub.clear_depth == 1.0f && stub.clear_stencil == 0x37,
+          "Z24S8 decodes depth above the stencil byte");
+    m(M_ZSTENCIL_CLEAR, 0x000000ABu);
+    m(M_CLEAR_BUFFERS, 3u);
+    CHECK(stub.clear_depth == 0.0f && stub.clear_stencil == 0xAB,
+          "Z24S8 preserves zero depth and its independent stencil value");
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1103,6 +1131,7 @@ int main(void)
     test_indexed_draws();
     test_scissor();
     test_color_clear_mask();
+    test_depth_clear_packing();
     test_color_feedback();
     test_readback();
     test_custom_guest_mapping();
