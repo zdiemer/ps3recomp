@@ -220,6 +220,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         static _Thread_local int initialized = 0;
         static _Thread_local unsigned checks = 0;
         static _Thread_local unsigned mode = 0;
+        static _Thread_local int reported = -1;
         if (!initialized) {
             control = getenv("PS3_USLEEP_MODE_FILE");
             initialized = 1;
@@ -229,11 +230,16 @@ int64_t sys_timer_usleep(ppu_context* ctx)
             if (file) {
                 if (fscanf(file,"%u",&flags)==1 && mode!=(flags & 8u)) {
                     mode=flags & 8u;
-                    fprintf(stderr,"[usleep-mode] guest_tid=%llu timer=%u\n",
-                        (unsigned long long)ctx->thread_id,mode!=0);
                 }
                 fclose(file);
             }
+        }
+        if (control && reported != (int)mode) {
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            fprintf(stderr,"[usleep-mode] tid=%lu guest_tid=%llu timer=%u qpc=%lld\n",
+                GetCurrentThreadId(), (unsigned long long)ctx->thread_id,
+                mode!=0, now.QuadPart);
+            reported = (int)mode;
         }
         if (mode && usec>=50 && ps3_usleep_high_resolution(usec)) return CELL_OK;
     }
