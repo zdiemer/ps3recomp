@@ -40,6 +40,7 @@
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../spu/spu_overlay_registry.h"
+#include "../spu/spu_coherency.h"
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #ifndef _WIN32
@@ -768,18 +769,13 @@ void ps3_sampler_start(void) {}
 extern "C" uint8_t* vm_base;   /* defined by the host */
 extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below) */
 
-/* PPU <-> SPU lock-line coherence (runtime/spu/spu_coherency.c). A store by
- * lifted guest code into a 128-byte line an SPU has reserved with GETLLAR has
+/* PPU <-> SPU lock-line coherence (runtime/spu/spu_coherency.c). A store via
+ * these out-of-line PPU accessors into a 128-byte line reserved with GETLLAR has
  * to serialize through the SPU lock-line lock, or it can land inside a PUTLLC's
  * compare and be written straight back over; and it has to raise SPU_EVENT_LR,
  * which is how an SPURS idle service parked in `rdch SPU_RdEventStat` finds out
- * work was posted. spu_coh_is_reserved reads a global that stays zero until an
- * SPU reserves its first line, so an ordinary store pays one branch. */
-extern "C" int  spu_coh_is_reserved(uint32_t addr);
-extern "C" void spu_lockline_lock(void);
-extern "C" void spu_lockline_unlock(void);
-extern "C" void spu_coh_notify_write(uint32_t addr);
-
+ * work was posted. The optional inline predicate remains disabled unless
+ * PPU_INLINE_COH_CHECK=ON is present at startup. */
 /* ---------------------------------------------------------------------------
  * lwarx/stwcx. cross-thread reservation invalidation.
  *
@@ -1413,6 +1409,7 @@ static inline bool vm_memory_probes(void)
  * PPU_INLINE_READS=ON. Keep it disabled until ppu_run initializes the exact
  * same immutable diagnostic decision used by the out-of-line accessors. */
 extern "C" int ppu_native_reads_inline_enabled = 0;
+static int ppu_inline_coh_predicate_enabled = 0;
 extern "C" void ppu_native_reads_inline_init(void)
 {
     static int initialized = 0;
@@ -1426,11 +1423,17 @@ extern "C" void ppu_native_reads_inline_init(void)
 
     const char* request = getenv("PPU_INLINE_READS");
     const int requested = request && strcmp(request, "ON") == 0;
+    const char* coh_request = getenv("PPU_INLINE_COH_CHECK");
+    const int coh_requested = coh_request && strcmp(coh_request, "ON") == 0;
     const int probes = vm_memory_probes() ? 1 : 0;
     ppu_native_reads_inline_enabled = requested && !probes && vm_base;
+    ppu_inline_coh_predicate_enabled = coh_requested && !probes && vm_base;
     fprintf(stderr,
         "[ppu-inline-reads] enabled=%d requested=%d probes=%d vm=%d\n",
         ppu_native_reads_inline_enabled, requested, probes, vm_base != NULL);
+    fprintf(stderr,
+        "[ppu-inline-coh] enabled=%d requested=%d probes=%d vm=%d\n",
+        ppu_inline_coh_predicate_enabled, coh_requested, probes, vm_base != NULL);
     __atomic_store_n(&initialized, 2, __ATOMIC_RELEASE);
 }
 /* END PPU INLINE READ ELIGIBILITY */
@@ -1504,7 +1507,10 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
  * them, until SPU code runs) it is the plain memcpy it replaced. */
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
-        if (spu_coh_is_reserved((uint32_t)(a))) {                             \
+        int _coh_reserved = ppu_inline_coh_predicate_enabled                  \
+            ? spu_coh_is_reserved_inline((uint32_t)(a))                       \
+            : spu_coh_is_reserved((uint32_t)(a));                             \
+        if (_coh_reserved) {                                                  \
             spu_lockline_lock();                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
             spu_coh_notify_write((uint32_t)(a));                              \

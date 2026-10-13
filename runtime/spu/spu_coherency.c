@@ -1,13 +1,14 @@
 /*
  * ps3recomp - PPU <-> SPU lock-line coherence
  *
- * See spu_coherency.h for what this is for. The state here is deliberately
- * plain: a bit per 128-byte line, a small table of the SPU contexts that have
+ * See spu_coherency.h for what this is for. The state here is a bit per
+ * 128-byte line, a small table of the SPU contexts that have
  * ever reserved one, and the lock-line spinlock. Everything that WRITES it runs
  * with the lock-line lock held (the SPU's GETLLAR, the PPU's coherent store),
- * so the read-modify-write on a shared bitmap byte is serialized. Only
- * spu_coh_is_reserved reads without the lock, which is the entire point: it is
- * on every PPU store.
+ * so context bookkeeping is serialized. The reservation bitmap is updated
+ * atomically because spu_coh_is_reserved reads it without the lock: it is on
+ * every PPU store, and must observe fresh publications without taking the
+ * lock on the unreserved path.
  */
 
 #include <stdlib.h>
@@ -126,18 +127,15 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
  * line outside a hardcoded window would be silently non-coherent, which is the
  * failure this whole file exists to remove.
  * ===========================================================================*/
-#define SPU_COH_LINE_SHIFT  7                                  /* 128-byte lines */
-#define SPU_COH_LINES       (1u << (32 - SPU_COH_LINE_SHIFT))   /* 2^25 lines */
-#define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
-
-static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
+unsigned char spu_coh_reservation_bitmap[SPU_COH_BITMAP_SIZE];
 
 /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
- * bitmap entirely for a title that runs no SPU code, and keeps every existing
- * test that stores through vm_write* paying one compare against a hot global.
- * Written once, under the lock; read unlocked, where a stale zero costs at most
- * one missed event on the very first reservation of the run. */
-static int s_coh_armed;
+ * bitmap entirely for a title that runs no SPU code. Published atomically after
+ * the first line bit so an acquire-in-program-order first observation sees the
+ * mark. A check that overlaps that first publication may still linearize just
+ * before it and miss that one reservation; the existing protocol does not
+ * serialize an unreserved PPU store against a concurrent first reservation. */
+uint32_t spu_coh_reservations_armed;
 
 /* Compact live set, always accessed under the lock-line lock. Async jobs may
  * outnumber physical SPUs, so an eight-entry ceiling can lose real holders. */
@@ -149,8 +147,14 @@ unsigned long g_spu_lr_raise = 0;
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
-    s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
-    s_coh_armed = 1;
+    /* Reservation publishers hold the lock-line lock, so they can preserve
+     * neighboring bits with an ordinary read followed by an atomic release
+     * store. The PPU predicate reads this byte concurrently without that lock. */
+    unsigned char* byte = &spu_coh_reservation_bitmap[line >> 3];
+    unsigned char bits = spu_coh_atomic_load_u8_relaxed(byte);
+    bits |= (unsigned char)(1u << (line & 7));
+    spu_coh_atomic_store_u8(byte, bits);
+    spu_coh_atomic_store_u32(&spu_coh_reservations_armed, 1u);
 
     if (!ctx) return;
     /* Search the whole live set before inserting. Filling an early hole
@@ -218,9 +222,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 
 int spu_coh_is_reserved(uint32_t addr)
 {
-    if (!s_coh_armed) return 0;
-    uint32_t line = addr >> SPU_COH_LINE_SHIFT;
-    return (s_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+    return spu_coh_is_reserved_inline(addr);
 }
 
 /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own

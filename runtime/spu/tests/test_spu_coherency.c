@@ -119,19 +119,34 @@ static void test_bitmap(void)
 
     TEST("a line nobody reserved is not marked");
     CHECK(spu_coh_is_reserved(LINE_A) == 0);
+    CHECK(spu_coh_is_reserved_inline(LINE_A) == 0);
     CHECK(spu_coh_is_reserved(LINE_A + 64) == 0);
 
     spu_getllar(&g_spu_a, LINE_A);
 
     TEST("GETLLAR marks the whole 128-byte line, not just the word");
     CHECK(spu_coh_is_reserved(LINE_A) != 0);
+    CHECK(spu_coh_is_reserved_inline(LINE_A) != 0);
     CHECK(spu_coh_is_reserved(LINE_A + 4) != 0);
+    CHECK(spu_coh_is_reserved_inline(LINE_A + 4) != 0);
     CHECK(spu_coh_is_reserved(LINE_A + 127) != 0);
+    CHECK(spu_coh_is_reserved_inline(LINE_A + 127) != 0);
 
     TEST("the neighbouring lines stay unmarked");
     CHECK(spu_coh_is_reserved(LINE_A - 1) == 0);
+    CHECK(spu_coh_is_reserved_inline(LINE_A - 1) == 0);
     CHECK(spu_coh_is_reserved(LINE_A + 128) == 0);
+    CHECK(spu_coh_is_reserved_inline(LINE_A + 128) == 0);
     CHECK(spu_coh_is_reserved(LINE_B) == 0);
+    CHECK(spu_coh_is_reserved_inline(LINE_B) == 0);
+
+    TEST("inline and ABI predicates safely address the final bitmap byte");
+    spu_lockline_lock();
+    spu_coh_reserve(NULL, 0xFFFFFF80u);
+    spu_lockline_unlock();
+    CHECK(spu_coh_is_reserved(0xFFFFFF80u));
+    CHECK(spu_coh_is_reserved_inline(0xFFFFFFFFu));
+    CHECK(!spu_coh_is_reserved_inline(0xFFFFFF7Fu));
 }
 
 /* ===========================================================================

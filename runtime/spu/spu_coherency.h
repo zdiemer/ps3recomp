@@ -17,9 +17,10 @@
  * at once: the store can no longer land inside a PUTLLC's compare/commit window
  * (where it would be silently reverted), and the reserving SPU gets its event.
  *
- * The bitmap check is a shift and a load against a global that stays zero until
- * an SPU actually reserves something, so a title that never runs SPU code pays
- * one predictable branch per store.
+ * The bitmap check is an atomic load against a global that stays zero until an
+ * SPU actually reserves something, so a title that never runs SPU code avoids
+ * touching the 4 MiB map. The optional PPU accessor predicate uses the same
+ * atomic state and remains disabled unless explicitly selected at startup.
  */
 
 #ifndef SPU_COHERENCY_H
@@ -59,6 +60,65 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
 /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
  * lookup guarded by a global that is zero until the first GETLLAR. */
 int spu_coh_is_reserved(uint32_t addr);
+
+/* The experimental PPU accessor predicate uses the same bitmap as the
+ * ABI helper above. Keep the representation C/C++ ABI-compatible; all accesses
+ * to these objects, including the reference helper, use compiler atomics. */
+#define SPU_COH_LINE_SHIFT 7u
+#define SPU_COH_BITMAP_SIZE (1u << (32u - SPU_COH_LINE_SHIFT - 3u))
+extern unsigned char spu_coh_reservation_bitmap[SPU_COH_BITMAP_SIZE];
+extern uint32_t spu_coh_reservations_armed;
+
+/* Keep the bitmap's storage representation plain across C/C++ translation
+ * units. Clang/clang-cl use __atomic builtins; native MSVC uses its interlocked
+ * intrinsics, whose operations are sequentially consistent. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+static inline uint32_t spu_coh_atomic_load_u32(const uint32_t* p)
+{
+    return (uint32_t)_InterlockedCompareExchange((volatile long*)p, 0, 0);
+}
+static inline unsigned char spu_coh_atomic_load_u8(const unsigned char* p)
+{
+    return (unsigned char)_InterlockedCompareExchange8((volatile char*)p, 0, 0);
+}
+static inline unsigned char spu_coh_atomic_load_u8_relaxed(const unsigned char* p)
+{
+    /* spu_coh_reserve holds the global writer lock; this byte is only read here. */
+    return *(const volatile unsigned char*)p;
+}
+static inline void spu_coh_atomic_store_u32(uint32_t* p, uint32_t value)
+{
+    (void)_InterlockedExchange((volatile long*)p, (long)value);
+}
+static inline void spu_coh_atomic_store_u8(unsigned char* p, unsigned char value)
+{
+    (void)_InterlockedExchange8((volatile char*)p, (char)value);
+}
+#else
+static inline uint32_t spu_coh_atomic_load_u32(const uint32_t* p)
+{ return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
+static inline unsigned char spu_coh_atomic_load_u8(const unsigned char* p)
+{ return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
+static inline unsigned char spu_coh_atomic_load_u8_relaxed(const unsigned char* p)
+{ return __atomic_load_n(p, __ATOMIC_RELAXED); }
+static inline void spu_coh_atomic_store_u32(uint32_t* p, uint32_t value)
+{ __atomic_store_n(p, value, __ATOMIC_RELEASE); }
+static inline void spu_coh_atomic_store_u8(unsigned char* p, unsigned char value)
+{ __atomic_store_n(p, value, __ATOMIC_RELEASE); }
+#endif
+
+/* Atomic reads are deliberate: PPU stores do not take the lock unless this
+ * predicate says the line is reserved. Acquire loads prevent compiler caching
+ * and pair with completed release publications; a check overlapping a writer
+ * may still observe the preceding value, as in the existing protocol. */
+static inline int spu_coh_is_reserved_inline(uint32_t addr)
+{
+    if (!spu_coh_atomic_load_u32(&spu_coh_reservations_armed)) return 0;
+    uint32_t line = addr >> SPU_COH_LINE_SHIFT;
+    unsigned char bits = spu_coh_atomic_load_u8(&spu_coh_reservation_bitmap[line >> 3]);
+    return (bits >> (line & 7u)) & 1u;
+}
 
 /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
  * whose live reservation covers it, drop that reservation, and wake the host
