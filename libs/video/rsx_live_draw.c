@@ -2879,15 +2879,18 @@ typedef struct { u32 w, h; const u8* data; u32 row_bytes, rows; } tex_level_t;
 static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t* lv, u32 n)
 {
     if (n == 0 || n > 14) return NULL;
-    /* A partially uploaded resource cannot be cached as complete. Preflight
-     * every level before creating resources or recording any GPU commands. */
-    u64 upload_end=g.upload_used;
-    for (u32 m=0;m<n;++m) {
+    /* Reject incomplete uploads before creating a resource or recording copy
+     * commands. Cached entries must represent every requested mip. */
+    if (g.upload_used > UPLOAD_SIZE) return NULL;
+    u64 upload_end = g.upload_used;
+    for (u32 m = 0; m < n; ++m) {
         if (!lv[m].data || !lv[m].w || !lv[m].h || !lv[m].row_bytes || !lv[m].rows)
             return NULL;
-        const u64 pitch=((u64)lv[m].row_bytes+255)&~255ull;
-        upload_end=((upload_end+511)&~511ull)+pitch*lv[m].rows;
-        if (upload_end>UPLOAD_SIZE) return NULL;
+        const u64 pitch = ((u64)lv[m].row_bytes + 255) & ~255ull;
+        upload_end = (upload_end + 511) & ~511ull;
+        if (upload_end > UPLOAD_SIZE || lv[m].rows > (UPLOAD_SIZE - upload_end) / pitch)
+            return NULL;
+        upload_end += pitch * lv[m].rows;
     }
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
