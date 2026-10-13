@@ -3662,11 +3662,15 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                 return _k + 1
         return 0
     def _live(lo, i):
-        """all_insns[lo:i] minus blocks that end in `blr` -- they return, so
-        they cannot flow into the dispatch at i. Scanning backward straight
-        through them latches an epilogue's `ld r30,0xA0(r1)` restore as the
-        "nearest definition" of the base register. A dead block starts at the
-        nearest branch target at or before its blr, or just after a branch."""
+        """all_insns[lo:i] minus blocks that cannot flow into the dispatch.
+
+        Scanning backward straight through a dead return or tail-branch block
+        latches an epilogue's `ld r30,0xA0(r1)` restore as the "nearest
+        definition" of a table-base register. A dead block starts at the
+        nearest branch target at or before its terminator, or just after a
+        branch. Conditional branches are not terminators here because their
+        fallthrough path remains live.
+        """
         seg = all_insns[lo:i]
         targets = set()
         for x in seg:
@@ -3679,9 +3683,33 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                         pass
         def _ends_block(x):     # a branch that does not return to the next insn
             return x.mnemonic.startswith('b') and x.mnemonic not in ('bl', 'bctrl', 'blrl')
+        # A return always disconnects its preceding epilogue from this later
+        # dispatch. A direct unconditional branch only does so when its target
+        # is outside the containing function; an in-function branch may be the
+        # live path into the dispatcher and must retain its predecessors.
+        fs = (_bisect.bisect_right(func_starts, all_insns[i].addr) - 1
+              if func_starts else -1)
+        has_func_extent = fs >= 0
+        if has_func_extent:
+            func_lo = func_starts[fs]
+            func_hi = (func_starts[fs + 1]
+                       if fs + 1 < len(func_starts) else text_hi)
+
+        def _dead_terminator(x):
+            if x.mnemonic == 'blr':
+                return True
+            if not has_func_extent or x.mnemonic not in ('b', 'ba'):
+                return False
+            last = x.operands.split(',')[-1].strip()
+            try:
+                target = int(last, 0)
+            except ValueError:
+                return False
+            return not (func_lo <= target < func_hi)
+
         out, k = [], len(seg) - 1
         while k >= 0:
-            if seg[k].mnemonic == 'blr':
+            if _dead_terminator(seg[k]):
                 # back to the block's first insn: a branch target, or the insn
                 # right after another branch (fallthrough entry)
                 while k > 0 and seg[k].addr not in targets and not _ends_block(seg[k - 1]):
