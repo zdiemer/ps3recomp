@@ -319,7 +319,7 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 #define MAX_REJECTED_PSO_KEYS 8192
 #define UPLOAD_SIZE      (64u * 1024 * 1024)
 #define SHADER_DISK_CACHE_MAGIC   0x43535A59u /* "YZSC" */
-/* v2: OP_KIL now emits discard (was a dropped TODO) — cached v1 pixel
+/* v2: OP_KIL now emits discard (was a dropped TODO) â€” cached v1 pixel
  * shaders would silently keep the old no-discard codegen. */
 #define SHADER_DISK_CACHE_VERSION 2u
 #define SHADER_DISK_CACHE_MAX_BLOB (4u * 1024u * 1024u)
@@ -1903,7 +1903,7 @@ static void decode_render_state(render_state_t* rs)
       if (nc) rs->cull_enable = 0; }
     rs->cull_face   = rsx_dsp_reg(&g.rsx, M_CULL_FACE);
     rs->front_face  = rsx_dsp_reg(&g.rsx, M_FRONT_FACE);
-    /* s31 (scratch/s31_blue_emitter.md): honor the RAW register — 0 is a
+    /* s31 (scratch/s31_blue_emitter.md): honor the RAW register â€” 0 is a
      * legitimate game-written "write no color channels" (the character
      * shadow-mask depth-prime pass). rsx_dispatch_init seeds the nv40
      * reset default (0x01010101), so never-written reads as all-on. */
@@ -1948,7 +1948,7 @@ static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
     D3D12_RENDER_TARGET_BLEND_DESC* b = &pd->BlendState.RenderTarget[0];
     /* nv40_3d COLOR_MASK byte layout (Mesa/nouveau nv40_3d.xml.h, MIT/X11):
      * B=[0:7] G=[8:15] R=[16:23] A=[24:31]; any nonzero byte = channel on.
-     * (s31: was hardcoded ENABLE_ALL — the blue-character class' live twin.) */
+     * (s31: was hardcoded ENABLE_ALL â€” the blue-character class' live twin.) */
     b->RenderTargetWriteMask =
         (((rs->color_mask       ) & 0xFF) ? D3D12_COLOR_WRITE_ENABLE_BLUE  : 0) |
         (((rs->color_mask >>  8 ) & 0xFF) ? D3D12_COLOR_WRITE_ENABLE_GREEN : 0) |
@@ -5505,7 +5505,7 @@ static ID3D12PipelineState* get_pso(
     if (!fp_uc) { LD_PSO_BAIL("fragment program is not fully mapped in guest memory"); return NULL; }
 
     /* Fragment output register mode (fp16 h0 vs fp32 r0) is driven by the
-     * SHADER_CONTROL word bit 0x40 (same fix as the replay harness — the
+     * SHADER_CONTROL word bit 0x40 (same fix as the replay harness â€” the
      * AUTO heuristic returned stale fp32 scratch for h0-writing materials);
      * fold the deciding bit into the cache key so a program reused under a
      * different export mode gets its own PSO. Kill-switch RSX_FP_CTRL_AUTO=1
@@ -10760,6 +10760,50 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
     fflush(stderr);
 }
 
+/* Routine counters are emitted at shutdown. Explicit renderer diagnostics
+ * may also report during frames; ordinary presentation must not contend
+ * on the shared CRT stderr lock for a periodic status line. */
+static void ld_report_counters(void)
+{
+    fprintf(stderr,
+            "[live-draw] frame %u packets[seen=%llu queued=%llu movie=%llu qfull=%llu] "
+            "groups[seen=%llu exec=%llu empty=%llu drop{fetch=%llu degen=%llu prim=%llu "
+            "alloc=%llu pso=%llu ring=%llu surface=%llu}] clears[guest=%llu badsurf=%llu implicitZ=%llu] "
+            "textures[cached=%u/%u full=%llu decodefail=%llu depthSRV=%llu rejectZ=%llu] "
+            "vtex[cached=%u enabled=%llu binds=%llu uploads=%llu refresh=%llu "
+            "unsupported=%llu missingTXL=%llu] divider=%llu "
+            "balance[p=%s g=%s] binds[white=%llu real=%llu surf=%llu] "
+            "probe_skip_sampling=%llu (cumulative)\n",
+            g_ld_frames,
+            g_ld_stats.packets_seen, g_ld_stats.packets_queued,
+            g_ld_stats.packets_movie, g_ld_stats.packets_queue_full,
+            g_ld_stats.groups_seen, g_ld_stats.groups_executed,
+            g_ld_stats.groups_empty, g_ld_stats.group_drop_fetch,
+            g_ld_stats.group_drop_degenerate, g_ld_stats.group_drop_primitive,
+            g_ld_stats.group_drop_alloc, g_ld_stats.group_drop_pso,
+            g_ld_stats.group_drop_ring, g_ld_stats.group_drop_surface,
+            g_ld_stats.clears, g_ld_stats.clear_drop_surface,
+            g_ld_stats.implicit_depth_clears,
+            g.n_textures, MAX_TEXTURES,
+            (unsigned long long)g_ld_texture_cache_full,
+            (unsigned long long)g_ld_texture_decode_fail,
+            (unsigned long long)g_ld_zdepth_srv_binds,
+            (unsigned long long)g_ld_zdepth_srv_reject_no_write,
+            g.n_vtex,
+            (unsigned long long)g_ld_vtex_enabled,
+            (unsigned long long)g_ld_vtex_binds,
+            (unsigned long long)g_ld_vtex_uploads,
+            (unsigned long long)g_ld_vtex_refreshes,
+            (unsigned long long)g_ld_vtex_unsupported,
+            (unsigned long long)g_ld_vtex_missing_for_txl,
+            (unsigned long long)g_ld_divider_fetches,
+            g_ld_stats.packets_seen == g_ld_stats.packets_queued +
+                g_ld_stats.packets_movie + g_ld_stats.packets_queue_full ? "ok" : "BAD",
+            g_ld_stats.groups_seen == ld_groups_accounted() ? "ok" : "BAD",
+            g_ld_bind_white, g_ld_bind_real, g_ld_bind_surf,
+            g_ld_stats.groups_probe_skipped);
+}
+
 void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
@@ -11503,47 +11547,9 @@ void rsx_live_draw_present(u32 buffer_id)
         }
     }
 #endif
-    /* First 32 frames verbatim, then every 32nd: keeps the log bounded while
-     * making the TRUE frame count measurable from the log. (The old hard cap
-     * at 32 made "stalls at frame ~32" unfalsifiable from the .err alone.) */
-    if (g_ld_frames <= 32 || (g_ld_frames & 31) == 0)
-        fprintf(stderr,
-                "[live-draw] frame %u packets[seen=%llu queued=%llu movie=%llu qfull=%llu] "
-                "groups[seen=%llu exec=%llu empty=%llu drop{fetch=%llu degen=%llu prim=%llu "
-                "alloc=%llu pso=%llu ring=%llu surface=%llu}] clears[guest=%llu badsurf=%llu implicitZ=%llu] "
-                "textures[cached=%u/%u full=%llu decodefail=%llu depthSRV=%llu rejectZ=%llu] "
-                "vtex[cached=%u enabled=%llu binds=%llu uploads=%llu refresh=%llu "
-                "unsupported=%llu missingTXL=%llu] divider=%llu "
-                "balance[p=%s g=%s] binds[white=%llu real=%llu surf=%llu] "
-                "probe_skip_sampling=%llu (cumulative)\n",
-                g_ld_frames,
-                g_ld_stats.packets_seen, g_ld_stats.packets_queued,
-                g_ld_stats.packets_movie, g_ld_stats.packets_queue_full,
-                g_ld_stats.groups_seen, g_ld_stats.groups_executed,
-                g_ld_stats.groups_empty, g_ld_stats.group_drop_fetch,
-                g_ld_stats.group_drop_degenerate, g_ld_stats.group_drop_primitive,
-                g_ld_stats.group_drop_alloc, g_ld_stats.group_drop_pso,
-                g_ld_stats.group_drop_ring, g_ld_stats.group_drop_surface,
-                g_ld_stats.clears, g_ld_stats.clear_drop_surface,
-                g_ld_stats.implicit_depth_clears,
-                g.n_textures, MAX_TEXTURES,
-                (unsigned long long)g_ld_texture_cache_full,
-                (unsigned long long)g_ld_texture_decode_fail,
-                (unsigned long long)g_ld_zdepth_srv_binds,
-                (unsigned long long)g_ld_zdepth_srv_reject_no_write,
-                g.n_vtex,
-                (unsigned long long)g_ld_vtex_enabled,
-                (unsigned long long)g_ld_vtex_binds,
-                (unsigned long long)g_ld_vtex_uploads,
-                (unsigned long long)g_ld_vtex_refreshes,
-                (unsigned long long)g_ld_vtex_unsupported,
-                (unsigned long long)g_ld_vtex_missing_for_txl,
-                (unsigned long long)g_ld_divider_fetches,
-                g_ld_stats.packets_seen == g_ld_stats.packets_queued +
-                    g_ld_stats.packets_movie + g_ld_stats.packets_queue_full ? "ok" : "BAD",
-                g_ld_stats.groups_seen == ld_groups_accounted() ? "ok" : "BAD",
-                g_ld_bind_white, g_ld_bind_real, g_ld_bind_surf,
-                g_ld_stats.groups_probe_skipped);
+    if (LD_DIAG_ENABLED("RSX_LIVE_FEED_DBG") &&
+        (g_ld_frames <= 32 || (g_ld_frames & 31) == 0))
+        ld_report_counters();
     /* [fps] heartbeat: direct frame-rate logging, one line per ~5s wall.
      * Exists because pace repeatedly had to be inferred from frame-counter
      * arithmetic and log ordering, and two such inferences were wrong in one
@@ -11866,6 +11872,7 @@ void rsx_live_draw_present(u32 buffer_id)
                   } }
                 (void)hi; (void)rbase;
             } }
+          if (LD_DIAG_ENABLED("RSX_LIVE_FEED_DBG"))
           fprintf(stderr, "[fps] %.1f (frames %u..%u over %.1fs)\n",
                   (g_ld_frames - fps_f0) * 1000.0 / (double)(now - fps_t0),
                   fps_f0, g_ld_frames, (now - fps_t0) / 1000.0);
@@ -12013,6 +12020,7 @@ void rsx_live_draw_shutdown(void)
         ld_texture_content_clear();
         return;
     }
+    ld_report_counters();
 #if defined(YZ_PERF_PROFILE)
     ld_slow_draw_dump();
     ld_profile_buffers_dump();
