@@ -106,12 +106,13 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <stdlib.h>
 #if defined(YZ_PERF_PROFILE)
 #include "rsx_profile_buffer.h"
-static rsx_profile_buffer g_ld_profile_csv, g_ld_geometry_csv;
+static rsx_profile_buffer g_ld_profile_csv, g_ld_geometry_csv, g_ld_texture_misses_csv;
 static void ld_profile_buffers_dump(void)
 {
-    rsx_profile_buffer* buffers[] = { &g_ld_profile_csv, &g_ld_geometry_csv };
-    const char* names[] = { "renderer", "geometry" };
-    for (unsigned i=0; i<2; ++i) {
+    rsx_profile_buffer* buffers[] = {
+        &g_ld_profile_csv, &g_ld_geometry_csv, &g_ld_texture_misses_csv };
+    const char* names[] = { "renderer", "geometry", "texture-misses" };
+    for (unsigned i=0; i<3; ++i) {
         const rsx_profile_buffer* b=buffers[i];
         if (!b->rows) continue;
         const int ok=rsx_profile_buffer_dump(b);
@@ -3137,6 +3138,39 @@ static void texture_cache_unlink(u32 index)
     if (*link) *link = g.textures[index].hash_next;
 }
 
+#if defined(YZ_PERF_PROFILE)
+/* Record descriptor identities only on misses. Bounded storage and shutdown
+ * output avoid disk traffic in the render loop. The content hash is already
+ * computed by the cache; this trace performs no additional guest reads. */
+static void texture_profile_miss(u32 slot, int evicted,
+    const texcache_t* replacement, u64 previous_use)
+{
+    rsx_profile_buffer* csv = &g_ld_texture_misses_csv;
+    static int initialized;
+    if (!initialized) {
+        initialized = 1;
+        const char* output = getenv("RSX_PROFILE_CSV");
+        if (output && *output) {
+            char path[4096];
+            const int n = snprintf(path, sizeof path, "%s.texture-misses.csv", output);
+            if (n > 0 && n < sizeof path && !rsx_profile_buffer_init(csv, path,
+                "event,frame,qpc,use_serial,slot,evicted,previous_use_serial,location,offset,format,width,height,pitch,remap,cubemap,mipmaps,dimension,content_hash,decoded\n",
+                65536, 320))
+                fprintf(stderr, "[profile-buffer] texture-misses allocation failed\n");
+        }
+    }
+    if (!csv->rows) return;
+    const texcache_t* e = replacement;
+    rsx_profile_buffer_printf(csv,
+        "%llu,%u,%lld,%llu,%u,%u,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%llu,%u\n",
+        (unsigned long long)csv->recorded, g_ld_frames, ld_profile_qpc(),
+        (unsigned long long)e->last_use_serial, slot, (unsigned)evicted,
+        (unsigned long long)previous_use, e->location, e->offset, e->format,
+        e->width, e->height, e->pitch, e->remap, e->cubemap, e->mipmaps,
+        e->dimension, (unsigned long long)e->content_hash, e->tex != NULL);
+}
+#endif
+
 /* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
  * descriptor-only cache, re-hash the source once per frame and refresh the
  * D3D resource when the game rewrites the same guest address. */
@@ -3342,6 +3376,10 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     /* Commit negative entries even when full. Previously this branch kept the
      * old LRU entry on failure, so the same descriptor missed forever. */
     texcache_t* entry = &g.textures[index];
+#if defined(YZ_PERF_PROFILE)
+    texture_profile_miss(index, cache_was_full, &replacement,
+        cache_was_full ? entry->last_use_serial : 0);
+#endif
     if (cache_was_full) {
         texture_cache_unlink(index);
         ++g_ld_texture_cache_evictions;
@@ -11802,6 +11840,7 @@ void rsx_live_draw_shutdown(void)
     ld_profile_buffers_dump();
     rsx_profile_buffer_destroy(&g_ld_profile_csv);
     rsx_profile_buffer_destroy(&g_ld_geometry_csv);
+    rsx_profile_buffer_destroy(&g_ld_texture_misses_csv);
 #endif
     ld_vertex_worker_summary();
     ld_vertex_workers_clear();
