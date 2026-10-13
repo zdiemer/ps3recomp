@@ -1264,6 +1264,40 @@ typedef enum {
  * builds, but the absent-environment path does not query either clock. */
 #define LD_SLOW_DRAW_CAP 1024u
 #define LD_SLOW_DRAW_STAGE_COUNT 4u
+/* Nested, disjoint call buckets inside the resource-resolution draw phase. */
+#define LD_SLOW_DRAW_RESOURCE_KIND_COUNT 4u
+typedef enum {
+    LD_SLOW_RESOURCE_SURFACE = 0,
+    LD_SLOW_RESOURCE_DEPTH,
+    LD_SLOW_RESOURCE_TEXTURE,
+    LD_SLOW_RESOURCE_VERTEX_TEXTURE
+} ld_slow_draw_resource_kind;
+
+typedef enum {
+    LD_SLOW_TEXTURE_UNCLASSIFIED = 0,
+    LD_SLOW_TEXTURE_HIT = 1,
+    LD_SLOW_TEXTURE_NEGATIVE_HIT = 2,
+    LD_SLOW_TEXTURE_RETRY = 3,
+    LD_SLOW_TEXTURE_REFRESH = 4,
+    LD_SLOW_TEXTURE_MISS = 5
+} ld_slow_texture_outcome;
+
+typedef struct {
+    u64 lookup_ticks, watch_ticks, hash_ticks, decode_ticks;
+    u64 srv_ticks, retire_ticks, log_ticks, residual_ticks;
+    /* Nested inside decode_ticks; not part of the disjoint slot partition. */
+    u64 resource_create_ticks;
+    u32 resource_create_calls;
+    u32 outcome, decode_attempted, decode_succeeded, watch_skipped, cache_full;
+} ld_slow_texture_detail;
+
+typedef struct {
+    u64 total_ticks, max_ticks;
+    u32 calls;
+    u32 max_location, max_offset, max_format, max_width, max_height, max_slot;
+    ld_slow_texture_detail texture_detail;
+} ld_slow_draw_resource_stat;
+
 typedef enum {
     LD_SLOW_DRAW_GEOMETRY_PREP = 0,
     LD_SLOW_DRAW_PIPELINE_CONSTANTS,
@@ -1276,6 +1310,7 @@ typedef struct {
     u64 qpc_begin, qpc_end;
     u64 cycle_begin, cycle_end;
     u64 stage_ticks[LD_SLOW_DRAW_STAGE_COUNT];
+    ld_slow_draw_resource_stat resource[LD_SLOW_DRAW_RESOURCE_KIND_COUNT];
     u64 get_pso_ticks;
     u64 build_pso_ticks, shader_disk_load_ticks, d3d_compile_ticks;
     u64 create_graphics_pso_ticks;
@@ -1354,10 +1389,100 @@ static void ld_slow_draw_begin(ld_slow_draw_scope* scope)
     scope->event.host_tid = GetCurrentThreadId();
     scope->event.target = UINT32_MAX;
     scope->event.zslot = UINT32_MAX;
+    for (u32 i = 0; i < LD_SLOW_DRAW_RESOURCE_KIND_COUNT; ++i)
+        scope->event.resource[i].max_slot = UINT32_MAX;
     scope->event.qpc_begin = ld_slow_draw_qpc();
     scope->stage_begin = scope->event.qpc_begin;
     scope->event.cycle_valid = (u32)QueryThreadCycleTime(
         GetCurrentThread(), &scope->event.cycle_begin);
+}
+
+static u64 ld_slow_resource_begin(ld_slow_draw_scope* scope)
+{
+    return scope && scope->active ? ld_slow_draw_qpc() : 0;
+}
+
+static u64 ld_slow_texture_phase_begin(ld_slow_draw_scope* scope,
+    ld_slow_texture_detail* detail)
+{
+    return scope && scope->active && detail ? ld_slow_draw_qpc() : 0;
+}
+
+static void ld_slow_texture_phase_end(ld_slow_draw_scope* scope,
+    ld_slow_texture_detail* detail, u64* ticks, u64 begin)
+{
+    if (!scope || !scope->active || !detail || !ticks) return;
+    const u64 end = ld_slow_draw_qpc();
+    if (end >= begin) *ticks += end - begin;
+}
+
+static void ld_slow_texture_resource_create(ld_slow_texture_detail* detail,
+    u64 begin)
+{
+    if (!detail) return;
+    const u64 end = ld_slow_draw_qpc();
+    if (end >= begin) detail->resource_create_ticks += end - begin;
+    ++detail->resource_create_calls;
+}
+
+static void ld_slow_resource_finish_at(ld_slow_draw_scope* scope,
+    ld_slow_draw_resource_kind kind, u64 begin, u32 location, u32 offset,
+    u32 format, u32 width, u32 height, u32 slot, u64 end)
+{
+    if (!scope || !scope->active) return;
+    if (end < begin) return;
+    const u64 elapsed = end - begin;
+    ld_slow_draw_resource_stat* stat = &scope->event.resource[kind];
+    ++stat->calls;
+    stat->total_ticks += elapsed;
+    if (stat->calls == 1 || elapsed > stat->max_ticks) {
+        stat->max_ticks = elapsed;
+        stat->max_location = location;
+        stat->max_offset = offset;
+        stat->max_format = format;
+        stat->max_width = width;
+        stat->max_height = height;
+        stat->max_slot = slot;
+    }
+}
+
+static void ld_slow_resource_finish(ld_slow_draw_scope* scope,
+    ld_slow_draw_resource_kind kind, u64 begin, u32 location, u32 offset,
+    u32 format, u32 width, u32 height, u32 slot)
+{
+    if (!scope || !scope->active) return;
+    ld_slow_resource_finish_at(scope, kind, begin, location, offset, format,
+        width, height, slot, ld_slow_draw_qpc());
+}
+
+static void ld_slow_texture_resource_finish(ld_slow_draw_scope* scope,
+    u64 begin, const rsx_dsp_texture* texture, u32 slot,
+    ld_slow_texture_detail* detail)
+{
+    if (!scope || !scope->active) return;
+    const u64 end = ld_slow_draw_qpc();
+    if (end < begin) return;
+    ld_slow_draw_resource_stat* stat =
+        &scope->event.resource[LD_SLOW_RESOURCE_TEXTURE];
+    const u64 elapsed = end - begin;
+    ++stat->calls;
+    stat->total_ticks += elapsed;
+    if (stat->calls == 1 || elapsed > stat->max_ticks) {
+        stat->max_ticks = elapsed;
+        stat->max_location = texture->location;
+        stat->max_offset = texture->offset;
+        stat->max_format = texture->format;
+        stat->max_width = texture->width;
+        stat->max_height = texture->height;
+        stat->max_slot = slot;
+        if (detail) {
+            const u64 measured = detail->lookup_ticks + detail->watch_ticks +
+                detail->hash_ticks + detail->decode_ticks + detail->srv_ticks +
+                detail->retire_ticks + detail->log_ticks;
+            detail->residual_ticks = elapsed > measured ? elapsed - measured : 0;
+            stat->texture_detail = *detail;
+        }
+    }
 }
 
 static void ld_slow_draw_advance(ld_slow_draw_scope* scope,
@@ -1413,7 +1538,16 @@ static void ld_slow_draw_dump(void)
         "primitive,packets,source_refs,vertices,topology_count,"
         "target,zslot,texture_mask,vertex_texture_mask,geometry_preparation_ms,pipeline_constants_ms,"
         "resource_resolution_ms,command_recording_ms,get_pso_ms,pso_lookup,"
-        "build_pso_ms,shader_disk_load_ms,d3d_compile_ms,create_graphics_pso_ms\n");
+        "build_pso_ms,shader_disk_load_ms,d3d_compile_ms,create_graphics_pso_ms,"
+        "surface_calls,surface_total_ms,surface_max_ms,surface_max_location,surface_max_offset,surface_max_format,surface_max_width,surface_max_height,surface_max_slot,"
+        "depth_calls,depth_total_ms,depth_max_ms,depth_max_location,depth_max_offset,depth_max_format,depth_max_width,depth_max_height,depth_max_slot,"
+        "texture_calls,texture_total_ms,texture_max_ms,texture_max_location,texture_max_offset,texture_max_format,texture_max_width,texture_max_height,texture_max_slot,"
+        "vertex_texture_calls,vertex_texture_total_ms,vertex_texture_max_ms,vertex_texture_max_location,vertex_texture_max_offset,vertex_texture_max_format,vertex_texture_max_width,vertex_texture_max_height,vertex_texture_max_slot,"
+        "texture_outcome,texture_decode_attempted,texture_decode_succeeded,texture_watch_skipped,texture_cache_full,"
+        "texture_slot_lookup_ms,texture_slot_watch_ms,texture_slot_hash_ms,texture_slot_decode_ms,"
+        "texture_slot_srv_ms,texture_slot_retire_ms,texture_slot_log_ms,texture_slot_residual_ms,"
+        "texture_resource_create_ms,texture_resource_create_calls,"
+        "resource_residual_ms\n");
     const u64 first = (g_ld_slow_draw.next + LD_SLOW_DRAW_CAP -
         g_ld_slow_draw.recorded) % LD_SLOW_DRAW_CAP;
     const double scale = g_ld_slow_draw.qpc_frequency
@@ -1427,7 +1561,7 @@ static void ld_slow_draw_dump(void)
         fprintf(csv,
             "%llu,%lu,%llu,%u,%u,%llu,%llu,%.6f,%u,%llu,%llu,%llu,%u,%u,%u,%u,%u,"
             "%u,%u,0x%08X,0x%08X,%.6f,%.6f,%.6f,%.6f,%.6f,%u,"
-            "%.6f,%.6f,%.6f,%.6f\n",
+            "%.6f,%.6f,%.6f,%.6f",
             (unsigned long long)g_ld_slow_draw.qpc_frequency, threshold_us,
             (unsigned long long)e->callback_id, e->frame, e->host_tid,
             (unsigned long long)e->qpc_begin,
@@ -1445,6 +1579,29 @@ static void ld_slow_draw_dump(void)
             e->get_pso_ticks * scale, e->pso_lookup,
             e->build_pso_ticks * scale, e->shader_disk_load_ticks * scale,
             e->d3d_compile_ticks * scale, e->create_graphics_pso_ticks * scale);
+        u64 nested_resource_ticks = 0;
+        for (u32 k = 0; k < LD_SLOW_DRAW_RESOURCE_KIND_COUNT; ++k) {
+            const ld_slow_draw_resource_stat* stat = &e->resource[k];
+            nested_resource_ticks += stat->total_ticks;
+            fprintf(csv, ",%u,%.6f,%.6f,%u,%u,%u,%u,%u,%u",
+                stat->calls, stat->total_ticks * scale, stat->max_ticks * scale,
+                stat->max_location, stat->max_offset, stat->max_format,
+                stat->max_width, stat->max_height, stat->max_slot);
+        }
+        const u64 resource_ticks = e->stage_ticks[LD_SLOW_DRAW_RESOURCE_RESOLUTION];
+        const u64 residual_ticks = resource_ticks > nested_resource_ticks
+            ? resource_ticks - nested_resource_ticks : 0;
+        const ld_slow_texture_detail* td =
+            &e->resource[LD_SLOW_RESOURCE_TEXTURE].texture_detail;
+        fprintf(csv, ",%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f\n",
+            td->outcome, td->decode_attempted, td->decode_succeeded,
+            td->watch_skipped, td->cache_full,
+            td->lookup_ticks * scale, td->watch_ticks * scale,
+            td->hash_ticks * scale, td->decode_ticks * scale,
+            td->srv_ticks * scale, td->retire_ticks * scale,
+            td->log_ticks * scale, td->residual_ticks * scale,
+            td->resource_create_ticks * scale, td->resource_create_calls,
+            residual_ticks * scale);
     }
     fclose(csv);
     ReleaseSRWLockExclusive(&g_ld_slow_draw_lock);
@@ -2900,7 +3057,8 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
 
 typedef struct { u32 w, h; const u8* data; u32 row_bytes, rows; } tex_level_t;
 
-static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t* lv, u32 n)
+static ID3D12Resource* create_texture_mipped_scoped(DXGI_FORMAT fmt,
+    const tex_level_t* lv, u32 n, ld_slow_texture_detail* slow_detail)
 {
     if (n == 0 || n > 14) return NULL;
     /* Reject incomplete uploads before creating a resource or recording copy
@@ -2926,9 +3084,12 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     const LONGLONG create_begin = g_ld_profile.texture_decode_active
         ? ld_profile_qpc() : 0;
 #endif
-    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+    const u64 slow_create_begin = slow_detail ? ld_slow_draw_qpc() : 0;
+    const HRESULT create_result = g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
                                                       D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-                                                      &IID_ID3D12Resource, (void**)&tex))) {
+                                                      &IID_ID3D12Resource, (void**)&tex);
+    if (slow_detail) ld_slow_texture_resource_create(slow_detail, slow_create_begin);
+    if (FAILED(create_result)) {
 #if defined(YZ_PERF_PROFILE)
         if (g_ld_profile.texture_decode_active)
             ld_profile_note_texture_create(create_begin, &rd);
@@ -3005,6 +3166,12 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     return tex;
 }
 
+static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt,
+    const tex_level_t* lv, u32 n)
+{
+    return create_texture_mipped_scoped(fmt, lv, n, NULL);
+}
+
 #include "rsx_texture_content_cache.h"
 static void ld_texture_content_summary(void)
 {
@@ -3048,7 +3215,8 @@ static void ld_texture_content_profile(u32 frame,LONGLONG qpc)
 /* Cubemap faces are stored face-major in guest memory. D3D12 subresources use
  * that same order: face * mip_count + mip. */
 static ID3D12Resource* create_texture_cube(
-    DXGI_FORMAT fmt, const tex_level_t* lv, u32 n_mips)
+    DXGI_FORMAT fmt, const tex_level_t* lv, u32 n_mips,
+    ld_slow_texture_detail* slow_detail)
 {
     if (!n_mips) return NULL;
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -3061,10 +3229,13 @@ static ID3D12Resource* create_texture_cube(
     const LONGLONG create_begin = g_ld_profile.texture_decode_active
         ? ld_profile_qpc() : 0;
 #endif
-    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(
+    const u64 slow_create_begin = slow_detail ? ld_slow_draw_qpc() : 0;
+    const HRESULT create_result = g.dev->lpVtbl->CreateCommittedResource(
             g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
             D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-            &IID_ID3D12Resource, (void**)&tex))) {
+            &IID_ID3D12Resource, (void**)&tex);
+    if (slow_detail) ld_slow_texture_resource_create(slow_detail, slow_create_begin);
+    if (FAILED(create_result)) {
 #if defined(YZ_PERF_PROFILE)
         if (g_ld_profile.texture_decode_active)
             ld_profile_note_texture_create(create_begin, &rd);
@@ -3151,6 +3322,14 @@ static ID3D12Resource* create_texture_cube(
     }
 #endif
     return tex;
+}
+
+static ID3D12Resource* create_texture_rgba_scoped(const u8* rgba, u32 w, u32 h,
+    ld_slow_texture_detail* slow_detail)
+{
+    tex_level_t lv = { w, h, rgba, w * 4, h };
+    return create_texture_mipped_scoped(DXGI_FORMAT_R8G8B8A8_UNORM,
+        &lv, 1, slow_detail);
 }
 
 static ID3D12Resource* create_texture_rgba(const u8* rgba, u32 w, u32 h)
@@ -3327,7 +3506,8 @@ static int texture_cached_content_changed(
     return 0;
 }
 
-static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+static ID3D12Resource* decode_guest_texture_scoped(const rsx_dsp_texture* t,
+    u32 remap, ld_slow_texture_detail* slow_detail)
 {
     const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
     const int linear = (t->format & TEX_FMT_LINEAR) != 0;
@@ -3384,7 +3564,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
                     mh = mh > 1 ? mh >> 1 : 1;
                 }
             }
-            return create_texture_cube(dxgi, cube_levels, n_mips);
+            return create_texture_cube(dxgi, cube_levels, n_mips, slow_detail);
         }
         tex_level_t levels[14];
         u32 mw = w, mh = h, off = 0, n = 0;
@@ -3401,7 +3581,9 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
             mw = mw > 1 ? mw >> 1 : 1;
             mh = mh > 1 ? mh >> 1 : 1;
         }
-        return create_texture_mipped_cached(dxgi, levels, n);
+        return slow_detail
+            ? create_texture_mipped_cached_scoped(dxgi, levels, n, slow_detail)
+            : create_texture_mipped_cached(dxgi, levels, n);
     }
 
     u32 texel_size;
@@ -3473,7 +3655,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
         }
         ID3D12Resource* resource = (!oom && level == 6 * n_mips)
             ? create_texture_cube(
-                DXGI_FORMAT_R8G8B8A8_UNORM, cube_levels, n_mips)
+                DXGI_FORMAT_R8G8B8A8_UNORM, cube_levels, n_mips, slow_detail)
             : NULL;
         for (u32 i = 0; i < level; i++) free(rgba[i]);
         return resource;
@@ -3571,9 +3753,15 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
         mh = mh > 1 ? mh >> 1 : 1;
     }
     ID3D12Resource* resource = (!oom && n)
-        ? create_texture_mipped(DXGI_FORMAT_R8G8B8A8_UNORM, levels, n) : NULL;
+        ? create_texture_mipped_scoped(DXGI_FORMAT_R8G8B8A8_UNORM, levels, n,
+            slow_detail) : NULL;
     for (u32 m = 0; m < n; m++) free(rgba[m]);
     return resource;
+}
+
+static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+{
+    return decode_guest_texture_scoped(t, remap, NULL);
 }
 
 static u64 texture_override_revision(const rsx_dsp_texture* t)
@@ -3587,7 +3775,7 @@ static u64 texture_override_revision(const rsx_dsp_texture* t)
 
 static ID3D12Resource* decode_guest_texture_profiled(
     const rsx_dsp_texture* texture, u32 remap, int* override_rgba,
-    ld_texture_decode_kind kind)
+    ld_texture_decode_kind kind, ld_slow_texture_detail* slow_detail)
 {
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG begin = ld_profile_qpc();
@@ -3609,11 +3797,14 @@ static ID3D12Resource* decode_guest_texture_profiled(
         const u8* pixels=source ? g_texture_pixels(texture->format,
             texture->width,texture->height,source,bytes,g_texture_override_user) : NULL;
         if (pixels) {
-            result=create_texture_rgba(pixels,texture->width,texture->height);
+            result=create_texture_rgba_scoped(pixels,texture->width,
+                texture->height, slow_detail);
             if (result) *override_rgba=1;
         }
     }
-    if (!result) result = decode_guest_texture(texture, remap);
+    if (!result) result = slow_detail
+        ? decode_guest_texture_scoped(texture, remap, slow_detail)
+        : decode_guest_texture(texture, remap);
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.texture_decode_qpc +=
         (u64)(ld_profile_qpc() - begin);
@@ -3755,39 +3946,62 @@ static void texture_profile_miss(u32 slot, int evicted,
 /* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
  * descriptor-only cache, re-hash the source once per frame and refresh the
  * D3D resource when the game rewrites the same guest address. */
-static u32 texture_srv_slot(const rsx_dsp_texture* t)
+static u32 texture_srv_slot_scoped(const rsx_dsp_texture* t,
+    ld_slow_draw_scope* slow_scope, ld_slow_texture_detail* slow_detail)
 {
     const u32 remap = t->remap & 0xFFFF;
     static int refresh_enabled = -1;
     if (refresh_enabled < 0)
         refresh_enabled = getenv("RSX_NO_TEX_REFRESH") ? 0 : 1;
 
+    u64 phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
     const u32 bucket = texture_cache_bucket(t);
     const u64 override_revision=texture_override_revision(t);
     const u32 i = texture_cache_find(t, bucket);
+    ld_slow_texture_phase_end(slow_scope, slow_detail,
+        slow_detail ? &slow_detail->lookup_ticks : NULL, phase_begin);
     if (i != UINT32_MAX) {
         texcache_t* entry = &g.textures[i];
         /* Failed decodes need a cache identity too. Retry at most once per
          * frame so transient unmapped data can recover, without a full LRU
          * scan and decode attempt at every binding of an unsupported format. */
         if (!entry->tex && entry->last_hash_frame != g_ld_frames) {
+            if (slow_detail) slow_detail->outcome = LD_SLOW_TEXTURE_RETRY;
+            if (slow_detail) slow_detail->decode_attempted = 1;
             entry->last_hash_frame=g_ld_frames;
+            phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
             entry->tex=decode_guest_texture_profiled(
-                t, remap, &entry->override_rgba, LD_TEXTURE_DECODE_RETRY);
+                t, remap, &entry->override_rgba, LD_TEXTURE_DECODE_RETRY,
+                slow_detail);
+            ld_slow_texture_phase_end(slow_scope, slow_detail,
+                slow_detail ? &slow_detail->decode_ticks : NULL, phase_begin);
+            if (slow_detail) slow_detail->decode_succeeded = entry->tex != NULL;
             if (entry->tex) {
                 entry->override_revision=override_revision;
                 int readable=0;
+                phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                 entry->content_hash=texture_content_hash(t,&readable);
+                ld_slow_texture_phase_end(slow_scope, slow_detail,
+                    slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
                 entry->content_hash_kind=texture_hash_kind();
+                phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                 write_texture_srv(i,entry);
+                ld_slow_texture_phase_end(slow_scope, slow_detail,
+                    slow_detail ? &slow_detail->srv_ticks : NULL, phase_begin);
             } else ++g_ld_texture_decode_fail;
         }
-        if (refresh_enabled && entry->tex &&
-            entry->last_hash_frame != g_ld_frames) {
+        if (slow_detail && slow_detail->outcome == LD_SLOW_TEXTURE_UNCLASSIFIED)
+            slow_detail->outcome = entry->tex ? LD_SLOW_TEXTURE_HIT : LD_SLOW_TEXTURE_NEGATIVE_HIT;
+        const int override_changed=entry->override_revision!=override_revision;
+        if ((refresh_enabled || override_changed) && entry->tex &&
+            (entry->last_hash_frame != g_ld_frames || override_changed)) {
             u64 watch_stamp = 0;
             u32 watch_bytes = 0;
+            phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
             int watch_valid = texture_watch_stamp(t,&watch_stamp,&watch_bytes);
-            int skip = watch_valid && entry->write_watch_valid &&
+            ld_slow_texture_phase_end(slow_scope, slow_detail,
+                slow_detail ? &slow_detail->watch_ticks : NULL, phase_begin);
+            int skip = !override_changed && watch_valid && entry->write_watch_valid &&
                 entry->write_watch_stamp == watch_stamp &&
                 entry->content_hash_kind == texture_hash_kind();
             static int validate = -1;
@@ -3796,11 +4010,17 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                 validate = option && *option == '1';
             }
             int readable = skip && !validate;
+            phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
             const u64 hash = readable ? entry->content_hash : texture_content_hash(t, &readable);
+            ld_slow_texture_phase_end(slow_scope, slow_detail,
+                slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
             if (skip && validate) {
                 ++g_texture_watch_audits;
                 u64 after = 0;
+                phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                 const int stable = texture_watch_stamp(t,&after,NULL) && after == watch_stamp;
+                ld_slow_texture_phase_end(slow_scope, slow_detail,
+                    slow_detail ? &slow_detail->watch_ticks : NULL, phase_begin);
                 if (!stable) {
                     ++g_texture_watch_races;
                     watch_valid = 0;
@@ -3809,21 +4029,23 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                     ++g_texture_watch_failures;
                     g_texture_watch.healthy = 0;
                     watch_valid = 0; skip = 0;
+                    phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                     fprintf(stderr,"[texture-write-watch] unchanged-stamp hash mismatch; disabling reuse\n");
+                    ld_slow_texture_phase_end(slow_scope, slow_detail,
+                        slow_detail ? &slow_detail->log_ticks : NULL, phase_begin);
                 }
             }
             if (skip) {
+                if (slow_detail) slow_detail->watch_skipped = 1;
                 ++g_texture_watch_skips;
                 g_texture_watch_skip_bytes += watch_bytes;
             }
             /* A failed decode must not stamp old GPU contents as current. */
             entry->write_watch_valid = 0;
-        const int override_changed=entry->override_revision!=override_revision;
-        if ((refresh_enabled || override_changed) && entry->tex &&
-            (entry->last_hash_frame != g_ld_frames || override_changed)) {
-            int readable = 0;
-            const u64 hash = texture_content_hash(t, &readable);
+            phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
             const int hash_changed = texture_cached_content_changed(entry,t,hash,&readable);
+            ld_slow_texture_phase_end(slow_scope, slow_detail,
+                slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
              * reads are microseconds apart, so they can only disagree if a
              * guest thread is writing this texture right now -- i.e. we are
@@ -3833,11 +4055,15 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
               if (race < 0) race = getenv("LD_TEX_RACE") ? 1 : 0;
               if (race && readable) {
                   int r2 = 0;
+                  phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                   const u64 again = texture_content_hash(t, &r2);
+                  ld_slow_texture_phase_end(slow_scope, slow_detail,
+                      slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
                   static unsigned long long checks = 0, torn = 0;
                   checks++;
                   if (r2 && again != hash) torn++;
-                  if ((checks % 256) == 0)
+                  if ((checks % 256) == 0) {
+                      phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                       fprintf(stderr,
                               "[tex-race] src=%u:0x%08X %ux%u  torn %llu/%llu reads"
                               " (%.1f%%)\n",
@@ -3845,6 +4071,9 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                               (unsigned long long)torn,
                               (unsigned long long)checks,
                               100.0 * (double)torn / (double)checks);
+                      ld_slow_texture_phase_end(slow_scope, slow_detail,
+                          slow_detail ? &slow_detail->log_ticks : NULL, phase_begin);
+                  }
               } }
             /* LD_FBDBG=1: account for the PS1 framebuffer specifically
              * (location 1, offset 0x400000, the 1024x512 fmt 0xE2 texture the
@@ -3861,19 +4090,30 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                   checks++;
                   if (!readable) unread++;
                   if (hash_changed) changed++;
-                  if ((checks % 64) == 0 || checks < 4)
+                  if ((checks % 64) == 0 || checks < 4) {
+                      phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                       fprintf(stderr, "[fbdbg] ps1fb checks=%llu unreadable=%llu"
                                       " changed=%llu span=%u %ux%u pitch=%u\n",
                               checks, unread, changed,
                               texture_source_span(t), t->width, t->height,
                               t->pitch);
+                      ld_slow_texture_phase_end(slow_scope, slow_detail,
+                          slow_detail ? &slow_detail->log_ticks : NULL, phase_begin);
+                  }
               } }
             entry->last_hash_frame = g_ld_frames;
             if (hash_changed || override_changed) {
                 int override_rgba=0;
+                if (slow_detail) slow_detail->outcome = LD_SLOW_TEXTURE_REFRESH;
+                if (slow_detail) slow_detail->decode_attempted = 1;
+                phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                 ID3D12Resource* replacement =
                     decode_guest_texture_profiled(
-                        t, remap, &override_rgba, LD_TEXTURE_DECODE_REFRESH);
+                        t, remap, &override_rgba, LD_TEXTURE_DECODE_REFRESH,
+                        slow_detail);
+                ld_slow_texture_phase_end(slow_scope, slow_detail,
+                    slow_detail ? &slow_detail->decode_ticks : NULL, phase_begin);
+                if (slow_detail) slow_detail->decode_succeeded = replacement != NULL;
                 if (replacement) {
                     ID3D12Resource* old = entry->tex;
                     entry->tex = replacement;
@@ -3881,16 +4121,26 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                     entry->override_revision=override_revision;
                     entry->content_hash = hash;
                     entry->content_hash_kind = texture_hash_kind();
+                    phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                     write_texture_srv(i, entry);
+                    ld_slow_texture_phase_end(slow_scope, slow_detail,
+                        slow_detail ? &slow_detail->srv_ticks : NULL, phase_begin);
+                    phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                     retire_texture(old);
+                    ld_slow_texture_phase_end(slow_scope, slow_detail,
+                        slow_detail ? &slow_detail->retire_ticks : NULL, phase_begin);
                     static u32 refresh_count = 0;
                     refresh_count++;
-                    if (refresh_count <= 64 || (refresh_count & 255) == 0)
+                    if (refresh_count <= 64 || (refresh_count & 255) == 0) {
+                        phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                         fprintf(stderr,
                                 "[tex-refresh] n=%u frame=%u unit-src=%u:0x%08X "
                                 "fmt=0x%02X %ux%u\n",
                                 refresh_count, g_ld_frames, t->location, t->offset,
                                 t->format, t->width, t->height);
+                        ld_slow_texture_phase_end(slow_scope, slow_detail,
+                            slow_detail ? &slow_detail->log_ticks : NULL, phase_begin);
+                    }
                 }
             }
             if (readable && entry->content_hash == hash && g_texture_watch.healthy) {
@@ -3925,11 +4175,15 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                 index = i;
         evicted = g.textures[index].tex;
         if (g_ld_texture_cache_full <= 16 ||
-            (g_ld_texture_cache_full & (g_ld_texture_cache_full - 1)) == 0)
+            (g_ld_texture_cache_full & (g_ld_texture_cache_full - 1)) == 0) {
+            phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
             fprintf(stderr,
                     "[texture-cache] FULL cap=%u lru-evictions=%llu\n",
                     MAX_TEXTURES,
                     (unsigned long long)g_ld_texture_cache_evictions);
+            ld_slow_texture_phase_end(slow_scope, slow_detail,
+                slow_detail ? &slow_detail->log_ticks : NULL, phase_begin);
+        }
     }
 
     texcache_t replacement;
@@ -3948,11 +4202,24 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     replacement.last_use_serial = ++g_ld_texture_use_serial;
     {
         int readable = 0;
+        phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
         replacement.content_hash = texture_content_hash(t, &readable);
+        ld_slow_texture_phase_end(slow_scope, slow_detail,
+            slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
         replacement.content_hash_kind = texture_hash_kind();
     }
+    if (slow_detail) {
+        slow_detail->outcome = LD_SLOW_TEXTURE_MISS;
+        slow_detail->cache_full = cache_was_full;
+        slow_detail->decode_attempted = 1;
+    }
+    phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
     replacement.tex = decode_guest_texture_profiled(
-        t, remap, &replacement.override_rgba, LD_TEXTURE_DECODE_MISS);
+        t, remap, &replacement.override_rgba, LD_TEXTURE_DECODE_MISS,
+        slow_detail);
+    ld_slow_texture_phase_end(slow_scope, slow_detail,
+        slow_detail ? &slow_detail->decode_ticks : NULL, phase_begin);
+    if (slow_detail) slow_detail->decode_succeeded = replacement.tex != NULL;
     replacement.override_revision=override_revision;
     /* Commit negative entries even when full. Previously this branch kept the
      * old LRU entry on failure, so the same descriptor missed forever. */
@@ -3965,23 +4232,40 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         texture_cache_unlink(index);
         ++g_ld_texture_cache_evictions;
     }
-    if (evicted) retire_texture(evicted);
+    if (evicted) {
+        phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
+        retire_texture(evicted);
+        ld_slow_texture_phase_end(slow_scope, slow_detail,
+            slow_detail ? &slow_detail->retire_ticks : NULL, phase_begin);
+    }
     *entry = replacement;
     texture_cache_link(index, bucket);
     if (replacement.tex) {
+        phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
         write_texture_srv(index, entry);
+        ld_slow_texture_phase_end(slow_scope, slow_detail,
+            slow_detail ? &slow_detail->srv_ticks : NULL, phase_begin);
     } else {
         g_ld_texture_decode_fail++;
         if (g_ld_texture_decode_fail <= 16 ||
-            (g_ld_texture_decode_fail & (g_ld_texture_decode_fail - 1)) == 0)
+            (g_ld_texture_decode_fail & (g_ld_texture_decode_fail - 1)) == 0) {
+            phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
             fprintf(stderr,
                     "[texture-cache] decode failed n=%llu src=%u:0x%08X "
                     "fmt=0x%02X %ux%u pitch=%u\n",
                     (unsigned long long)g_ld_texture_decode_fail,
                     t->location, t->offset, t->format, t->width, t->height,
                     t->pitch);
+            ld_slow_texture_phase_end(slow_scope, slow_detail,
+                slow_detail ? &slow_detail->log_ticks : NULL, phase_begin);
+        }
     }
     return replacement.tex ? SRV_TEXTURE_BASE + index : SRV_WHITE;
+}
+
+static u32 texture_srv_slot(const rsx_dsp_texture* t)
+{
+    return texture_srv_slot_scoped(t, NULL, NULL);
 }
 
 typedef struct {
@@ -4605,6 +4889,31 @@ static u32 current_surface(void)
                        sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
                            ? DXGI_FORMAT_R16G16B16A16_FLOAT
                            : DXGI_FORMAT_R8G8B8A8_UNORM);
+}
+
+static u32 surface_get_slow_draw(ld_slow_draw_scope* slow_draw,
+    u32 location, u32 offset, u32 width, u32 height, DXGI_FORMAT format)
+{
+    const u64 begin = ld_slow_resource_begin(slow_draw);
+    const u32 slot = surface_get(location, offset, width, height, format);
+    ld_slow_resource_finish(slow_draw, LD_SLOW_RESOURCE_SURFACE, begin,
+        location, offset, (u32)format, width, height, slot);
+    return slot;
+}
+
+static u32 current_surface_slow_draw(ld_slow_draw_scope* slow_draw)
+{
+    const u64 begin = ld_slow_resource_begin(slow_draw);
+    const u32 slot = current_surface();
+    const u64 end = ld_slow_draw_qpc();
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+    const DXGI_FORMAT format = sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+        ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+    ld_slow_resource_finish_at(slow_draw, LD_SLOW_RESOURCE_SURFACE, begin,
+        sf.color_location[0], sf.color_offset[0], (u32)format,
+        sf.clip_w, sf.clip_h, slot, end);
+    return slot;
 }
 
 /* On RSX each zeta (depth) address is distinct memory. The offline renderer's
@@ -9583,7 +9892,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
     }
 
     ld_slow_draw_advance(slow_draw, LD_SLOW_DRAW_RESOURCE_RESOLUTION);
-    const u32 target = current_surface();
+    const u32 target = slow_draw && slow_draw->active
+        ? current_surface_slow_draw(slow_draw) : current_surface();
     if (target == LD_INVALID_SURFACE) {
         live_draw_csv_emit(prim, n_tri, "drop_surface");
         g_ld_stats.group_drop_surface++;
@@ -9805,11 +10115,16 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
         rsx_dsp_get_surface(&g.rsx, &msf);
         const u32 want = ld_rt_count(msf.color_target);
         for (u32 r = 1; r < want; r++) {
-            const u32 s = surface_get(msf.color_location[r], msf.color_offset[r],
-                                      msf.clip_w, msf.clip_h,
-                                      msf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
-                                          ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                          : DXGI_FORMAT_R8G8B8A8_UNORM);
+            const DXGI_FORMAT mrt_format =
+                msf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+                    ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                    : DXGI_FORMAT_R8G8B8A8_UNORM;
+            const u32 s = slow_draw && slow_draw->active
+                ? surface_get_slow_draw(slow_draw,
+                    msf.color_location[r], msf.color_offset[r],
+                    msf.clip_w, msf.clip_h, mrt_format)
+                : surface_get(msf.color_location[r], msf.color_offset[r],
+                    msf.clip_w, msf.clip_h, mrt_format);
             if (s == LD_INVALID_SURFACE || s == target) break;
             mrt[n_mrt++] = s;
         }
@@ -10100,7 +10415,18 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
                     if (g.zdepths[i].location == t.location &&
                         g.zdepths[i].offset == t.offset &&
                         (current_zslot != 1 + i || self_zeta_read)) {
-                        if (zdepth_snapshot(1 + i))
+                        int snapshot_ok;
+                        if (slow_draw && slow_draw->active) {
+                            const u64 resource_begin = ld_slow_resource_begin(slow_draw);
+                            snapshot_ok = zdepth_snapshot(1 + i);
+                            ld_slow_resource_finish(slow_draw, LD_SLOW_RESOURCE_DEPTH,
+                                resource_begin, g.zdepths[i].location,
+                                g.zdepths[i].offset, 0, g.zdepths[i].snapshot_w,
+                                g.zdepths[i].snapshot_h, 1 + i);
+                        } else {
+                            snapshot_ok = zdepth_snapshot(1 + i);
+                        }
+                        if (snapshot_ok)
                             sampled_depth = (int)i;
                         else {
                             g_ld_zdepth_srv_reject_no_write++;
@@ -10168,7 +10494,16 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
                 if (!seen && n_zdepth_used < SRV_TABLE_SIZE)
                     zdepth_used[n_zdepth_used++] = (u32)sampled_depth;
             } else {
-                slots[u] = texture_srv_slot(&t);
+                if (slow_draw && slow_draw->active) {
+                    const u64 resource_begin = ld_slow_resource_begin(slow_draw);
+                    ld_slow_texture_detail texture_detail;
+                    memset(&texture_detail, 0, sizeof(texture_detail));
+                    slots[u] = texture_srv_slot_scoped(&t, slow_draw, &texture_detail);
+                    ld_slow_texture_resource_finish(slow_draw, resource_begin,
+                        &t, u, &texture_detail);
+                } else {
+                    slots[u] = texture_srv_slot(&t);
+                }
                 if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
             }
         }
@@ -10203,7 +10538,15 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
         if (!((vtex_mask >> u) & 1u)) continue;
         rsx_dsp_vertex_texture vt;
         rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
-        vtex_slots[u] = vertex_texture_srv_slot(&vt);
+        if (slow_draw && slow_draw->active) {
+            const u64 resource_begin = ld_slow_resource_begin(slow_draw);
+            vtex_slots[u] = vertex_texture_srv_slot(&vt);
+            ld_slow_resource_finish(slow_draw, LD_SLOW_RESOURCE_VERTEX_TEXTURE,
+                resource_begin, vt.location, vt.offset, vt.format,
+                vt.width, vt.height, u);
+        } else {
+            vtex_slots[u] = vertex_texture_srv_slot(&vt);
+        }
         if (vtex_slots[u] != SRV_WHITE)
             g_ld_vtex_binds++;
         else
