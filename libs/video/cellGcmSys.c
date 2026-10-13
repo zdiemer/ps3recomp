@@ -1912,6 +1912,18 @@ static int gcm_try_vp_burst(rsx_state* state,u32 get,u32 put,u32 header)
 /* END GCM VP BURST BOUNDARY */
 #include "gcm_vp_burst_mode.h"
 
+/* Final VP burst counters are emitted once outside the timed FIFO path. The
+ * same lock protects polling/recording and prevents racing a drain during
+ * orderly shutdown. */
+void cellGcm_vp_burst_dump(void)
+{
+    AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+    if (s_vp_burst_mode.initialized && s_vp_burst_mode.active &&
+        !s_vp_burst_mode.final_reported)
+        gcm_vp_burst_final_report(gcm_vp_burst_clock());
+    ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+}
+
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
