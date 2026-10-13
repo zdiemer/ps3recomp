@@ -104,6 +104,24 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(YZ_PERF_PROFILE)
+#include "rsx_profile_buffer.h"
+static rsx_profile_buffer g_ld_profile_csv, g_ld_geometry_csv;
+static void ld_profile_buffers_dump(void)
+{
+    rsx_profile_buffer* buffers[] = { &g_ld_profile_csv, &g_ld_geometry_csv };
+    const char* names[] = { "renderer", "geometry" };
+    for (unsigned i=0; i<2; ++i) {
+        const rsx_profile_buffer* b=buffers[i];
+        if (!b->rows) continue;
+        const int ok=rsx_profile_buffer_dump(b);
+        fprintf(stderr,"[profile-buffer] stream=%s saved=%d recorded=%llu retained=%llu rejected=%llu\n",
+            names[i],ok,(unsigned long long)b->recorded,
+            (unsigned long long)(b->recorded>b->capacity ? b->capacity : b->recorded),
+            (unsigned long long)b->rejected);
+    }
+}
+#endif
 #include "rsx_texture_write_watch.h"
 
 /* Bulk references, dense remapping, specialized vertex decoding and triangle
@@ -4741,7 +4759,7 @@ static void ld_pull_summary(void)
  * out of ordinary measurements; subtraction retains all frames in a window. */
 static void ld_pull_profile(u32 frame, LONGLONG qpc)
 {
-    static FILE* csv;
+    rsx_profile_buffer* csv=&g_ld_geometry_csv;
     static int initialized;
     if (!initialized) {
         initialized=1;
@@ -4749,15 +4767,15 @@ static void ld_pull_profile(u32 frame, LONGLONG qpc)
         if (output && *output) {
             char path[4096];
             const int n=snprintf(path,sizeof path,"%s.geometry.csv",output);
-            if (n>0 && n<sizeof path) csv=fopen(path,"wb");
-            if (csv) fprintf(csv,"frame,qpc,enabled,prepared_draws,vertices,raw_upload_bytes,bypasses,total_vertex_upload_bytes\n");
+            if (n>0 && n<sizeof path && !rsx_profile_buffer_init(csv,path,
+                "frame,qpc,enabled,prepared_draws,vertices,raw_upload_bytes,bypasses,total_vertex_upload_bytes\n",32768,256))
+                fprintf(stderr,"[profile-buffer] geometry allocation failed\n");
         }
     }
-    if (csv) {
-        fprintf(csv,"%u,%lld,%d,%llu,%llu,%llu,%llu,%llu\n",frame,qpc,
+    if (csv->rows) {
+        rsx_profile_buffer_printf(csv,"%u,%lld,%d,%llu,%llu,%llu,%llu,%llu\n",frame,qpc,
             g_ld_pull_enabled,g_ld_pull_draws,g_ld_pull_vertices,g_ld_pull_bytes,
             g_ld_pull_bypasses,g_ld_profile.total.vertex_upload_bytes);
-        if ((frame&63u)==0) fflush(csv);
     }
 }
 #endif
@@ -6210,26 +6228,25 @@ static void ld_profile_present(u32 frame)
     const int compile_free =
         LD_PROFILE_DELTA(vs_compile_calls) == 0 &&
         LD_PROFILE_DELTA(ps_compile_calls) == 0;
-    /* Optional full-run CSV: buffered writes, no per-frame stderr flush or
-     * adapter queries. Keep frame intervals separate from overlapping CPU
-     * scopes (draw_cpu includes vertex packing and some flushes). */
-    static FILE* csv;
+    /* Bounded in-memory CSV, saved on normal close. No file I/O or duplicate
+     * stderr/adapter reports in CSV mode. Scopes still overlap. */
+    rsx_profile_buffer* csv=&g_ld_profile_csv;
     static int csv_initialized;
     if (!csv_initialized) {
         csv_initialized = 1;
         const char* output = getenv("RSX_PROFILE_CSV");
         if (output && *output) {
-            csv = fopen(output, "wb");
-            if (csv) fprintf(csv, "frame,qpc,dt_ms,draw_cpu_ms,vertex_pack_ms,"
+            if (!rsx_profile_buffer_init(csv,output,"frame,qpc,dt_ms,draw_cpu_ms,vertex_pack_ms,"
                 "flush_ms,fence_wait_ms,decompile_ms,vs_compile_ms,ps_compile_ms,"
                 "create_pso_ms,texture_decode_ms,draws,vertices,texture_upload_bytes,"
                 "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
                 "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work,"
                 "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses,topology_index_ms,"
-                "texture_watch_ms,texture_watch_queries,texture_watch_dirty_pages,texture_watch_skip_bytes,texture_watch_skips,texture_watch_audits,texture_watch_races,texture_watch_failures,vertex_cache,vertex_cache_hits,vertex_cache_misses,vertex_cache_bypasses,vertex_cache_compared_bytes,vertex_cache_storage_bytes,geometry_cache,geometry_cache_hits,geometry_cache_misses,geometry_cache_bypasses,geometry_cache_queries,geometry_cache_dirty_pages,geometry_cache_storage_bytes,geometry_cache_audits,geometry_cache_races,geometry_cache_failures,geometry_cache_query_ms,geometry_cache_begin_ms,geometry_cache_store_ms,geometry_cache_copy_ms,geometry_cache_hit_vertices,geometry_cache_hit_refs,vertex_workers,vertex_worker_draws,vertex_worker_vertices,vertex_worker_large_draws,vertex_worker_large_vertices,vertex_worker_parallel_draws,vertex_worker_parallel_vertices,vertex_worker_jobs,vertex_worker_bypasses,vertex_worker_audits,vertex_worker_races,vertex_worker_failures,vertex_worker_wait_ms,shader_disk_load_ms,shader_disk_store_ms,shader_blob_create_ms,shader_disk_load_calls,shader_disk_store_calls,vs_blob_lookup_ms,ps_blob_lookup_ms\n");
+                "texture_watch_ms,texture_watch_queries,texture_watch_dirty_pages,texture_watch_skip_bytes,texture_watch_skips,texture_watch_audits,texture_watch_races,texture_watch_failures,vertex_cache,vertex_cache_hits,vertex_cache_misses,vertex_cache_bypasses,vertex_cache_compared_bytes,vertex_cache_storage_bytes,geometry_cache,geometry_cache_hits,geometry_cache_misses,geometry_cache_bypasses,geometry_cache_queries,geometry_cache_dirty_pages,geometry_cache_storage_bytes,geometry_cache_audits,geometry_cache_races,geometry_cache_failures,geometry_cache_query_ms,geometry_cache_begin_ms,geometry_cache_store_ms,geometry_cache_copy_ms,geometry_cache_hit_vertices,geometry_cache_hit_refs,vertex_workers,vertex_worker_draws,vertex_worker_vertices,vertex_worker_large_draws,vertex_worker_large_vertices,vertex_worker_parallel_draws,vertex_worker_parallel_vertices,vertex_worker_jobs,vertex_worker_bypasses,vertex_worker_audits,vertex_worker_races,vertex_worker_failures,vertex_worker_wait_ms,shader_disk_load_ms,shader_disk_store_ms,shader_blob_create_ms,shader_disk_load_calls,shader_disk_store_calls,vs_blob_lookup_ms,ps_blob_lookup_ms\n",32768,2048))
+                fprintf(stderr,"[profile-buffer] renderer allocation failed\n");
         }
     }
-    if (csv) {
+    if (csv->rows) {
         extern void cellGcmGetBlitProfile(u64*,u64*,u64*);
         static u64 previous_ticks,previous_pixels,previous_row_pixels;
         u64 blit_ticks,blit_pixels,blit_row_pixels;
@@ -6243,7 +6260,7 @@ static void ld_profile_present(u32 frame)
         static u64 previous_geom_begin_ticks, previous_geom_store_ticks, previous_geom_copy_ticks, previous_geom_hit_vertices, previous_geom_hit_refs;
         static ld_vertex_worker_stats previous_workers;
         static u64 previous_worker_wait_ticks;
-        fprintf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+        rsx_profile_buffer_printf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
             "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
@@ -6347,7 +6364,6 @@ static void ld_profile_present(u32 frame)
         previous_watch_failures=g_texture_watch_failures;
         previous_limit_ticks=g_ld_frame_limit_wait_ticks;
         previous_ticks=blit_ticks; previous_pixels=blit_pixels; previous_row_pixels=blit_row_pixels;
-        if ((frame & 63u) == 0) fflush(csv);
     }
     ld_pull_profile(frame,now);
     g_ld_profile.measured_frames++;
@@ -6377,7 +6393,7 @@ static void ld_profile_present(u32 frame)
             flush_reason[LD_FLUSH_PIXEL_CONSTANT_RING]) != 0 ||
         LD_PROFILE_DELTA(ps_constant_capacity_failures) != 0;
 
-    if (emit) {
+    if (emit && !csv->rows) {
         DXGI_QUERY_VIDEO_MEMORY_INFO memory = {0};
         if (g_ld_profile.adapter)
             g_ld_profile.adapter->lpVtbl->QueryVideoMemoryInfo(
@@ -9820,6 +9836,9 @@ double rsx_live_draw_get_present_fps(void)
 
 void rsx_live_draw_dump_present_samples(void)
 {
+#if defined(YZ_PERF_PROFILE)
+    ld_profile_buffers_dump();
+#endif
     ld_pull_summary();
     ld_present_measure_dump();
     ld_texture_watch_summary();
@@ -11514,6 +11533,11 @@ void rsx_live_draw_present(u32 buffer_id)
 void rsx_live_draw_shutdown(void)
 {
     if (!g.ready) return;
+#if defined(YZ_PERF_PROFILE)
+    ld_profile_buffers_dump();
+    rsx_profile_buffer_destroy(&g_ld_profile_csv);
+    rsx_profile_buffer_destroy(&g_ld_geometry_csv);
+#endif
     ld_vertex_worker_summary();
     ld_vertex_workers_clear();
     ld_geometry_cache_summary();
