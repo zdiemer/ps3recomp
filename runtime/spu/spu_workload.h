@@ -34,6 +34,40 @@ extern "C" {
 
 typedef void (*spu_lifted_entry_fn)(spu_context*);
 
+/* Optional async-task lifecycle probe. The caller registers this once during
+ * startup, before any async SPU workers are dispatched, and leaves it unchanged
+ * until shutdown. QPC values are host QueryPerformanceCounter ticks. The
+ * callback runs on the submitting or worker thread and must be bounded. */
+typedef struct {
+    uint64_t job_id;
+    int32_t image_id;
+    uint32_t args_ea;
+    uint32_t taskset_ea;
+    uint32_t taskid;
+    uint32_t r3[4];
+    uint32_t have_r3;
+} spu_async_trace_snapshot;
+
+enum {
+    SPU_ASYNC_TRACE_SUBMIT = 1,
+    SPU_ASYNC_TRACE_CREATE_THREAD = 2,
+    SPU_ASYNC_TRACE_WORKER_SETUP = 3,
+    SPU_ASYNC_TRACE_ABI_EXECUTION = 4,
+    SPU_ASYNC_TRACE_POST_EXECUTION = 5,
+    SPU_ASYNC_TRACE_THREAD_CLEANUP = 6,
+    SPU_ASYNC_TRACE_CREATE_THREAD_FAILED = 7,
+    SPU_ASYNC_TRACE_SETUP_FAILED = 8
+};
+
+typedef void (*spu_async_trace_callback)(unsigned phase,
+                                         const spu_async_trace_snapshot* snapshot,
+                                         uint64_t begin_qpc,
+                                         uint64_t end_qpc);
+
+/* Diagnostic callback registration; setting NULL disables lifecycle probes.
+ * The callback must be installed before workers start and remain immutable. */
+void spu_workload_set_async_trace_callback(spu_async_trace_callback callback);
+
 /* FNV-1a 64-bit over a byte range. The canonical workload fingerprint; the
  * offline extractor computes the same value so registrations and the images a
  * title passes to cellSpurs line up. */

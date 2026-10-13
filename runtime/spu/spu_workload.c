@@ -218,7 +218,42 @@ typedef struct {
     uint32_t            taskid;
     int                 heap_context; /* captured experiment mode per dispatch */
     int                 byte_ops_simd;
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+    spu_async_trace_snapshot trace_snapshot;
+#endif
 } spu_async_job;
+
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+static spu_async_trace_callback s_async_trace_callback;
+static volatile LONG64 s_async_trace_next_job_id;
+
+void spu_workload_set_async_trace_callback(spu_async_trace_callback callback)
+{
+    /* Startup-only by contract: publication happens before worker creation. */
+    s_async_trace_callback = callback;
+}
+
+static uint64_t spu_async_trace_qpc(void)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (uint64_t)now.QuadPart;
+}
+
+static void spu_async_trace_emit(unsigned phase,
+                                 const spu_async_trace_snapshot* snapshot,
+                                 uint64_t begin_qpc, uint64_t end_qpc)
+{
+    spu_async_trace_callback callback = s_async_trace_callback;
+    if (callback && snapshot && snapshot->job_id)
+        callback(phase, snapshot, begin_qpc, end_qpc);
+}
+#else
+void spu_workload_set_async_trace_callback(spu_async_trace_callback callback)
+{
+    (void)callback;
+}
+#endif
 
 SPU_THREAD_LOCAL int g_spu_byte_ops_simd = 1;
 
@@ -396,8 +431,17 @@ static int spu_job_timing_enabled(int image)
     return !filter || atoi(filter) == image;
 }
 
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+static void spu_async_run(spu_async_job* j, uint64_t trace_worker_begin_qpc)
+#else
 static void spu_async_run(spu_async_job* j)
+#endif
 {
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+    const spu_async_trace_snapshot trace_snapshot = j->trace_snapshot;
+    uint64_t trace_abi_end_qpc = 0;
+    int trace_abi_completed = 0;
+#endif
     /* Opt-in wall times distinguish taskset-lock contention, image setup and
      * actual lifted execution. Persistent tasks report only when they exit. */
     const int timing = spu_job_timing_enabled(j->image_id);
@@ -688,6 +732,13 @@ static void spu_async_run(spu_async_job* j)
                 #undef RDBE32
             }
             spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+            if (trace_snapshot.job_id)
+                spu_async_trace_emit(SPU_ASYNC_TRACE_WORKER_SETUP, &trace_snapshot,
+                                     trace_worker_begin_qpc, spu_async_trace_qpc());
+            const uint64_t trace_abi_begin_qpc = trace_snapshot.job_id
+                                               ? spu_async_trace_qpc() : 0;
+#endif
             const uint64_t execute_start = timing ? spu_job_clock_ms() : 0;
             const uint64_t execute_qpc = timing ? spu_job_qpc() : 0;
             const uint64_t execute_cycles = timing ? spu_job_cycles() : 0;
@@ -711,6 +762,13 @@ static void spu_async_run(spu_async_job* j)
                 rc = spu_run_lifted_job_abi_profiled(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0, 0,
                                                 timing ? &abi_profile : NULL);
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+            trace_abi_end_qpc = trace_snapshot.job_id ? spu_async_trace_qpc() : 0;
+            trace_abi_completed = trace_snapshot.job_id != 0;
+            if (trace_abi_completed)
+                spu_async_trace_emit(SPU_ASYNC_TRACE_ABI_EXECUTION, &trace_snapshot,
+                                     trace_abi_begin_qpc, trace_abi_end_qpc);
+#endif
             if (timing) {
                 const uint64_t end = spu_job_clock_ms();
                 const uint64_t end_qpc = spu_job_qpc(), end_cycles = spu_job_cycles();
@@ -788,6 +846,17 @@ static void spu_async_run(spu_async_job* j)
         /* Persistent LS is retained in its taskset slot for the next task; a
          * per-dispatch LS is freed. */
         if (!ts_slot) free(ls);
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+        if (!loaded && trace_snapshot.job_id)
+            spu_async_trace_emit(SPU_ASYNC_TRACE_SETUP_FAILED, &trace_snapshot,
+                                 trace_worker_begin_qpc, spu_async_trace_qpc());
+#endif
+    } else {
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+        if (trace_snapshot.job_id)
+            spu_async_trace_emit(SPU_ASYNC_TRACE_SETUP_FAILED, &trace_snapshot,
+                                 trace_worker_begin_qpc, spu_async_trace_qpc());
+#endif
     }
     if (ts_slot) {
 #ifdef _WIN32
@@ -796,11 +865,21 @@ static void spu_async_run(spu_async_job* j)
         pthread_mutex_unlock(&ts_slot->lock);
 #endif
     }
+#if defined(YZ_PERF_PROFILE) && defined(_WIN32)
+    if (trace_abi_completed)
+        spu_async_trace_emit(SPU_ASYNC_TRACE_POST_EXECUTION, &trace_snapshot,
+                             trace_abi_end_qpc, spu_async_trace_qpc());
+#endif
     free(j);
 }
 
 #ifdef _WIN32
 static DWORD WINAPI spu_async_thread(LPVOID p) {
+#if defined(YZ_PERF_PROFILE)
+    spu_async_job* job = (spu_async_job*)p;
+    const spu_async_trace_snapshot trace_snapshot = job->trace_snapshot;
+    const uint64_t trace_worker_begin_qpc = trace_snapshot.job_id ? spu_async_trace_qpc() : 0;
+#endif
     g_spu_byte_ops_simd = ((spu_async_job*)p)->byte_ops_simd;
     const int image=((spu_async_job*)p)->image_id;
     const int timing=spu_job_timing_enabled(image);
@@ -810,13 +889,25 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
      * instead of killing the process silently with 0x80000001. */
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
     const uint64_t ready=timing?spu_job_cycles():0;
+#if defined(YZ_PERF_PROFILE)
+    spu_async_run((spu_async_job*)p, trace_worker_begin_qpc);
+#else
     spu_async_run((spu_async_job*)p);
+#endif
+#if defined(YZ_PERF_PROFILE)
+    const uint64_t trace_cleanup_begin_qpc = trace_snapshot.job_id ? spu_async_trace_qpc() : 0;
+#endif
     const uint64_t completed=timing?spu_job_cycles():0;
     /* Nothing on this stack may stay in the lock-line reserver set. */
     { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
       extern void spu_coh_forget_range(uintptr_t, uintptr_t);
       spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
       spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi); }
+#if defined(YZ_PERF_PROFILE)
+    if (trace_snapshot.job_id)
+        spu_async_trace_emit(SPU_ASYNC_TRACE_THREAD_CLEANUP, &trace_snapshot,
+                             trace_cleanup_begin_qpc, spu_async_trace_qpc());
+#endif
     if (timing) {
         const uint64_t end=spu_job_cycles();
         fprintf(stderr,"[spu-thread-time] image=%d end_qpc=%llu headroom_cycles=%llu job_cycles=%llu cleanup_cycles=%llu\n",
@@ -1303,8 +1394,35 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
     const int dispatch_timing = spu_job_timing_enabled(dispatch_image);
     const uint64_t dispatch_cycles = dispatch_timing ? spu_job_cycles() : 0;
     const uint64_t dispatch_qpc = dispatch_timing ? spu_job_qpc() : 0;
+#if defined(YZ_PERF_PROFILE)
+    memset(&j->trace_snapshot, 0, sizeof(j->trace_snapshot));
+    if (s_async_trace_callback) {
+        spu_async_trace_snapshot* snapshot = &j->trace_snapshot;
+        snapshot->job_id = (uint64_t)InterlockedIncrement64(&s_async_trace_next_job_id);
+        snapshot->image_id = j->image_id;
+        snapshot->args_ea = j->args_ea;
+        snapshot->taskset_ea = j->taskset_ea;
+        snapshot->taskid = j->taskid;
+        snapshot->have_r3 = (uint32_t)(j->have_r3 != 0);
+        if (j->have_r3) memcpy(snapshot->r3, j->r3, sizeof(snapshot->r3));
+        uint64_t submit_qpc = spu_async_trace_qpc();
+        spu_async_trace_emit(SPU_ASYNC_TRACE_SUBMIT, snapshot, submit_qpc, submit_qpc);
+    }
+    const spu_async_trace_snapshot trace_snapshot = j->trace_snapshot;
+    const uint64_t trace_create_begin_qpc = j->trace_snapshot.job_id
+                                           ? spu_async_trace_qpc() : 0;
+#endif
     HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
                              STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+#if defined(YZ_PERF_PROFILE)
+    const uint64_t trace_create_end_qpc = trace_snapshot.job_id ? spu_async_trace_qpc() : 0;
+    if (!th && trace_snapshot.job_id)
+        spu_async_trace_emit(SPU_ASYNC_TRACE_CREATE_THREAD_FAILED, &trace_snapshot,
+                             trace_create_begin_qpc, trace_create_end_qpc);
+    else if (trace_snapshot.job_id)
+        spu_async_trace_emit(SPU_ASYNC_TRACE_CREATE_THREAD, &trace_snapshot,
+                             trace_create_begin_qpc, trace_create_end_qpc);
+#endif
     if (!th) { free(j); return 0; }
     CloseHandle(th);   /* detached */
     if (dispatch_timing) {
