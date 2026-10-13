@@ -12,6 +12,9 @@ int ppu_native_memory_range(uint32_t address, uint32_t size);
 int ppu_native_memory_begin(uint32_t source, uint32_t source_size,
                             uint32_t destination, uint32_t destination_size,
                             uint32_t metadata, uint32_t metadata_size);
+/* Single owned destination, at most 1 MiB; success holds the same lock until
+ * end. Rejects any intersecting reservation, including partial edge lines. */
+int ppu_native_memory_begin_write(uint32_t destination, uint32_t size);
 void ppu_native_memory_end(void);
 #ifdef __cplusplus
 }
