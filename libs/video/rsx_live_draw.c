@@ -1290,6 +1290,8 @@ typedef struct {
     u64 vp_prepare_qpc, fp_prepare_qpc;
     u64 vp_cache_hits, vp_cache_misses;
     u64 pso_lookup_qpc;
+    u64 shader_disk_load_qpc, shader_disk_store_qpc, shader_blob_create_qpc;
+    u64 shader_disk_load_calls, shader_disk_store_calls;
     u64 vertex_refs_qpc;
     u64 vertex_remap_qpc;
     u64 vertex_plan_qpc;
@@ -4164,7 +4166,19 @@ static int shader_disk_cache_path(
     return length > 0 && length < MAX_PATH;
 }
 
-static ID3DBlob* shader_disk_cache_load(
+static HRESULT shader_disk_create_blob(size_t size, ID3DBlob** blob)
+{
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG begin = ld_profile_qpc();
+#endif
+    const HRESULT result = D3DCreateBlob(size, blob);
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.shader_blob_create_qpc += ld_profile_qpc() - begin;
+#endif
+    return result;
+}
+
+static ID3DBlob* shader_disk_cache_load_impl(
     u32 stage, const char* source, u32 source_length, u64 hash)
 {
     char path[MAX_PATH];
@@ -4197,7 +4211,7 @@ static ID3DBlob* shader_disk_cache_load(
             memcmp(stored_source, source, source_length) == 0;
     }
     if (valid) {
-        valid = SUCCEEDED(D3DCreateBlob(header.blob_length, &blob)) && blob &&
+        valid = SUCCEEDED(shader_disk_create_blob(header.blob_length, &blob)) && blob &&
             fread(blob->lpVtbl->GetBufferPointer(blob), 1,
                   header.blob_length, file) == header.blob_length;
     }
@@ -4219,7 +4233,21 @@ static ID3DBlob* shader_disk_cache_load(
     return blob;
 }
 
-static void shader_disk_cache_store(
+static ID3DBlob* shader_disk_cache_load(
+    u32 stage, const char* source, u32 source_length, u64 hash)
+{
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG begin = ld_profile_qpc();
+    ++g_ld_profile.total.shader_disk_load_calls;
+#endif
+    ID3DBlob* blob = shader_disk_cache_load_impl(stage, source, source_length, hash);
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.shader_disk_load_qpc += ld_profile_qpc() - begin;
+#endif
+    return blob;
+}
+
+static void shader_disk_cache_store_impl(
     u32 stage, const char* source, u32 source_length, u64 hash,
     ID3DBlob* blob)
 {
@@ -4266,6 +4294,19 @@ static void shader_disk_cache_store(
     const u32 stage_index = shader_disk_cache_stage_index(stage);
     const u64 value = ++g_ld_shader_disk_writes[stage_index];
     shader_disk_cache_progress(value);
+}
+
+static void shader_disk_cache_store(
+    u32 stage, const char* source, u32 source_length, u64 hash, ID3DBlob* blob)
+{
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG begin = ld_profile_qpc();
+    ++g_ld_profile.total.shader_disk_store_calls;
+#endif
+    shader_disk_cache_store_impl(stage, source, source_length, hash, blob);
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.shader_disk_store_qpc += ld_profile_qpc() - begin;
+#endif
 }
 
 static u64 ld_hash_structural_render_state(
@@ -6105,7 +6146,7 @@ static void ld_profile_present(u32 frame)
                 "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
                 "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work,"
                 "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses,topology_index_ms,"
-                "texture_watch_ms,texture_watch_queries,texture_watch_dirty_pages,texture_watch_skip_bytes,texture_watch_skips,texture_watch_audits,texture_watch_races,texture_watch_failures,vertex_cache,vertex_cache_hits,vertex_cache_misses,vertex_cache_bypasses,vertex_cache_compared_bytes,vertex_cache_storage_bytes,geometry_cache,geometry_cache_hits,geometry_cache_misses,geometry_cache_bypasses,geometry_cache_queries,geometry_cache_dirty_pages,geometry_cache_storage_bytes,geometry_cache_audits,geometry_cache_races,geometry_cache_failures,geometry_cache_query_ms,geometry_cache_begin_ms,geometry_cache_store_ms,geometry_cache_copy_ms,geometry_cache_hit_vertices,geometry_cache_hit_refs,vertex_workers,vertex_worker_draws,vertex_worker_vertices,vertex_worker_large_draws,vertex_worker_large_vertices,vertex_worker_parallel_draws,vertex_worker_parallel_vertices,vertex_worker_jobs,vertex_worker_bypasses,vertex_worker_audits,vertex_worker_races,vertex_worker_failures,vertex_worker_wait_ms\n");
+                "texture_watch_ms,texture_watch_queries,texture_watch_dirty_pages,texture_watch_skip_bytes,texture_watch_skips,texture_watch_audits,texture_watch_races,texture_watch_failures,vertex_cache,vertex_cache_hits,vertex_cache_misses,vertex_cache_bypasses,vertex_cache_compared_bytes,vertex_cache_storage_bytes,geometry_cache,geometry_cache_hits,geometry_cache_misses,geometry_cache_bypasses,geometry_cache_queries,geometry_cache_dirty_pages,geometry_cache_storage_bytes,geometry_cache_audits,geometry_cache_races,geometry_cache_failures,geometry_cache_query_ms,geometry_cache_begin_ms,geometry_cache_store_ms,geometry_cache_copy_ms,geometry_cache_hit_vertices,geometry_cache_hit_refs,vertex_workers,vertex_worker_draws,vertex_worker_vertices,vertex_worker_large_draws,vertex_worker_large_vertices,vertex_worker_parallel_draws,vertex_worker_parallel_vertices,vertex_worker_jobs,vertex_worker_bypasses,vertex_worker_audits,vertex_worker_races,vertex_worker_failures,vertex_worker_wait_ms,shader_disk_load_ms,shader_disk_store_ms,shader_blob_create_ms,shader_disk_load_calls,shader_disk_store_calls,vs_blob_lookup_ms,ps_blob_lookup_ms\n");
         }
     }
     if (csv) {
@@ -6123,7 +6164,7 @@ static void ld_profile_present(u32 frame)
         static ld_vertex_worker_stats previous_workers;
         static u64 previous_worker_wait_ticks;
         fprintf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.6f\n", frame, now, frame_ms,
+            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
@@ -6200,7 +6241,14 @@ static void ld_profile_present(u32 frame)
             (unsigned long long)(g_vertex_worker_stats.audits-previous_workers.audits),
             (unsigned long long)(g_vertex_worker_stats.races-previous_workers.races),
             (unsigned long long)(g_vertex_worker_stats.failures-previous_workers.failures),
-            ld_profile_ticks_ms(g_vertex_worker_wait_ticks-previous_worker_wait_ticks));
+            ld_profile_ticks_ms(g_vertex_worker_wait_ticks-previous_worker_wait_ticks),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_disk_load_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_disk_store_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_blob_create_qpc)),
+            (unsigned long long)LD_PROFILE_DELTA(shader_disk_load_calls),
+            (unsigned long long)LD_PROFILE_DELTA(shader_disk_store_calls),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(vs_blob_lookup_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(ps_blob_lookup_qpc)));
         previous_workers=g_vertex_worker_stats;
         previous_worker_wait_ticks=g_vertex_worker_wait_ticks;
         previous_geom_hits=g_geom_stats.hits; previous_geom_misses=g_geom_stats.misses;
