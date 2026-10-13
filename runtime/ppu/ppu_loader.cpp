@@ -1392,6 +1392,7 @@ static inline int vm_null_store(uint32_t a, uint32_t v, int width, void* ra)
  * per iteration (so the consecutive HOTREAD detectors reset). */
 /* Memory diagnostics are cold unless explicitly requested. Do not charge
  * every ordinary guest load/store for all the unrelated game probes. */
+/* BEGIN PPU INLINE READ ELIGIBILITY */
 static inline bool vm_memory_probes(void)
 {
 #ifdef VM_SAMPLE_READS
@@ -1407,6 +1408,32 @@ static inline bool vm_memory_probes(void)
     }();
     return enabled;
 }
+
+/* Generated PPU TUs may opt into an inline ordinary-RAM read path through
+ * PPU_INLINE_READS=ON. Keep it disabled until ppu_run initializes the exact
+ * same immutable diagnostic decision used by the out-of-line accessors. */
+extern "C" int ppu_native_reads_inline_enabled = 0;
+extern "C" void ppu_native_reads_inline_init(void)
+{
+    static int initialized = 0;
+    int expected = 0;
+    if (!__atomic_compare_exchange_n(&initialized, &expected, 1, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 2)
+            YieldProcessor();
+        return;
+    }
+
+    const char* request = getenv("PPU_INLINE_READS");
+    const int requested = request && strcmp(request, "ON") == 0;
+    const int probes = vm_memory_probes() ? 1 : 0;
+    ppu_native_reads_inline_enabled = requested && !probes && vm_base;
+    fprintf(stderr,
+        "[ppu-inline-reads] enabled=%d requested=%d probes=%d vm=%d\n",
+        ppu_native_reads_inline_enabled, requested, probes, vm_base != NULL);
+    __atomic_store_n(&initialized, 2, __ATOMIC_RELEASE);
+}
+/* END PPU INLINE READ ELIGIBILITY */
 static void vm_hotmap(uint32_t ea, int width)
 {
     static int en = -1; if (en < 0) en = getenv("PPU_HOTMAP") ? 1 : 0;
@@ -3846,6 +3873,10 @@ extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
 
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
+    /* Freeze the optional generated-code read policy before any guest code or
+     * guest-created host threads can execute. */
+    ppu_native_reads_inline_init();
+
     /* Preserve the host runner's buffering in quiet runs. Unbuffered Windows
      * stdio can issue a pipe write for each character and stall task dispatch.
      * Verbose diagnostics retain the immediate-output behavior. */
