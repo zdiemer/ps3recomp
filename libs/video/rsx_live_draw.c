@@ -4567,14 +4567,15 @@ static void ld_pull_update(void)
     int changed=0;
     if (g_ld_pull_enabled<0) {
         const char* option=getenv("RSX_GPU_VERTEX_PULL");
-        g_ld_pull_enabled=option && *option=='1';
+        g_ld_pull_enabled=option && option[0]>='1' && option[0]<='2' && !option[1]
+            ? option[0]-'0' : 0;
         control=getenv("RSX_GPU_VERTEX_PULL_FILE"); changed=1;
     }
     if (control && now>=next) {
         next=now+100;
         FILE* file=fopen(control,"r"); unsigned enabled;
         if (file) {
-            if (fscanf(file,"%u",&enabled)==1 && enabled<=1 && (int)enabled!=g_ld_pull_enabled) {
+            if (fscanf(file,"%u",&enabled)==1 && enabled<=2 && (int)enabled!=g_ld_pull_enabled) {
                 g_ld_pull_enabled=(int)enabled; changed=1;
             }
             fclose(file);
@@ -5721,7 +5722,13 @@ static void fetch_batches_hoisted(
     g_ld_profile.total.vertex_refs_qpc += ld_profile_qpc() - stage_begin;
     stage_begin = ld_profile_qpc();
 #endif
-    if (packed_payload && dc.n_refs > 1) {
+    /* Mode 2 trades repeated GPU vertex invocations for no CPU deduplication.
+     * Keep occurrence order and the existing restart/topology machinery. Even
+     * if raw packing later falls back, CPU fetching accepts unremapped refs.
+     * Geometry-cache operation deliberately retains its existing contract. */
+    const int pull_occurrences = g_ld_pull_enabled==2 &&
+        ld_vertex_mask_signature() && !ld_geometry_cache_enabled();
+    if (packed_payload && !pull_occurrences && dc.n_refs > 1) {
         u32 unique_refs = dc.n_refs;
         if (rsx_vertex_remap_build_ex(
                 &dc.ref_remap, dc.refs, dc.n_refs, &unique_refs,
