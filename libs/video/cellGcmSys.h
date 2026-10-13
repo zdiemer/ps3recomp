@@ -281,6 +281,10 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler);
 void cellGcmTickVBlank(void);
 void cellGcmTickFlip(void);
 
+/* Optional bounded diagnostic for slow FIFO drain calls. It is disabled unless
+ * GCM_SLOW_DRAIN_CSV names an output path; call once during orderly shutdown. */
+void cellGcm_fifo_slow_drain_dump(void);
+
 /* NID: 0xF9BFCDA3 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);
 
