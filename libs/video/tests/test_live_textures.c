@@ -1137,6 +1137,158 @@ static void native_vertex_worker_tests(void)
     VirtualFree(watch_guest,0,MEM_RELEASE); watch_guest=NULL;
     puts("Native vertex workers: 252 parallel format/size/mode comparisons, FP state, guards, resolver isolation, mutation audits, fault fallback and join/recreation passed");
 }
+static void texture_content_cache_gpu_tests(ID3D12Resource* rb)
+{
+    const u32 saved_upload_used=g.upload_used;
+    ID3D12Fence* content_fence=NULL;
+    OK(g.dev->lpVtbl->CreateFence(g.dev,0,D3D12_FENCE_FLAG_NONE,
+                                  &IID_ID3D12Fence,(void**)&content_fence));
+    OK(g.alloc->lpVtbl->Reset(g.alloc));
+    OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
+    ld_texture_content_clear();
+    g.upload_used=0;
+
+    u8 bc1_a[8]={0x31,0x42,0x53,0x64,0x75,0x86,0x97,0xA8};
+    u8 bc1_relocated[8]; memcpy(bc1_relocated,bc1_a,sizeof(bc1_a));
+    u8 bc1_changed[8]; memcpy(bc1_changed,bc1_a,sizeof(bc1_a)); bc1_changed[0]^=0x80;
+    tex_level_t level_a={4,4,bc1_a,8,1};
+    tex_level_t level_relocated={4,4,bc1_relocated,8,1};
+    tex_level_t level_changed={4,4,bc1_changed,8,1};
+    ID3D12Resource* held_first=create_texture_mipped_cached(
+        DXGI_FORMAT_BC1_UNORM,&level_a,1);
+    assert(held_first);
+    const u32 after_first=g.upload_used;
+    ID3D12Resource* same=create_texture_mipped_cached(
+        DXGI_FORMAT_BC1_UNORM,&level_relocated,1);
+    assert(same==held_first && g.upload_used==after_first);
+    same->lpVtbl->Release(same);
+    ID3D12Resource* changed=create_texture_mipped_cached(
+        DXGI_FORMAT_BC1_UNORM,&level_changed,1);
+    assert(changed && changed!=held_first && g.upload_used>after_first);
+
+    /* Exact level metadata and format participate in identity. */
+    u8 mip_bytes[16]; memset(mip_bytes,0xC3,sizeof(mip_bytes));
+    tex_level_t mip_levels[2]={{4,4,mip_bytes,8,1},{2,2,mip_bytes+8,8,1}};
+    ID3D12Resource* mip_texture=create_texture_mipped_cached(
+        DXGI_FORMAT_BC1_UNORM,mip_levels,2);
+    assert(mip_texture && mip_texture!=held_first && mip_texture!=changed);
+    u8 bc4_bytes[8]; memcpy(bc4_bytes,bc1_a,sizeof(bc4_bytes));
+    tex_level_t level_bc4={4,4,bc4_bytes,8,1};
+    ID3D12Resource* format_texture=create_texture_mipped_cached(
+        DXGI_FORMAT_BC4_UNORM,&level_bc4,1);
+    assert(format_texture && format_texture!=held_first && format_texture!=changed &&
+           format_texture!=mip_texture);
+
+    /* Force a hash collision against the first entry; exact bytes must reject it. */
+    u8 collision_bytes[8]; memcpy(collision_bytes,bc1_a,sizeof(collision_bytes));
+    collision_bytes[7]^=0x01;
+    tex_level_t collision_level={4,4,collision_bytes,8,1};
+    u64 first_hash=0; int first_found=0;
+    for (u32 i=0;i<LD_TEXTURE_CONTENT_ENTRIES;++i)
+        if (g_ld_texture_content.entries[i].resource==held_first) {
+            first_hash=g_ld_texture_content.entries[i].hash;
+            first_found=1;
+        }
+    assert(first_found);
+    const u64 compared_before=g_ld_texture_content.compared_bytes;
+    assert(!ld_texture_content_find(DXGI_FORMAT_BC1_UNORM,&collision_level,1,
+                                    collision_bytes,sizeof(collision_bytes),first_hash));
+    assert(g_ld_texture_content.compared_bytes==compared_before+sizeof(collision_bytes));
+    tex_level_t different_layout={4,4,bc1_a,4,2};
+    assert(!ld_texture_content_find(DXGI_FORMAT_BC1_UNORM,&different_layout,1,
+                                    bc1_a,sizeof(bc1_a),first_hash));
+    assert(!ld_texture_content_find(DXGI_FORMAT_BC1_UNORM,mip_levels,2,
+                                    bc1_a,sizeof(bc1_a),first_hash));
+    ID3D12Resource* format_hit=ld_texture_content_find(
+        DXGI_FORMAT_BC4_UNORM,&level_a,1,bc1_a,sizeof(bc1_a),first_hash);
+    assert(format_hit==format_texture && format_hit!=held_first);
+    format_hit->lpVtbl->Release(format_hit);
+    assert(!ld_texture_content_find(DXGI_FORMAT_BC1_UNORM_SRGB,&level_a,1,
+                                    bc1_a,sizeof(bc1_a),first_hash));
+
+    ID3D12Resource* retained_refs[]={held_first,changed,mip_texture,format_texture};
+    ld_texture_content_clear();
+    assert(g_ld_texture_content.count==0 && !g_ld_texture_content.scratch);
+    /* The caller reference keeps a cache-owned resource alive after clear. */
+    D3D12_RESOURCE_DESC desc; held_first->lpVtbl->GetDesc(held_first,&desc);
+    assert(desc.Format==DXGI_FORMAT_BC1_UNORM && desc.Width==4 && desc.MipLevels==1);
+    copy_source(held_first);
+    read_subresource(held_first,0,rb,8192,DXGI_FORMAT_BC1_UNORM,4,4);
+    OK(g.list->lpVtbl->Close(g.list));
+    ID3D12CommandList* lists[]={(ID3D12CommandList*)g.list};
+    g.queue->lpVtbl->ExecuteCommandLists(g.queue,1,lists);
+    OK(g.queue->lpVtbl->Signal(g.queue,content_fence,1));
+    OK(content_fence->lpVtbl->SetEventOnCompletion(content_fence,1,g.fence_event));
+    assert(WaitForSingleObject(g.fence_event,10000)==WAIT_OBJECT_0);
+    u8* readback_bytes; OK(rb->lpVtbl->Map(rb,0,NULL,(void**)&readback_bytes));
+    assert(!memcmp(readback_bytes+8192,bc1_a,sizeof(bc1_a)));
+    rb->lpVtbl->Unmap(rb,0,NULL);
+    for (u32 i=0;i<sizeof(retained_refs)/sizeof(retained_refs[0]);++i)
+        retained_refs[i]->lpVtbl->Release(retained_refs[i]);
+
+    /* Fill all entries and evict the oldest while keeping its caller ref. */
+    OK(g.alloc->lpVtbl->Reset(g.alloc));
+    OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
+    ld_texture_content_clear();
+    g.upload_used=0;
+    ID3D12Resource* eviction_refs[LD_TEXTURE_CONTENT_ENTRIES+1]={0};
+    u8 eviction_data[LD_TEXTURE_CONTENT_ENTRIES+1][8];
+    for (u32 i=0;i<LD_TEXTURE_CONTENT_ENTRIES+1;++i) {
+        for (u32 b=0;b<8;++b)
+            eviction_data[i][b]=(u8)((i>>(8u*(b&3u))) ^ (b*17u));
+        tex_level_t level={4,4,eviction_data[i],8,1};
+        eviction_refs[i]=create_texture_mipped_cached(DXGI_FORMAT_BC1_UNORM,&level,1);
+        assert(eviction_refs[i]);
+    }
+    assert(g_ld_texture_content.count==LD_TEXTURE_CONTENT_ENTRIES);
+    assert(g_ld_texture_content.evictions==1);
+    eviction_refs[0]->lpVtbl->GetDesc(eviction_refs[0],&desc);
+    assert(desc.Format==DXGI_FORMAT_BC1_UNORM && desc.Width==4);
+    copy_source(eviction_refs[0]);
+    read_subresource(eviction_refs[0],0,rb,12288,DXGI_FORMAT_BC1_UNORM,4,4);
+    ld_texture_content_clear();
+    assert(g_ld_texture_content.count==0);
+    OK(g.list->lpVtbl->Close(g.list));
+    g.queue->lpVtbl->ExecuteCommandLists(g.queue,1,lists);
+    OK(g.queue->lpVtbl->Signal(g.queue,content_fence,2));
+    OK(content_fence->lpVtbl->SetEventOnCompletion(content_fence,2,g.fence_event));
+    assert(WaitForSingleObject(g.fence_event,10000)==WAIT_OBJECT_0);
+    OK(rb->lpVtbl->Map(rb,0,NULL,(void**)&readback_bytes));
+    assert(!memcmp(readback_bytes+12288,eviction_data[0],sizeof(eviction_data[0])));
+    rb->lpVtbl->Unmap(rb,0,NULL);
+    for (u32 i=0;i<LD_TEXTURE_CONTENT_ENTRIES+1;++i)
+        eviction_refs[i]->lpVtbl->Release(eviction_refs[i]);
+
+    /* A full-ring preflight failure must leave the cursor/cache untouched. */
+    OK(g.alloc->lpVtbl->Reset(g.alloc));
+    OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
+    ld_texture_content_clear();
+    g.upload_used=UPLOAD_SIZE-100;
+    ID3D12Resource* failed=create_texture_mipped_cached(
+        DXGI_FORMAT_BC1_UNORM,&level_a,1);
+    assert(!failed && g.upload_used==UPLOAD_SIZE-100);
+    assert(g_ld_texture_content.count==0 && g_ld_texture_content.misses==1);
+    g.upload_used=0;
+    ID3D12Resource* retried=create_texture_mipped_cached(
+        DXGI_FORMAT_BC1_UNORM,&level_a,1);
+    assert(retried && g.upload_used>0 && g_ld_texture_content.count==1 &&
+           g_ld_texture_content.misses==2);
+    copy_source(retried);
+    read_subresource(retried,0,rb,16384,DXGI_FORMAT_BC1_UNORM,4,4);
+    ld_texture_content_clear();
+    OK(g.list->lpVtbl->Close(g.list));
+    g.queue->lpVtbl->ExecuteCommandLists(g.queue,1,lists);
+    OK(g.queue->lpVtbl->Signal(g.queue,content_fence,3));
+    OK(content_fence->lpVtbl->SetEventOnCompletion(content_fence,3,g.fence_event));
+    assert(WaitForSingleObject(g.fence_event,10000)==WAIT_OBJECT_0);
+    OK(rb->lpVtbl->Map(rb,0,NULL,(void**)&readback_bytes));
+    assert(!memcmp(readback_bytes+16384,bc1_a,sizeof(bc1_a)));
+    rb->lpVtbl->Unmap(rb,0,NULL);
+    retried->lpVtbl->Release(retried);
+    content_fence->lpVtbl->Release(content_fence);
+    g.upload_used=saved_upload_used;
+    puts("Texture content cache: relocation hit, changed bytes, format/mip identity, collision rejection, clear/eviction ref lifetime, upload-capacity retry and GPU readback passed");
+}
 
 static u64 override_epoch=1;
 static u8 override_pixels[4*4*4];
@@ -1156,6 +1308,9 @@ static const u8* test_override_pixels(u32 format,u32 w,u32 h,const u8* src,size_
 }
 static void override_tests(ID3D12Resource* rb)
 {
+    const u32 saved_frame=g_ld_frames, saved_cpu_work=g_ld_cpu_work;
+    /* Previous fallback readback leaves its cached BC resource in COPY_SOURCE. */
+    ld_texture_content_clear();
     OK(g.alloc->lpVtbl->Reset(g.alloc));
     OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
     g.upload_used=0;
@@ -1270,7 +1425,9 @@ int main(void)
         for (u32 b = 0; b < 16; ++b) assert(bytes[face*512+b] == 0x11 + face);
     assert(bytes[4096] == 0x35 && bytes[4097] == 0x79 && bytes[4098] == 0xB2 && bytes[4099] == 255);
     readback->lpVtbl->Unmap(readback,0,NULL);
-    override_tests(readback);
+    texture_content_cache_gpu_tests(readback);
+    override_tests(readback,0);
+    override_tests(readback,1);
     bias_tests();
     resolution_tests();
     postprocess_tests();
