@@ -285,6 +285,10 @@ void cellGcmTickFlip(void);
  * GCM_SLOW_DRAIN_CSV names an output path; call once during orderly shutdown. */
 void cellGcm_fifo_slow_drain_dump(void);
 
+/* Export the final opt-in VP burst experiment counters once during orderly
+ * shutdown. Periodic summaries require the file-control or profile mode. */
+void cellGcm_vp_burst_dump(void);
+
 /* NID: 0xF9BFCDA3 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);
 
