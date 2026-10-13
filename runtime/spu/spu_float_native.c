@@ -50,22 +50,27 @@ void spu_float_native_update(void) {
         const char* option=getenv("SPU_FLOAT_NATIVE");
         if (control || option) spu_float_native_set_mode(option && *option=='1');
         else spu_float_native_available();
-        /* control is initialized by available(), including when no mode env exists. */
+        /* available() initializes the control path, even without a mode env. */
         if (control && reported<0) spu_float_native_set_mode(0);
     }
     ULONGLONG now=GetTickCount64();
     if (control && now>=next_check) {
-        next_check=now+100; FILE* file=fopen(control,"r"); unsigned enabled;
+        next_check=now+100;
+        FILE* file=fopen(control,"r");
+        unsigned enabled;
         if (file) {
-            if (fscanf(file,"%u",&enabled)==1 && enabled<=1) spu_float_native_set_mode((int)enabled);
+            if (fscanf(file,"%u",&enabled)==1 && enabled<=1)
+                spu_float_native_set_mode((int)enabled);
             fclose(file);
         }
     }
 }
 void spu_float_native_summary(void) {
     fprintf(stderr,"[spu-float-native-summary] supported=%d enabled=%d validate=%d audits=%llu failures=%llu failed=%d\n",
-        supported,spu_float_native_active(),validate,__atomic_load_n(&audits,__ATOMIC_RELAXED),
-        __atomic_load_n(&failures,__ATOMIC_RELAXED),__atomic_load_n(&failed,__ATOMIC_RELAXED));
+        supported,spu_float_native_active(),validate,
+        __atomic_load_n(&audits,__ATOMIC_RELAXED),
+        __atomic_load_n(&failures,__ATOMIC_RELAXED),
+        __atomic_load_n(&failed,__ATOMIC_RELAXED));
 }
 static u128 validate_result(u128 result,u128 a,u128 b,u128 c,unsigned op) {
     if (!validate) return result;
@@ -91,7 +96,8 @@ static inline __attribute__((always_inline)) __m128i canonical(__m128i x) {
 static inline __attribute__((always_inline)) __m128i flush(__m128i x) { return canonical(x); }
 #define NATIVE __attribute__((target("avx512f")))
 #define ROUND (_MM_FROUND_TO_ZERO|_MM_FROUND_NO_EXC)
-NATIVE u128 spu_float_native_add(u128 a,u128 b) {
+NATIVE __m128 __vectorcall spu_float_native_add_ps(__m128 av,__m128 bv) {
+    u128 a,b; _mm_storeu_ps(a._f32,av); _mm_storeu_ps(b._f32,bv);
     __m128i aa=canonical(_mm_loadu_si128((const __m128i*)&a)),bb=canonical(_mm_loadu_si128((const __m128i*)&b));
     const __m128i em=_mm_set1_epi32(0x7f800000),limit=_mm_set1_epi32(0x7e800000);
     const int slow=_mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(
@@ -101,10 +107,11 @@ NATIVE u128 spu_float_native_add(u128 a,u128 b) {
         _mm512_castps128_ps512(_mm_castsi128_ps(bb)),ROUND);
     u128 r; _mm_storeu_si128((__m128i*)&r,flush(_mm_castps_si128(_mm512_castps512_ps128(result))));
     for (int i=0;i<4;++i) if (slow&(1<<i)) r._u32[i]=spu_float_add(a._u32[i],b._u32[i]);
-    if (validate) return validate_result(r,a,b,(u128){0},0);
-    return r;
+    if (validate) r=validate_result(r,a,b,(u128){0},0);
+    return _mm_loadu_ps(r._f32);
 }
-NATIVE u128 spu_float_native_mul(u128 a,u128 b) {
+NATIVE __m128 __vectorcall spu_float_native_mul_ps(__m128 av,__m128 bv) {
+    u128 a,b; _mm_storeu_ps(a._f32,av); _mm_storeu_ps(b._f32,bv);
     __m128i aa=canonical(_mm_loadu_si128((const __m128i*)&a)),bb=canonical(_mm_loadu_si128((const __m128i*)&b));
     const __m128i em=_mm_set1_epi32(0xff);
     __m128i ea=_mm_and_si128(_mm_srli_epi32(aa,23),em);
@@ -116,10 +123,11 @@ NATIVE u128 spu_float_native_mul(u128 a,u128 b) {
         _mm512_castps128_ps512(_mm_castsi128_ps(bb)),ROUND);
     u128 r; _mm_storeu_si128((__m128i*)&r,flush(_mm_castps_si128(_mm512_castps512_ps128(result))));
     for (int i=0;i<4;++i) if (slow&(1<<i)) r._u32[i]=spu_float_mul(a._u32[i],b._u32[i]);
-    if (validate) return validate_result(r,a,b,(u128){0},1);
-    return r;
+    if (validate) r=validate_result(r,a,b,(u128){0},1);
+    return _mm_loadu_ps(r._f32);
 }
-NATIVE u128 spu_float_native_madd(u128 a,u128 b,u128 c) {
+NATIVE __m128 __vectorcall spu_float_native_madd_ps(__m128 av,__m128 bv,__m128 cv) {
+    u128 a,b,c; _mm_storeu_ps(a._f32,av); _mm_storeu_ps(b._f32,bv); _mm_storeu_ps(c._f32,cv);
     __m128i aa=canonical(_mm_loadu_si128((const __m128i*)&a)),bb=canonical(_mm_loadu_si128((const __m128i*)&b)),cc=canonical(_mm_loadu_si128((const __m128i*)&c));
     const __m128i em=_mm_set1_epi32(0xff);
     __m128i ea=_mm_and_si128(_mm_srli_epi32(aa,23),em);
@@ -133,8 +141,8 @@ NATIVE u128 spu_float_native_madd(u128 a,u128 b,u128 c) {
         _mm512_castps128_ps512(_mm_castsi128_ps(bb)),_mm512_castps128_ps512(_mm_castsi128_ps(cc)),ROUND);
     u128 r; _mm_storeu_si128((__m128i*)&r,flush(_mm_castps_si128(_mm512_castps512_ps128(result))));
     for (int i=0;i<4;++i) if (slow&(1<<i)) r._u32[i]=spu_float_madd(a._u32[i],b._u32[i],c._u32[i]);
-    if (validate) return validate_result(r,a,b,c,2);
-    return r;
+    if (validate) r=validate_result(r,a,b,c,2);
+    return _mm_loadu_ps(r._f32);
 }
 
 #else

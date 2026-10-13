@@ -19,9 +19,28 @@ int spu_float_native_available(void);
 int spu_float_native_set_mode(int requested);
 void spu_float_native_update(void);
 void spu_float_native_summary(void);
+#ifdef SPU_FLOAT_NATIVE_HOST
+#include <xmmintrin.h>
+/* Keep the four lanes in vector registers across the Windows ABI boundary.
+ * Returning/passing u128 unions through an out-of-line C call spills every
+ * operand to memory, which is costly in the realtime audio DSP loops. */
+__m128 __vectorcall spu_float_native_add_ps(__m128 a,__m128 b);
+__m128 __vectorcall spu_float_native_mul_ps(__m128 a,__m128 b);
+__m128 __vectorcall spu_float_native_madd_ps(__m128 a,__m128 b,__m128 c);
+static inline u128 spu_float_native_add(u128 a,u128 b) {
+    u128 r; _mm_storeu_ps(r._f32,spu_float_native_add_ps(_mm_loadu_ps(a._f32),_mm_loadu_ps(b._f32))); return r;
+}
+static inline u128 spu_float_native_mul(u128 a,u128 b) {
+    u128 r; _mm_storeu_ps(r._f32,spu_float_native_mul_ps(_mm_loadu_ps(a._f32),_mm_loadu_ps(b._f32))); return r;
+}
+static inline u128 spu_float_native_madd(u128 a,u128 b,u128 c) {
+    u128 r; _mm_storeu_ps(r._f32,spu_float_native_madd_ps(_mm_loadu_ps(a._f32),_mm_loadu_ps(b._f32),_mm_loadu_ps(c._f32))); return r;
+}
+#else
 u128 spu_float_native_add(u128 a,u128 b);
 u128 spu_float_native_mul(u128 a,u128 b);
 u128 spu_float_native_madd(u128 a,u128 b,u128 c);
+#endif
 #ifdef __cplusplus
 }
 #endif

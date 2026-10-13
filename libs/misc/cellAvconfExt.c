@@ -20,6 +20,11 @@ extern u8* vm_base;
  * -----------------------------------------------------------------------*/
 
 static float s_gamma = 1.0f;
+static u32 s_downmixer;
+u32 ps3_audio_out_downmixer(void)
+{
+    return __atomic_load_n(&s_downmixer, __ATOMIC_RELAXED);
+}
 
 /* ---------------------------------------------------------------------------
  * API implementations
@@ -30,9 +35,10 @@ s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
     (void)audioOut;
     (void)option;
 
-    /* Match the advertised LPCM modes. Encoded AC3/DTS is unsupported. */
+    /* All current host backends submit stereo PCM. Advertising surround here
+     * makes titles configure an eight-channel output without a downmixer. */
     if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM && fs == CELL_AUDIO_OUT_FS_48KHZ)
-        return CELL_AUDIO_OUT_CHNUM_8;
+        return CELL_AUDIO_OUT_CHNUM_2;
 
     return 0; /* not available */
 }
@@ -44,7 +50,7 @@ s32 cellAudioOutGetSoundAvailability2(u32 audioOut, u32 type, u32 fs, u32 ch, u3
 
     if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM &&
         fs == CELL_AUDIO_OUT_FS_48KHZ &&
-        (ch == CELL_AUDIO_OUT_CHNUM_2 || ch == CELL_AUDIO_OUT_CHNUM_6 || ch == CELL_AUDIO_OUT_CHNUM_8))
+        ch == CELL_AUDIO_OUT_CHNUM_2)
         return 1; /* available */
 
     return 0;
@@ -68,20 +74,12 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
     /* Retail ABI: eight-byte header and eight-byte sound modes. */
     info->portType = 0; /* HDMI */
     info->state = 1;    /* CELL_AUDIO_OUT_DEVICE_STATE_AVAILABLE */
-    info->availableModeCount = 3;
+    info->availableModeCount = 1;
     info->availableModes[0].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
     info->availableModes[0].channel = CELL_AUDIO_OUT_CHNUM_2;
     info->availableModes[0].fs      = CELL_AUDIO_OUT_FS_48KHZ;
-    info->availableModes[1].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
-    info->availableModes[1].channel = CELL_AUDIO_OUT_CHNUM_6;
-    info->availableModes[1].fs      = CELL_AUDIO_OUT_FS_48KHZ;
-    info->availableModes[2].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
-    info->availableModes[2].channel = CELL_AUDIO_OUT_CHNUM_8;
-    info->availableModes[2].fs      = CELL_AUDIO_OUT_FS_48KHZ;
     u32 ea = (u32)((u8*)info - vm_base);
     vm_write32(ea + 8 + 4, 0x00000001); /* stereo */
-    vm_write32(ea + 16 + 4, 0x00010000); /* 5.1 */
-    vm_write32(ea + 24 + 4, 0x40000000); /* 7.1 */
 
     return CELL_OK;
 }
@@ -103,6 +101,8 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
     memset(config, 0, sizeof(CellAudioOutConfiguration));
     config->channel = CELL_AUDIO_OUT_CHNUM_2;
     config->encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+    vm_write32((u32)((u8*)config - vm_base) + 12,
+               audioOut == 0 ? ps3_audio_out_downmixer() : 0);
 
     return CELL_OK;
 }
@@ -129,7 +129,7 @@ s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
     vm_write8(ea + 2, 0);
     vm_write8(ea + 3, 0);
     vm_write32(ea + 4, 0);                                  /* reserved       */
-    vm_write32(ea + 8, 0);                                  /* no down-mixer  */
+    vm_write32(ea + 8, audioOut == 0 ? ps3_audio_out_downmixer() : 0);
     vm_write8(ea + 12, CELL_AUDIO_OUT_CODING_TYPE_LPCM);       /* soundMode      */
     vm_write8(ea + 13, CELL_AUDIO_OUT_CHNUM_2);
     vm_write8(ea + 14, CELL_AUDIO_OUT_FS_48KHZ);
@@ -168,12 +168,17 @@ s32 cellVideoOutSetGamma(u32 videoOut, float gamma)
     return CELL_OK;
 }
 
-/* cellAudioOutConfigure(audioOut, config, option, waitForEvent) -- set the
- * audio output mode. We accept any config and report success (request id 0);
- * the title queries availability separately. NID 0x4692AB35. */
+/* The physical output remains stereo. Preserve a valid primary downmixer
+ * selection; as on the guest system, an invalid mode keeps the previous one.
+ * CellAudioOutConfiguration has ten reserved bytes and downMixer at +12. */
 s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option, u32 waitForEvent)
 {
-    (void)config; (void)option; (void)waitForEvent;
+    u32 ea = (u32)(uintptr_t)config;
+    if (!ea) return CELL_EINVAL;
+    if (audioOut == 0 && vm_read32(ea + 12) <= 2)
+        __atomic_store_n(&s_downmixer, vm_read32(ea + 12), __ATOMIC_RELAXED);
+    fprintf(stderr, "[audio-config] out=%u channels=%u encoder=%u downmixer=%u\n", audioOut, vm_read8(ea), vm_read8(ea+1), vm_read32(ea+12));
+    (void)option; (void)waitForEvent;
     printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
     return 0;
 }
