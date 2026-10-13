@@ -1427,6 +1427,182 @@ static LONGLONG ld_profile_qpc(void)
     return value.QuadPart;
 }
 
+/* Opt-in per-draw timing. This storage is compiled only into the profiling
+ * lane and allocated only when RSX_SLOW_DRAW_CSV names an output file. */
+#define LD_SLOW_DRAW_CAP 256u
+#define LD_SLOW_DRAW_STAGE_COUNT 4u
+typedef enum {
+    LD_SLOW_DRAW_GEOMETRY_PREP = 0,
+    LD_SLOW_DRAW_PIPELINE_CONSTANTS,
+    LD_SLOW_DRAW_RESOURCE_RESOLUTION,
+    LD_SLOW_DRAW_COMMAND_RECORDING
+} ld_slow_draw_stage_id;
+
+typedef struct {
+    u64 callback_id;
+    u64 qpc_begin, qpc_end;
+    u64 cycle_begin, cycle_end;
+    u64 stage_ticks[LD_SLOW_DRAW_STAGE_COUNT];
+    u32 frame, host_tid;
+    u32 primitive, packets, source_refs, vertices, topology_count;
+    u32 target, zslot, texture_mask, vertex_texture_mask;
+    u32 stage, cycle_valid;
+} ld_slow_draw_event;
+
+typedef struct {
+    int enabled, dumped;
+    const char* path;
+    u64 qpc_frequency, threshold_ticks;
+    u32 threshold_us;
+    u64 callbacks, recorded, overwritten;
+    u32 next;
+    ld_slow_draw_event* events;
+} ld_slow_draw_profile;
+
+typedef struct {
+    int active;
+    ld_slow_draw_event event;
+    u64 stage_begin;
+} ld_slow_draw_scope;
+
+static ld_slow_draw_profile g_ld_slow_draw;
+static SRWLOCK g_ld_slow_draw_lock = SRWLOCK_INIT;
+
+static void ld_slow_draw_configure(void)
+{
+    const char* path = getenv("RSX_SLOW_DRAW_CSV");
+    if (!path || !*path) return;
+    const char* threshold = getenv("RSX_SLOW_DRAW_THRESHOLD_US");
+    unsigned long threshold_us = threshold ? strtoul(threshold, NULL, 10) : 250ul;
+    if (!threshold_us || threshold_us > 1000000ul) threshold_us = 250ul;
+    g_ld_slow_draw.path = path;
+    g_ld_slow_draw.qpc_frequency = (u64)g_ld_profile.qpc_frequency;
+    if (!g_ld_slow_draw.qpc_frequency) {
+        g_ld_slow_draw.path = NULL;
+        return;
+    }
+    g_ld_slow_draw.threshold_us = (u32)threshold_us;
+    g_ld_slow_draw.threshold_ticks =
+        g_ld_slow_draw.qpc_frequency * threshold_us / 1000000ull;
+    g_ld_slow_draw.events = (ld_slow_draw_event*)calloc(
+        LD_SLOW_DRAW_CAP, sizeof(ld_slow_draw_event));
+    if (!g_ld_slow_draw.events) {
+        fprintf(stderr, "[slow-draw] could not allocate bounded event ring\n");
+        g_ld_slow_draw.path = NULL;
+        return;
+    }
+    g_ld_slow_draw.enabled = 1;
+}
+
+static void ld_slow_draw_begin(ld_slow_draw_scope* scope)
+{
+    memset(scope, 0, sizeof(*scope));
+    if (!g_ld_slow_draw.enabled) return;
+    scope->active = 1;
+    scope->event.callback_id = (u64)InterlockedIncrement64(
+        (volatile LONG64*)&g_ld_slow_draw.callbacks);
+    scope->event.frame = g_ld_frames;
+    scope->event.host_tid = GetCurrentThreadId();
+    scope->event.target = UINT32_MAX;
+    scope->event.zslot = UINT32_MAX;
+    scope->event.qpc_begin = (u64)ld_profile_qpc();
+    scope->stage_begin = scope->event.qpc_begin;
+    scope->event.cycle_valid = (u32)QueryThreadCycleTime(
+        GetCurrentThread(), &scope->event.cycle_begin);
+}
+
+static void ld_slow_draw_advance(ld_slow_draw_scope* scope,
+                                ld_slow_draw_stage_id next_stage)
+{
+    if (!scope || !scope->active) return;
+    const u64 now = (u64)ld_profile_qpc();
+    if (scope->event.stage < LD_SLOW_DRAW_STAGE_COUNT && now >= scope->stage_begin)
+        scope->event.stage_ticks[scope->event.stage] += now - scope->stage_begin;
+    scope->event.stage = (u32)next_stage;
+    scope->stage_begin = now;
+}
+
+static void ld_slow_draw_finish(ld_slow_draw_scope* scope)
+{
+    if (!scope || !scope->active) return;
+    scope->event.cycle_valid = scope->event.cycle_valid &&
+        QueryThreadCycleTime(GetCurrentThread(), &scope->event.cycle_end);
+    if (scope->event.cycle_end < scope->event.cycle_begin)
+        scope->event.cycle_valid = 0;
+    scope->event.qpc_end = (u64)ld_profile_qpc();
+    if (scope->event.stage < LD_SLOW_DRAW_STAGE_COUNT &&
+        scope->event.qpc_end >= scope->stage_begin)
+        scope->event.stage_ticks[scope->event.stage] +=
+            scope->event.qpc_end - scope->stage_begin;
+    if (scope->event.qpc_end < scope->event.qpc_begin ||
+        scope->event.qpc_end - scope->event.qpc_begin <
+            g_ld_slow_draw.threshold_ticks)
+        return;
+    AcquireSRWLockExclusive(&g_ld_slow_draw_lock);
+    g_ld_slow_draw.events[g_ld_slow_draw.next] = scope->event;
+    g_ld_slow_draw.next = (g_ld_slow_draw.next + 1u) % LD_SLOW_DRAW_CAP;
+    if (g_ld_slow_draw.recorded < LD_SLOW_DRAW_CAP)
+        ++g_ld_slow_draw.recorded;
+    else
+        ++g_ld_slow_draw.overwritten;
+    ReleaseSRWLockExclusive(&g_ld_slow_draw_lock);
+}
+
+static void ld_slow_draw_dump(void)
+{
+    if (!g_ld_slow_draw.enabled || g_ld_slow_draw.dumped) return;
+    FILE* csv = fopen(g_ld_slow_draw.path, "wb");
+    if (!csv) {
+        fprintf(stderr, "[slow-draw] cannot open %s\n", g_ld_slow_draw.path);
+        return;
+    }
+    AcquireSRWLockExclusive(&g_ld_slow_draw_lock);
+    g_ld_slow_draw.dumped = 1;
+    fprintf(csv,
+        "qpc_frequency,threshold_us,callback_id,frame,host_tid,qpc_begin,qpc_end,wall_ms,"
+        "thread_cycles_valid,thread_cycles_begin,thread_cycles_end,thread_cycles_delta_not_ms,"
+        "primitive,packets,source_refs,vertices,topology_count,"
+        "target,zslot,texture_mask,vertex_texture_mask,geometry_preparation_ms,pipeline_constants_ms,"
+        "resource_resolution_ms,command_recording_ms\n");
+    const u64 first = (g_ld_slow_draw.next + LD_SLOW_DRAW_CAP -
+        g_ld_slow_draw.recorded) % LD_SLOW_DRAW_CAP;
+    const double scale = g_ld_slow_draw.qpc_frequency
+        ? 1000.0 / (double)g_ld_slow_draw.qpc_frequency : 0.0;
+    const unsigned long threshold_us = g_ld_slow_draw.threshold_us;
+    for (u64 i = 0; i < g_ld_slow_draw.recorded; ++i) {
+        const ld_slow_draw_event* e =
+            &g_ld_slow_draw.events[(first + i) % LD_SLOW_DRAW_CAP];
+        const u64 cycles = e->cycle_valid && e->cycle_end >= e->cycle_begin
+            ? e->cycle_end - e->cycle_begin : 0;
+        fprintf(csv,
+            "%llu,%lu,%llu,%u,%u,%llu,%llu,%.6f,%u,%llu,%llu,%llu,%u,%u,%u,%u,%u,"
+            "%u,%u,0x%08X,0x%08X,%.6f,%.6f,%.6f,%.6f\n",
+            (unsigned long long)g_ld_slow_draw.qpc_frequency, threshold_us,
+            (unsigned long long)e->callback_id, e->frame, e->host_tid,
+            (unsigned long long)e->qpc_begin,
+            (unsigned long long)e->qpc_end,
+            (e->qpc_end - e->qpc_begin) * scale, e->cycle_valid,
+            (unsigned long long)e->cycle_begin,
+            (unsigned long long)e->cycle_end,
+            (unsigned long long)cycles, e->primitive, e->packets,
+            e->source_refs, e->vertices, e->topology_count, e->target, e->zslot,
+            e->texture_mask, e->vertex_texture_mask,
+            e->stage_ticks[LD_SLOW_DRAW_GEOMETRY_PREP] * scale,
+            e->stage_ticks[LD_SLOW_DRAW_PIPELINE_CONSTANTS] * scale,
+            e->stage_ticks[LD_SLOW_DRAW_RESOURCE_RESOLUTION] * scale,
+            e->stage_ticks[LD_SLOW_DRAW_COMMAND_RECORDING] * scale);
+    }
+    fclose(csv);
+    ReleaseSRWLockExclusive(&g_ld_slow_draw_lock);
+    fprintf(stderr,
+        "[slow-draw] saved=%llu overwritten=%llu callbacks=%llu threshold_us=%lu "
+        "thread_cycles_are_raw_counts_not_ms path=%s\n",
+        (unsigned long long)g_ld_slow_draw.recorded,
+        (unsigned long long)g_ld_slow_draw.overwritten,
+        (unsigned long long)g_ld_slow_draw.callbacks, threshold_us,
+        g_ld_slow_draw.path);
+}
+
 static void ld_profile_note_texture_create(
     LONGLONG begin, const D3D12_RESOURCE_DESC* desc)
 {
@@ -8160,7 +8336,11 @@ static void write_topology_indices(u32 prim, u32* indices)
     }
 }
 
-static void sink_end_impl(void* user, const rsx_dispatch* r)
+static void sink_end_impl(void* user, const rsx_dispatch* r
+#if defined(YZ_PERF_PROFILE)
+                          , ld_slow_draw_scope* slow_draw
+#endif
+                          )
 {
     g_ld_pull_active=0;
     (void)user; (void)r;
@@ -8206,6 +8386,14 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         }
     }
     const u32 prim = g.rsx.current_primitive;
+#if defined(YZ_PERF_PROFILE)
+    if (slow_draw && slow_draw->active) {
+        slow_draw->event.primitive = prim;
+        slow_draw->event.packets = dc.n_packets;
+        slow_draw->event.vertices = dc.n_verts;
+        slow_draw->event.source_refs = dc.n_source_refs;
+    }
+#endif
     rsx_vertex_layout_plan used_layout;
     ld_current_vertex_layout(&used_layout);
 #if defined(YZ_PERF_PROFILE)
@@ -8249,6 +8437,13 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g_ld_stats.group_drop_degenerate++;
         return;
     }
+#if defined(YZ_PERF_PROFILE)
+    if (slow_draw && slow_draw->active) {
+        slow_draw->event.source_refs = dc.n_source_refs;
+        slow_draw->event.vertices = dc.n_verts;
+        slow_draw->event.topology_count = n_tri;
+    }
+#endif
 
     live_a010_geom_trace(prim, n_tri);
 
@@ -8298,6 +8493,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     }
 
 #if defined(YZ_PERF_PROFILE)
+    ld_slow_draw_advance(slow_draw, LD_SLOW_DRAW_PIPELINE_CONSTANTS);
     const LONGLONG pso_begin=ld_profile_qpc();
 #endif
     ID3D12PipelineState* pso = get_pso(
@@ -8348,6 +8544,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         return;
     }
 
+#if defined(YZ_PERF_PROFILE)
+    ld_slow_draw_advance(slow_draw, LD_SLOW_DRAW_RESOURCE_RESOLUTION);
+#endif
     const u32 target = current_surface();
     if (target == LD_INVALID_SURFACE) {
         live_draw_csv_emit(prim, n_tri, "drop_surface");
@@ -8591,6 +8790,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     const u32 current_zslot = g.depth
         ? zdepth_get(sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h)
         : 0;
+#if defined(YZ_PERF_PROFILE)
+    if (slow_draw && slow_draw->active)
+        slow_draw->event.zslot = current_zslot;
+#endif
     u32 slots[SRV_TABLE_SIZE], smp_slots[SMP_TABLE_SIZE];
     u32 surf_used[SRV_TABLE_SIZE], n_surf_used = 0;
     u32 zdepth_used[SRV_TABLE_SIZE], n_zdepth_used = 0;
@@ -8936,6 +9139,13 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     }
 
     const u32 vtex_mask = vertex_texture_mask();
+#if defined(YZ_PERF_PROFILE)
+    if (slow_draw && slow_draw->active) {
+        slow_draw->event.target = target;
+        slow_draw->event.texture_mask = texture_mask;
+        slow_draw->event.vertex_texture_mask = vtex_mask;
+    }
+#endif
     /* Diagnostic unit mask: isolate texture-dependent fragment calculations. */
     { static u32 white_units = ~0u;
       static u32 white_surface, white_attributes;
@@ -8978,6 +9188,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g.smp_ring_used = 0;
     }
 
+#if defined(YZ_PERF_PROFILE)
+    ld_slow_draw_advance(slow_draw, LD_SLOW_DRAW_COMMAND_RECORDING);
+#endif
     D3D12_RESOURCE_BARRIER bar = {0};
     bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -9254,11 +9467,19 @@ static void sink_end(void* user, const rsx_dispatch* r)
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG begin = ld_profile_qpc();
     if (!g_ld_profile.first_draw_qpc) g_ld_profile.first_draw_qpc=begin;
-#endif
-    sink_end_impl(user, r);
-#if defined(YZ_PERF_PROFILE)
+    ld_slow_draw_scope slow_draw;
+    ld_slow_draw_scope* slow_draw_ptr = NULL;
+    if (g_ld_slow_draw.enabled) {
+        ld_slow_draw_begin(&slow_draw);
+        slow_draw_ptr = &slow_draw;
+    }
+    sink_end_impl(user, r, slow_draw_ptr);
     g_ld_profile.last_draw_qpc=ld_profile_qpc();
-    g_ld_profile.total.sink_end_qpc += (u64)(g_ld_profile.last_draw_qpc - begin);
+    g_ld_profile.total.sink_end_qpc +=
+        (u64)(g_ld_profile.last_draw_qpc - begin);
+    if (slow_draw_ptr) ld_slow_draw_finish(slow_draw_ptr);
+#else
+    sink_end_impl(user, r);
 #endif
 }
 
@@ -9568,6 +9789,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     ld_present_measure_init();
 #if defined(YZ_PERF_PROFILE)
     memset(&g_ld_profile, 0, sizeof(g_ld_profile));
+    memset(&g_ld_slow_draw, 0, sizeof(g_ld_slow_draw));
     {
         LARGE_INTEGER frequency;
         QueryPerformanceFrequency(&frequency);
@@ -9898,6 +10120,9 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     sink.flip = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
 
+#if defined(YZ_PERF_PROFILE)
+    ld_slow_draw_configure();
+#endif
     g.ready = 1;
     g.enabled = 1;
     return 0;
@@ -10193,6 +10418,7 @@ void rsx_live_draw_dump_present_samples(void)
 {
     ld_texture_content_summary();
 #if defined(YZ_PERF_PROFILE)
+    ld_slow_draw_dump();
     ld_profile_buffers_dump();
 #endif
     ld_pull_summary();
@@ -11888,13 +12114,24 @@ void rsx_live_draw_present(u32 buffer_id)
 
 void rsx_live_draw_shutdown(void)
 {
-    if (!g.ready) { ld_texture_content_clear(); return; }
+    if (!g.ready) {
 #if defined(YZ_PERF_PROFILE)
+        ld_slow_draw_dump();
+        free(g_ld_slow_draw.events);
+        memset(&g_ld_slow_draw, 0, sizeof(g_ld_slow_draw));
+#endif
+        ld_texture_content_clear();
+        return;
+    }
+#if defined(YZ_PERF_PROFILE)
+    ld_slow_draw_dump();
     ld_profile_buffers_dump();
     rsx_profile_buffer_destroy(&g_ld_profile_csv);
     rsx_profile_buffer_destroy(&g_ld_geometry_csv);
     rsx_profile_buffer_destroy(&g_ld_texture_misses_csv);
     rsx_profile_buffer_destroy(&g_ld_texture_content_csv);
+    free(g_ld_slow_draw.events);
+    memset(&g_ld_slow_draw, 0, sizeof(g_ld_slow_draw));
 #endif
     ld_vertex_worker_summary();
     ld_vertex_workers_clear();
