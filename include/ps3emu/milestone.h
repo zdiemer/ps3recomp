@@ -11,21 +11,23 @@
  *
  *  - It must not distort timing. Verbose tracing starves guest threads and
  *    changes behaviour, so a gate built on it would lie about the thing it is
- *    supposed to be checking. A repeat occurrence here costs one string hash and
- *    one relaxed atomic add; nothing formats, allocates or locks.
+ *    supposed to be checking. A repeat occurrence costs one string hash and
+ *    one relaxed atomic add. First keys, scalar facts and count checkpoints
+ *    enter a fixed bounded queue; a background writer owns all file operations.
+ *    It checkpoints counts every couple of seconds on its own timer, even if
+ *    no guest thread reaches another milestone.
  *
  *  - It must survive a hang. The interesting failure is a title that stops
  *    making progress, and a process killed on a timeout never reaches atexit().
- *    So the ordered stream is appended to the file as each key is FIRST seen,
- *    not buffered until the end, and the occurrence counts are re-appended
- *    every couple of seconds -- last block wins. Nothing here needs the clean
- *    exit, which matters because almost no gated title gets one: an
- *    atexit-only counts section is a section the regression gate never sees,
- *    and "did it stop drawing?" is a question only the counts can answer.
+ *    So first keys and scalar facts are appended by the writer as they arrive,
+ *    and occurrence counts are re-appended every couple of seconds -- last
+ *    block wins. Nothing here needs the clean exit, which matters because
+ *    almost no gated title gets one. Queue saturation is reported in the log
+ *    as an explicit overflow marker rather than silently dropping records.
  *
- *  - It must cost nothing when unused. With PS3_MILESTONE_OUT unset the whole
- *    module is one relaxed load and a return, so it stays compiled into every
- *    port with no reason to ever gate it out.
+ *  - It must cost almost nothing when unused. With PS3_MILESTONE_OUT unset the
+ *    entry points perform atomic state checks and return without creating a
+ *    thread or touching a file, so it stays compiled into every port.
  *
  * Ports need no code of their own: the hooks live in the shared runtime, at the
  * choke points every title already funnels through (ps3_hle_call, lv2_syscall,
@@ -43,9 +45,9 @@ extern "C" {
 
 /* Record one occurrence of `key`.
  *
- * The first occurrence is assigned the next ordinal and appended to the log
- * immediately; later ones only bump a counter. `key` is copied, so callers may
- * pass a stack buffer.
+ * The first occurrence is assigned the next ordinal and queued for the log
+ * writer; later ones only bump a counter. `key` is copied, so callers may pass
+ * a stack buffer. The bounded queue reports any saturation in the output.
  *
  * Keys are namespaced by a prefix so the diff reads well and so regress.py can
  * group them: "hle:" firmware imports, "sys:" lv2 syscalls, "rsx:" draw paths,
@@ -58,15 +60,16 @@ void ps3_ms(const char* key);
  * that and call this only on the first sighting. */
 void ps3_msf(const char* fmt, ...);
 
-/* Record a scalar fact -- functions lifted, imports left unresolved. Written
- * to the log as it is set, so it survives a kill like the ordered stream
+/* Record a scalar fact -- functions lifted, imports left unresolved. Queued
+ * for the writer as it is set, so it survives a kill like the ordered stream
  * does; recording the same key again appends, and the reader takes the last
  * line for it. */
 void ps3_ms_kv(const char* key, long long value);
 
-/* Write the final counts section and close the log. Registered with atexit() on
- * first use; calling it directly is safe and idempotent. Counts are also
- * checkpointed as the run goes, so this is the tidy ending, not the only one. */
+/* Stop accepting records, let the writer drain, write final counts and close
+ * the log. Registered with atexit() on first use; calling it directly is safe
+ * and idempotent. Counts are also checkpointed as the run goes, so this is the
+ * tidy ending, not the only one. */
 void ps3_ms_dump(void);
 
 #ifdef __cplusplus
