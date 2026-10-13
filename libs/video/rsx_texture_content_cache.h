@@ -75,8 +75,9 @@ static ID3D12Resource* ld_texture_content_find(DXGI_FORMAT fmt,
     }
     return NULL;
 }
-static ID3D12Resource* create_texture_mipped_cached(
-    DXGI_FORMAT fmt,const tex_level_t* levels,u32 count)
+static ID3D12Resource* create_texture_mipped_cached_scoped(
+    DXGI_FORMAT fmt,const tex_level_t* levels,u32 count,
+    ld_slow_texture_detail* slow_detail)
 {
     ++g_ld_texture_content.requests;
     u64 size=0;
@@ -114,7 +115,7 @@ static ID3D12Resource* create_texture_mipped_cached(
         g_ld_texture_content.scratch,(u32)size,hash);
     if (resource) { ++g_ld_texture_content.hits; return resource; }
     ++g_ld_texture_content.misses;
-    resource=create_texture_mipped(fmt,snapshot,count);
+    resource=create_texture_mipped_scoped(fmt,snapshot,count,slow_detail);
     if (!resource) return NULL;
 
     D3D12_RESOURCE_DESC desc;
@@ -156,6 +157,11 @@ static ID3D12Resource* create_texture_mipped_cached(
     return resource;
 bypass:
     ++g_ld_texture_content.bypasses;
-    return create_texture_mipped(fmt,levels,count);
+    return create_texture_mipped_scoped(fmt,levels,count,slow_detail);
+}
+static ID3D12Resource* create_texture_mipped_cached(
+    DXGI_FORMAT fmt,const tex_level_t* levels,u32 count)
+{
+    return create_texture_mipped_cached_scoped(fmt,levels,count,NULL);
 }
 #endif
