@@ -38,6 +38,7 @@ DRIVER = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "platform/win32_compat.h"
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -58,6 +59,30 @@ static const char* k_shared[N_KEYS] = {
     "t:zero", "t:one", "t:two", "t:three",
     "t:four", "t:five", "t:six", "t:seven"
 };
+static HANDLE progress_event;
+static volatile LONG first_written, kv_written, counts_written;
+
+/* Test-only completion notifications come from the actual writer after flush. */
+void ps3_ms_test_writer_gate(void) { }
+void ps3_ms_test_record_written(unsigned type)
+{
+    if (type==1) InterlockedIncrement(&first_written);
+    else if (type==2) InterlockedIncrement(&kv_written);
+    else if (type==3) InterlockedIncrement(&counts_written);
+    if (progress_event) SetEvent(progress_event);
+}
+
+static int wait_for_output(int first, int kv, int counts)
+{
+    int i;
+    for (i=0;i<1000;i++) {
+        if (InterlockedCompareExchange(&first_written,0,0)>=first &&
+            InterlockedCompareExchange(&kv_written,0,0)>=kv &&
+            InterlockedCompareExchange(&counts_written,0,0)>=counts) return 1;
+        WaitForSingleObject(progress_event,20);
+    }
+    return 0;
+}
 
 static void worker_body(void)
 {
@@ -77,6 +102,8 @@ int main(int argc, char** argv)
     const char* mode = argc > 1 ? argv[1] : "--on";
     thr_t th[N_THREADS];
     int i;
+    progress_event=CreateEventA(NULL,FALSE,FALSE,NULL);
+    if (!progress_event) return 90;
 
     /* Ordinals 1..3, with 'a' repeated so its bucket differs from the others. */
     ps3_ms("a");
@@ -117,6 +144,9 @@ int main(int argc, char** argv)
         sleep(MS_CKPT_SECS + 1);
 #endif
         worker_body();
+        /* The writer checkpoints on its own timer. Wait for its post-flush
+           notification rather than assuming a file-write delay. */
+        if (!wait_for_output(N_KEYS+4,3,2)) return 91;
         fflush(NULL);
         _exit(0);
     }
@@ -125,10 +155,10 @@ int main(int argc, char** argv)
 """
 
 
-def build(driver_c, exe):
+def build(driver_c, exe, compiler=None):
     """Compile the driver + the real milestone.c. Returns (ok, message)."""
     if os.name == "nt":
-        clang = shutil.which("clang-cl") or r"C:\Program Files\LLVM\bin\clang-cl.exe"
+        clang = str(compiler) if compiler else (shutil.which("clang-cl") or r"C:\Program Files\LLVM\bin\clang-cl.exe")
         if not os.path.exists(clang) and not shutil.which("clang-cl"):
             return False, "clang-cl not found"
         vcvars = find_vcvars()
@@ -140,7 +170,7 @@ def build(driver_c, exe):
             f.write("@echo off\n")
             f.write('call "%s" >nul 2>nul\n' % vcvars)
             f.write('cd /d "%s"\n' % ROOT)
-            f.write('"%s" /nologo /W3 /I include /Fe:"%s" "%s" runtime\\milestone.c '
+            f.write('"%s" /nologo /W3 /DPS3_MILESTONE_TEST_HOOKS /I include /I runtime /Fe:"%s" "%s" runtime\\milestone.c '
                     '> "%s" 2>&1\n' % (clang, exe, driver_c, log))
         rc = subprocess.run(["cmd", "/c", bat], cwd=ROOT).returncode
         if rc != 0:
@@ -150,8 +180,10 @@ def build(driver_c, exe):
     cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
     if not cc:
         return False, "no C compiler found (set CC)"
-    cp = subprocess.run([cc, "-O1", "-w", "-I", "include", "-o", exe, driver_c,
-                         os.path.join("runtime", "milestone.c"), "-lpthread"],
+    cp = subprocess.run([cc, "-O1", "-w", "-DPS3_MILESTONE_TEST_HOOKS", "-I", "include",
+                         "-I", "runtime", "-o", exe, driver_c,
+                         os.path.join("runtime", "milestone.c"),
+                         os.path.join("runtime", "platform", "win32_compat.c"), "-lpthread"],
                         cwd=ROOT, capture_output=True, text=True)
     if cp.returncode != 0:
         return False, cp.stdout + cp.stderr
@@ -206,6 +238,7 @@ def check(cond, what):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="keep the built driver")
+    ap.add_argument("--compiler", help="explicit clang-cl path (Windows) or C compiler path (POSIX)")
     args = ap.parse_args()
 
     os.makedirs(SCRATCH, exist_ok=True)
@@ -216,7 +249,7 @@ def main():
     with open(driver_c, "w") as f:
         f.write(DRIVER % dict(N_THREADS=N_THREADS, N_ITERS=N_ITERS, N_KEYS=N_KEYS))
 
-    ok, msg = build(driver_c, exe)
+    ok, msg = build(driver_c, exe, args.compiler)
     if not ok:
         # A green tick that compiled nothing is worse than a red one, so CI=1
         # turns a missing compiler into a failure rather than a skip.
