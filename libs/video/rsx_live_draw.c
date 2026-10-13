@@ -10414,8 +10414,12 @@ double rsx_live_draw_get_present_fps(void)
         : 0.0;
 }
 
+static void ld_report_counters(void);
+
 void rsx_live_draw_dump_present_samples(void)
 {
+    /* Haze exits after this diagnostic dump without renderer teardown. */
+    if (g.ready) ld_report_counters();
     ld_texture_content_summary();
 #if defined(YZ_PERF_PROFILE)
     ld_slow_draw_dump();
@@ -10870,7 +10874,7 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
     fflush(stderr);
 }
 
-/* Routine counters are emitted at shutdown. Explicit renderer diagnostics
+/* Routine counters are emitted by exit dumps and shutdown. Renderer diagnostics
  * may also report during frames; ordinary presentation must not contend
  * on the shared CRT stderr lock for a periodic status line. */
 static void ld_report_counters(void)
