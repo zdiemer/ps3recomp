@@ -516,7 +516,9 @@ _MAX_MID_TAIL = 0x6000
 
 def _last_line_is_terminator(body_lines: list[str]) -> bool:
     """True if the function's last instruction is an unconditional terminator
-    (return / internal goto / direct call / syscall / unconditional tail-call)."""
+    (return / internal goto / direct call / unconditional tail-call). A syscall is
+    not one: `sc` returns to the next instruction, so a function that ends in `sc`
+    must fall through to it."""
     for line in reversed(body_lines):
         s = line.strip()
         if not s or s.endswith(":") or s.startswith("loc_") and s.endswith(": ;"):
@@ -531,7 +533,7 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
         if t.startswith("if ("):
             return False
         return (t.startswith("return") or "goto " in t or
-                t.startswith("func_") or t.startswith("lv2_syscall") or
+                t.startswith("func_") or
                 "{ func_" in t or t.startswith("{ g_trampoline_fn"))
     return False
 
