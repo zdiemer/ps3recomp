@@ -41,6 +41,7 @@ void rsx_live_draw_set_display_buffer(
     u32 b, u32 l, u32 o, u32 p, u32 w, u32 h)
 { (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
+void rsx_live_draw_vp_burst_32(const u32 words[32]) { (void)words; }
 void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
 void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
 { (void)d; (void)o; (void)v; }
@@ -74,6 +75,7 @@ void rsx_live_draw_shutdown(void) {}
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "rsx_dispatch.h"
+#include "rsx_vp_burst.h"
 #include "rsx_fp_decompiler.h"
 static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_surf = 0;
 /* Set once PS1 VRAM actually holds a drawn frame (see the PS1_PC heartbeat).
@@ -9432,6 +9434,22 @@ void rsx_live_draw_method(u32 method, u32 arg)
         if (!g_ld_movie_track_rsx) return;
     }
     rsx_dispatch_method(&g.rsx, method, arg);
+}
+
+void rsx_live_draw_vp_burst_32(const u32 words[32])
+{
+    /* Preserve the per-method movie/debug serialization and movie suppression
+     * paths. The ordinary ready path has no side effects between consecutive
+     * VP instruction words, so it can update the 32-word burst in one call. */
+    if (ld_movie_composite_ui_enabled() || g_ld_debug_layer_enabled ||
+        g_ld_movie_mode) {
+        for (u32 i = 0; i < 32; ++i)
+            rsx_live_draw_method(0x0B80u + i * 4u, words[i]);
+        return;
+    }
+
+    if (!g.ready) return;
+    rsx_vp_burst_dispatch_32(&g.rsx, 0, 0x0B80u, words);
 }
 
 void rsx_live_draw_set_movie_mode(int on)

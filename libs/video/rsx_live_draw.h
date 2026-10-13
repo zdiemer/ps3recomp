@@ -83,6 +83,9 @@ void rsx_live_draw_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 /* Feed one NV method write. No-op when disabled or uninitialized. */
 void rsx_live_draw_method(u32 method, u32 arg);
 
+/* Feed a complete 32-word NV4097 transform-program upload burst. */
+void rsx_live_draw_vp_burst_32(const u32 words[32]);
+
 /* Publish the FIFO bounds associated with the next flip method.  The live
  * consumer calls this only for driver-queue methods; ordinary method traffic
  * pays no extra synchronization cost. */

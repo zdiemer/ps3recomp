@@ -17,6 +17,7 @@
 #include "../../runtime/ppu/ppu_native_memory.h"
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
+#include "rsx_vp_burst.h"
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
@@ -1651,6 +1652,27 @@ int cellGcm_fifo_has_queued_work(void)
     return s_fifo_getoff != vm_read32(GCM_CONTROL_GUEST_ADDR);
 }
 
+/* BEGIN GCM VP BURST BOUNDARY: extracted by the boundary regression test. */
+static int gcm_try_vp_burst(rsx_state* state,u32 get,u32 put,u32 header)
+{
+    extern uint32_t ppu_vm_size;
+    if (header!=0x00800B80u || (get&3u) || (uint64_t)get+132u>put ||
+        state->vp_ucode_write>UINT32_MAX-4u) return 0;
+    u32 addresses[32],words[32];
+    /* Validate the entire published packet before changing any mirror. IO
+     * pages need not map to contiguous EAs. Keep vm_read32's BE conversion. */
+    for (u32 i=0;i<32;++i) {
+        addresses[i]=gcm_io2ea(get+4u+i*4u);
+        if (!ppu_native_ram_range(addresses[i],4,ppu_vm_size,VM_HLE_INJECT_BASE)) return 0;
+    }
+    for (u32 i=0;i<32;++i) words[i]=vm_read32(addresses[i]);
+    if (rsx_live_draw_enabled()) rsx_live_draw_vp_burst_32(words);
+    if (rsx_draw_engine_enabled()) rsx_draw_engine_vp_burst_32(words);
+    return rsx_vp_burst_process_32(state,0,RSX_VP_BURST_METHOD,words);
+}
+/* END GCM VP BURST BOUNDARY */
+#include "gcm_vp_burst_mode.h"
+
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
@@ -1676,6 +1698,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * by s_gcm_ctx_out_ea, which stays 0 on that path. */
     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
+    gcm_vp_burst_poll();
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
      * offset in the control register), decoding method headers and following
@@ -1952,6 +1975,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
+            const int vp_burst_packet=w==0x00800B80u;
+            const uint64_t vp_burst_started=vp_burst_packet && s_vp_burst_mode.profile ? gcm_vp_burst_clock():0;
+            if (vp_burst_packet && s_vp_burst_mode.enabled && !s_vp_burst_mode.diagnostics &&
+                gcm_try_vp_burst(&s_state,s_fifo_getoff,put,w)) {
+                gcm_vp_burst_record(vp_burst_started,1);
+                s_fifo_getoff+=132u;
+                continue;
+            }
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
@@ -2081,6 +2112,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     gcm_2d_method(subch, m, vm_read32(dea));
                 }
             }
+            if (vp_burst_packet) gcm_vp_burst_record(vp_burst_started,0);
             s_fifo_getoff += 4 + count * 4;
             continue;
         }
