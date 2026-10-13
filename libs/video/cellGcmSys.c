@@ -14,6 +14,7 @@
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
+#include "../../runtime/ppu/ppu_native_memory.h"
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
@@ -526,6 +527,19 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
         s_gcm_context_ea = cdata;                   /* RSX drains commands from here */
     }
     return cdata;
+}
+
+/* A native producer may batch writes only to the title's current context with
+ * our synchronized wrap callback. The FIFO consumer follows published PUT,
+ * not this context's allocation cursor, and suppresses heuristic recycling
+ * for this callback. The title must still serialize its own producers. */
+int cellGcm_native_context_matches(uint32_t context)
+{
+    if (!s_gcm_ctx_out_ea || vm_read32(s_gcm_ctx_out_ea) != context ||
+        atomic_load_explicit(&s_fifo_recycle_active,memory_order_acquire)) return 0;
+    uint32_t callback=vm_read32(context+12);
+    return ppu_native_ram_range(callback,8,0,VM_HLE_INJECT_BASE) &&
+        vm_read32(callback)==GCM_FIFO_CALLBACK_SENTINEL_EA;
 }
 
 s32 cellGcmGetConfiguration(CellGcmConfig* config)
