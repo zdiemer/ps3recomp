@@ -1,6 +1,7 @@
 #include <assert.h>
 #include "../cellGcmSys.c"
 uint8_t* vm_base;
+uint32_t ppu_vm_size;
 int g_resv_store_active = 0;
 uint32_t g_ww_lo = 0, g_ww_hi = 0;
 void spu_lockline_lock(void) { }
@@ -24,6 +25,7 @@ int main(int argc, char** argv) {
     _putenv_s("GCM_FIFO_WAIT_NATIVE", mode);
     const u32 begin = 0x100000, tail = 0x101000;
     vm_base = calloc(1, GCM_CONTROL_GUEST_ADDR + 4096);
+    ppu_vm_size = GCM_CONTROL_GUEST_ADDR + 4096;
     assert(vm_base);
     HANDLE kick=(HANDLE)cellGcm_fifo_kick_event(); assert(kick);
     assert(WaitForSingleObject(kick,0)==WAIT_TIMEOUT);

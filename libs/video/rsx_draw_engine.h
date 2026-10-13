@@ -265,6 +265,9 @@ void rsx_draw_engine_shutdown(void);
  * write its state into the wrong register bank. */
 void rsx_draw_engine_method(u32 method, u32 arg);
 
+/* Feed a complete 32-word NV4097 transform-program upload burst. */
+void rsx_draw_engine_vp_burst_32(const u32 words[32]);
+
 /* cellGcmSetDisplayBuffer, so the flip can resolve a buffer id to a surface
  * the engine has actually rendered rather than to whatever is bound. */
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,

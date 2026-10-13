@@ -17,6 +17,7 @@
 #include "rsx_restart_cuts.h"
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
+#include "rsx_vp_burst.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -2655,6 +2656,12 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
     rsx_dispatch_method(&g.rsx, m, arg);
+}
+
+void rsx_draw_engine_vp_burst_32(const u32 words[32])
+{
+    if (!g.ready) return;
+    rsx_vp_burst_dispatch_32(&g.rsx, 0, 0x0B80u, words);
 }
 
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
