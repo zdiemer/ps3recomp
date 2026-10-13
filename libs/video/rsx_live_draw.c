@@ -2282,8 +2282,236 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
 /* ---------------------------------------------------------------------------
  * command list submit/wait (simple synchronous model, like the harness)
  * -----------------------------------------------------------------------*/
+
+/* BEGIN RSX SLOW FLUSH DIAGNOSTIC */
+/* Opt-in ordinary-build attribution for synchronous command-list flushes.
+ * There is no allocation or file I/O on the flush path; when disabled the
+ * only work is the once-initialized path check. Records are published only
+ * after a flush completes (or returns through one of its existing failure
+ * branches), so shutdown never observes a partially-written event. */
+#define LD_SLOW_FLUSH_CAP 4096u
+enum {
+    LD_SLOW_FLUSH_CLOSE = 0,
+    LD_SLOW_FLUSH_EXECUTE,
+    LD_SLOW_FLUSH_SIGNAL,
+    LD_SLOW_FLUSH_COMPLETED_VALUE,
+    LD_SLOW_FLUSH_SET_EVENT,
+    LD_SLOW_FLUSH_WAIT,
+    LD_SLOW_FLUSH_INFO_QUEUE,
+    LD_SLOW_FLUSH_RETIRED_RELEASE,
+    LD_SLOW_FLUSH_ALLOC_RESET,
+    LD_SLOW_FLUSH_LIST_RESET,
+    LD_SLOW_FLUSH_STAGE_COUNT
+};
+
+typedef struct {
+    u64 qpc_begin, qpc_end;
+    u64 thread_cycles_begin, thread_cycles_end;
+    u64 stage_ticks[LD_SLOW_FLUSH_STAGE_COUNT];
+    u64 fence_value, completed_value;
+    u64 sequence;
+    u32 frame, host_tid, reason, retired_count;
+    u32 thread_cycles_valid, waited, wait_result, wait_error;
+    u32 stage_mask;
+    u32 close_hr, signal_hr, set_event_hr;
+    u32 alloc_reset_hr, list_reset_hr, failed_stage;
+} ld_slow_flush_event;
+
+typedef struct {
+    int active;
+    ld_slow_flush_event event;
+} ld_slow_flush_scope;
+
+static INIT_ONCE g_ld_slow_flush_once = INIT_ONCE_STATIC_INIT;
+static volatile LONG g_ld_slow_flush_config_state = -1;
+static const char* g_ld_slow_flush_path;
+static u64 g_ld_slow_flush_frequency;
+static u64 g_ld_slow_flush_threshold_ticks;
+static u32 g_ld_slow_flush_threshold_us = 2000;
+static SRWLOCK g_ld_slow_flush_lock = SRWLOCK_INIT;
+static ld_slow_flush_event g_ld_slow_flush_events[LD_SLOW_FLUSH_CAP];
+static u64 g_ld_slow_flush_next, g_ld_slow_flush_count;
+static u64 g_ld_slow_flush_overwritten, g_ld_slow_flush_sequence;
+static LONG g_ld_slow_flush_dumped;
+
+static BOOL CALLBACK ld_slow_flush_configure(PINIT_ONCE once, PVOID param,
+                                              PVOID* context)
+{
+    (void)once; (void)param; (void)context;
+    const char* path = getenv("RSX_SLOW_FLUSH_CSV");
+    if (path && *path) {
+        LARGE_INTEGER frequency;
+        if (QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0) {
+            g_ld_slow_flush_path = path;
+            g_ld_slow_flush_frequency = (u64)frequency.QuadPart;
+            const char* threshold = getenv("RSX_SLOW_FLUSH_THRESHOLD_US");
+            if (threshold && *threshold) {
+                char* end = NULL;
+                const unsigned long value = strtoul(threshold, &end, 10);
+                if (end != threshold && *end == '\0' && value > 0 &&
+                    value <= 1000000ul)
+                    g_ld_slow_flush_threshold_us = (u32)value;
+            }
+            g_ld_slow_flush_threshold_ticks =
+                g_ld_slow_flush_frequency * g_ld_slow_flush_threshold_us / 1000000ull;
+        } else {
+            fprintf(stderr, "[slow-rsx-flush] QPC frequency unavailable; diagnostic disabled\n");
+        }
+    }
+    InterlockedExchange(&g_ld_slow_flush_config_state,
+                        g_ld_slow_flush_path ? 1 : 0);
+    return TRUE;
+}
+
+static u64 ld_slow_flush_qpc(void)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (u64)now.QuadPart;
+}
+
+static u64 ld_slow_flush_cycles(u32* valid)
+{
+    ULONG64 cycles = 0;
+    *valid = QueryThreadCycleTime(GetCurrentThread(), &cycles) != 0;
+    return *valid ? (u64)cycles : 0;
+}
+
+static void ld_slow_flush_begin(ld_slow_flush_scope* scope,
+                                ld_flush_reason reason)
+{
+    scope->active = 0;
+    if (InterlockedCompareExchange(&g_ld_slow_flush_config_state, -1, -1) == -1)
+        InitOnceExecuteOnce(&g_ld_slow_flush_once, ld_slow_flush_configure,
+                            NULL, NULL);
+    if (!g_ld_slow_flush_path || !g_ld_slow_flush_frequency ||
+        InterlockedCompareExchange(&g_ld_slow_flush_dumped, 0, 0))
+        return;
+    memset(&scope->event, 0, sizeof(scope->event));
+    scope->active = 1;
+    scope->event.thread_cycles_begin = ld_slow_flush_cycles(
+        &scope->event.thread_cycles_valid);
+    scope->event.host_tid = GetCurrentThreadId();
+    scope->event.frame = g_ld_frames;
+    scope->event.reason = (u32)reason;
+    scope->event.retired_count = g.n_retired_textures;
+    scope->event.wait_result = UINT32_MAX;
+    scope->event.completed_value = UINT64_MAX;
+    scope->event.qpc_begin = ld_slow_flush_qpc();
+}
+
+static void ld_slow_flush_finish(ld_slow_flush_scope* scope)
+{
+    if (!scope->active) return;
+    ld_slow_flush_event* event = &scope->event;
+    event->qpc_end = ld_slow_flush_qpc();
+    u32 cycles_end_valid = 0;
+    event->thread_cycles_end = ld_slow_flush_cycles(&cycles_end_valid);
+    event->thread_cycles_valid = event->thread_cycles_valid && cycles_end_valid;
+    if (event->qpc_end < event->qpc_begin) return;
+    const u64 elapsed = event->qpc_end - event->qpc_begin;
+    if (elapsed <= g_ld_slow_flush_threshold_ticks && !event->failed_stage)
+        return;
+
+    AcquireSRWLockExclusive(&g_ld_slow_flush_lock);
+    if (!InterlockedCompareExchange(&g_ld_slow_flush_dumped, 0, 0)) {
+        event->sequence = ++g_ld_slow_flush_sequence;
+        g_ld_slow_flush_events[g_ld_slow_flush_next] = *event;
+        g_ld_slow_flush_next = (g_ld_slow_flush_next + 1u) % LD_SLOW_FLUSH_CAP;
+        if (g_ld_slow_flush_count < LD_SLOW_FLUSH_CAP)
+            ++g_ld_slow_flush_count;
+        else
+            ++g_ld_slow_flush_overwritten;
+    }
+    ReleaseSRWLockExclusive(&g_ld_slow_flush_lock);
+}
+
+static void ld_slow_flush_dump(void)
+{
+    if (InterlockedCompareExchange(&g_ld_slow_flush_config_state, -1, -1) == -1)
+        InitOnceExecuteOnce(&g_ld_slow_flush_once, ld_slow_flush_configure,
+                            NULL, NULL);
+    if (!g_ld_slow_flush_path || !g_ld_slow_flush_frequency) return;
+    AcquireSRWLockExclusive(&g_ld_slow_flush_lock);
+    if (InterlockedCompareExchange(&g_ld_slow_flush_dumped, 1, 0)) {
+        ReleaseSRWLockExclusive(&g_ld_slow_flush_lock);
+        return;
+    }
+    FILE* file = fopen(g_ld_slow_flush_path, "wb");
+    if (!file) {
+        fprintf(stderr, "[slow-rsx-flush] cannot open %s\n", g_ld_slow_flush_path);
+        ReleaseSRWLockExclusive(&g_ld_slow_flush_lock);
+        return;
+    }
+    int io_error = 0;
+    if (fprintf(file, "#qpc_frequency,%llu,threshold_us,%u,capacity,%u,retained,%llu,overwritten,%llu\n",
+            (unsigned long long)g_ld_slow_flush_frequency,
+            g_ld_slow_flush_threshold_us, LD_SLOW_FLUSH_CAP,
+            (unsigned long long)g_ld_slow_flush_count,
+            (unsigned long long)g_ld_slow_flush_overwritten) < 0)
+        io_error = 1;
+    if (fprintf(file,
+            "sequence,frame,host_tid,reason,qpc_begin,qpc_end,total_ticks,"
+            "thread_cycles_valid,thread_cycles_delta,fence_value,completed_value,"
+            "retired_count,waited,wait_result,wait_error,stage_mask,close_hr,signal_hr,"
+            "set_event_hr,alloc_reset_hr,list_reset_hr,failed_stage,"
+            "unaccounted_ticks,close_ticks,execute_ticks,signal_ticks,completed_value_ticks,"
+            "set_event_ticks,wait_ticks,info_queue_ticks,retired_release_ticks,"
+            "alloc_reset_ticks,list_reset_ticks\n") < 0)
+        io_error = 1;
+    const u64 retained = g_ld_slow_flush_count;
+    const u64 first = g_ld_slow_flush_count < LD_SLOW_FLUSH_CAP
+        ? 0 : g_ld_slow_flush_next;
+    for (u64 i = 0; i < retained; ++i) {
+        const ld_slow_flush_event* e =
+            &g_ld_slow_flush_events[(first + i) % LD_SLOW_FLUSH_CAP];
+        const u64 cycles = e->thread_cycles_valid &&
+            e->thread_cycles_end >= e->thread_cycles_begin
+            ? e->thread_cycles_end - e->thread_cycles_begin : 0;
+        u64 stages_total = 0;
+        for (u32 stage = 0; stage < LD_SLOW_FLUSH_STAGE_COUNT; ++stage)
+            stages_total += e->stage_ticks[stage];
+        const u64 total_ticks = e->qpc_end - e->qpc_begin;
+        const u64 unaccounted_ticks = total_ticks > stages_total
+            ? total_ticks - stages_total : 0;
+        if (fprintf(file,
+            "%llu,%u,%u,%u,%llu,%llu,%llu,%u,%llu,%llu,%llu,%u,%u,%u,%u,%u,"
+            "0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,%u,%llu,"
+            "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+            (unsigned long long)e->sequence,e->frame,e->host_tid,e->reason,
+            (unsigned long long)e->qpc_begin,(unsigned long long)e->qpc_end,
+            (unsigned long long)(e->qpc_end-e->qpc_begin),
+            e->thread_cycles_valid,(unsigned long long)cycles,
+            (unsigned long long)e->fence_value,
+            (unsigned long long)e->completed_value,e->retired_count,e->waited,
+            e->wait_result,e->wait_error,e->stage_mask,e->close_hr,e->signal_hr,e->set_event_hr,
+            e->alloc_reset_hr,e->list_reset_hr,e->failed_stage,
+            (unsigned long long)unaccounted_ticks,
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_CLOSE],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_EXECUTE],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_SIGNAL],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_COMPLETED_VALUE],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_SET_EVENT],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_WAIT],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_INFO_QUEUE],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_RETIRED_RELEASE],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_ALLOC_RESET],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_LIST_RESET]) < 0)
+            io_error = 1;
+    }
+    if (ferror(file)) io_error = 1;
+    if (fclose(file) != 0) io_error = 1;
+    if (io_error)
+        fprintf(stderr, "[slow-rsx-flush] write failed for %s\n", g_ld_slow_flush_path);
+    ReleaseSRWLockExclusive(&g_ld_slow_flush_lock);
+}
+/* END RSX SLOW FLUSH DIAGNOSTIC */
+
+/* BEGIN RSX SLOW FLUSH WRAPPER */
 static void ld_flush(ld_flush_reason reason)
 {
+    ld_slow_flush_scope slow_flush;
+    ld_slow_flush_begin(&slow_flush, reason);
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG flush_begin = ld_profile_qpc();
     g_ld_profile.total.flush_reason[reason]++;
@@ -2314,35 +2542,77 @@ static void ld_flush(ld_flush_reason reason)
 #else
     (void)reason;
 #endif
+    u64 stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
     const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_CLOSE] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_CLOSE;
+        slow_flush.event.close_hr = (u32)close_hr;
+    }
     if (FAILED(close_hr)) {
         fprintf(stderr,
                 "[d3d-fail] command-list Close hr=0x%08lX frame=%u\n",
                 (unsigned long)close_hr, g_ld_frames);
         ld_dump_dred("Close", close_hr);
         g.ready = 0;
+        if (slow_flush.active)
+            slow_flush.event.failed_stage = LD_SLOW_FLUSH_CLOSE + 1;
+        ld_slow_flush_finish(&slow_flush);
         return;
     }
     ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
     g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_EXECUTE] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_EXECUTE;
+    }
     const u64 v = ++g.fence_value;
+    if (slow_flush.active) slow_flush.event.fence_value = v;
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
     const HRESULT signal_hr =
         g.queue->lpVtbl->Signal(g.queue, g.fence, v);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_SIGNAL] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_SIGNAL;
+        slow_flush.event.signal_hr = (u32)signal_hr;
+    }
     if (FAILED(signal_hr)) {
         fprintf(stderr,
                 "[d3d-fail] queue Signal hr=0x%08lX frame=%u\n",
                 (unsigned long)signal_hr, g_ld_frames);
         ld_dump_dred("Signal", signal_hr);
         g.ready = 0;
+        if (slow_flush.active)
+            slow_flush.event.failed_stage = LD_SLOW_FLUSH_SIGNAL + 1;
+        ld_slow_flush_finish(&slow_flush);
         return;
     }
-    if (g.fence->lpVtbl->GetCompletedValue(g.fence) < v) {
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
+    const u64 completed_value = g.fence->lpVtbl->GetCompletedValue(g.fence);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_COMPLETED_VALUE] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_COMPLETED_VALUE;
+        slow_flush.event.completed_value = completed_value;
+    }
+    if (completed_value < v) {
 #if defined(YZ_PERF_PROFILE)
         const LONGLONG wait_begin = ld_profile_qpc();
 #endif
+        stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
         const HRESULT event_hr =
             g.fence->lpVtbl->SetEventOnCompletion(
                 g.fence, v, g.fence_event);
+        if (slow_flush.active) {
+            slow_flush.event.stage_ticks[LD_SLOW_FLUSH_SET_EVENT] =
+                ld_slow_flush_qpc() - stage_begin;
+            slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_SET_EVENT;
+            slow_flush.event.set_event_hr = (u32)event_hr;
+        }
         if (FAILED(event_hr)) {
             fprintf(stderr,
                     "[d3d-fail] fence SetEventOnCompletion "
@@ -2350,16 +2620,38 @@ static void ld_flush(ld_flush_reason reason)
                     (unsigned long)event_hr, g_ld_frames);
             ld_dump_dred("SetEventOnCompletion", event_hr);
             g.ready = 0;
+            if (slow_flush.active)
+                slow_flush.event.failed_stage = LD_SLOW_FLUSH_SET_EVENT + 1;
+            ld_slow_flush_finish(&slow_flush);
             return;
         }
-        WaitForSingleObject(g.fence_event, INFINITE);
+        if (slow_flush.active) slow_flush.event.waited = 1;
+        stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
+        const DWORD wait_result = WaitForSingleObject(g.fence_event, INFINITE);
+        const DWORD wait_error = wait_result == WAIT_FAILED
+            ? GetLastError() : 0;
+        if (slow_flush.active) {
+            slow_flush.event.stage_ticks[LD_SLOW_FLUSH_WAIT] =
+                ld_slow_flush_qpc() - stage_begin;
+            slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_WAIT;
+            slow_flush.event.wait_result = wait_result;
+            slow_flush.event.wait_error = wait_error;
+            if (wait_result == WAIT_FAILED)
+                slow_flush.event.failed_stage = LD_SLOW_FLUSH_WAIT + 1;
+        }
 #if defined(YZ_PERF_PROFILE)
         const u64 wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
         g_ld_profile.total.fence_wait_qpc += wait_ticks;
         g_ld_profile.total.fence_reason_qpc[reason] += wait_ticks;
 #endif
     }
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
     ld_drain_info_queue("flush");
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_INFO_QUEUE] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_INFO_QUEUE;
+    }
 #if defined(YZ_PERF_PROFILE)
     if (g_ld_gpu_armed && g_ld_gpu_results[1] >= g_ld_gpu_results[0])
         g_ld_profile.total.gpu_ticks += g_ld_gpu_results[1] - g_ld_gpu_results[0];
@@ -2368,11 +2660,37 @@ static void ld_flush(ld_flush_reason reason)
      * earlier draw in this command list still references the old one.  The
      * fence above is the first safe point at which those old resources may be
      * released. */
+    if (slow_flush.active)
+        slow_flush.event.retired_count = g.n_retired_textures;
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
     for (u32 i = 0; i < g.n_retired_textures; i++)
         g.retired_textures[i]->lpVtbl->Release(g.retired_textures[i]);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_RETIRED_RELEASE] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_RETIRED_RELEASE;
+    }
     g.n_retired_textures = 0;
-    g.alloc->lpVtbl->Reset(g.alloc);
-    g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
+    const HRESULT alloc_reset_hr = g.alloc->lpVtbl->Reset(g.alloc);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_ALLOC_RESET] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_ALLOC_RESET;
+        slow_flush.event.alloc_reset_hr = (u32)alloc_reset_hr;
+        if (FAILED(alloc_reset_hr) && !slow_flush.event.failed_stage)
+            slow_flush.event.failed_stage = LD_SLOW_FLUSH_ALLOC_RESET + 1;
+    }
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
+    const HRESULT list_reset_hr = g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_LIST_RESET] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_LIST_RESET;
+        slow_flush.event.list_reset_hr = (u32)list_reset_hr;
+        if (FAILED(list_reset_hr) && !slow_flush.event.failed_stage)
+            slow_flush.event.failed_stage = LD_SLOW_FLUSH_LIST_RESET + 1;
+    }
 #if defined(YZ_PERF_PROFILE)
     g_ld_gpu_armed = g_ld_gpu_results && g_ld_gpu_frequency;
     if (g_ld_gpu_armed)
@@ -2384,7 +2702,9 @@ static void ld_flush(ld_flush_reason reason)
     g_ld_profile.total.flush_qpc += flush_ticks;
     g_ld_profile.total.flush_reason_qpc[reason] += flush_ticks;
 #endif
+    ld_slow_flush_finish(&slow_flush);
 }
+/* END RSX SLOW FLUSH WRAPPER */
 
 /* DXGI can change fullscreen state on focus loss/restore. Refresh only the
  * scanout buffers after the present fence; guest surfaces and internal raster
@@ -10317,6 +10637,7 @@ void rsx_live_draw_dump_present_samples(void)
 {
     /* Haze exits after this diagnostic dump without renderer teardown. */
     if (g.ready) ld_report_counters();
+    ld_slow_flush_dump();
     ld_texture_content_summary();
 #if defined(YZ_PERF_PROFILE)
     ld_slow_draw_dump();
@@ -12023,6 +12344,7 @@ void rsx_live_draw_present(u32 buffer_id)
 void rsx_live_draw_shutdown(void)
 {
     if (!g.ready) {
+        ld_slow_flush_dump();
 #if defined(YZ_PERF_PROFILE)
         ld_slow_draw_dump();
         free(g_ld_slow_draw.events);
@@ -12032,6 +12354,7 @@ void rsx_live_draw_shutdown(void)
         return;
     }
     ld_report_counters();
+    ld_slow_flush_dump();
 #if defined(YZ_PERF_PROFILE)
     ld_slow_draw_dump();
     ld_profile_buffers_dump();
