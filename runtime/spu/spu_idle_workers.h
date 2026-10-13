@@ -27,7 +27,9 @@
 #include <stddef.h>
 
 #ifndef SPU_IDLE_WORKER_SLOTS
-#define SPU_IDLE_WORKER_SLOTS 16
+/* Returning-job bursts can exceed sixteen simultaneous callbacks. Retain
+ * enough workers for those bursts; this is not an execution concurrency cap. */
+#define SPU_IDLE_WORKER_SLOTS 32
 #endif
 
 #ifndef SPU_IDLE_WORKER_TIMEOUT_MS
