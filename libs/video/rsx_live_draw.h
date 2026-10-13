@@ -165,6 +165,8 @@ double rsx_live_draw_get_present_fps(void);
 /* End-only persistence hook used by the window-close path. Safe to call more
  * than once; it writes the fixed QPC ring at most once per renderer run. */
 void rsx_live_draw_dump_present_samples(void);
+/* End-only persistence hook: call after draws stop, before orderly exit. */
+void rsx_live_draw_dump_shader_cache(void);
 
 /* Bounded live AUTH diagnostic. The null-backend window starts it from a
  * private WM_APP message immediately before New Game is confirmed. */
