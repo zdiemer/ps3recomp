@@ -1,10 +1,6 @@
 #pragma once
 
 #include <stdint.h>
-#include <string.h>
-#if defined(_MSC_VER) && !defined(__clang__)
-#include <intrin.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,20 +26,26 @@ uint64_t vm_read64(uint64_t addr);
 #define PPU_INLINE_READ_FORCE inline
 #endif
 
-/* The original external accessor is a compiler memory boundary. Preserve
- * that boundary when inlining: guest RAM may be published by another thread,
- * including in polling loops with no explicit guest fence. These barriers
- * emit no hardware fence; guest PPU_FENCE still supplies hardware ordering. */
-static PPU_INLINE_READ_FORCE void ppu_inline_read_compiler_barrier(void)
-{
+/* Ordinary reads cannot modify the host PPU context. A full compiler memory
+ * clobber would incorrectly obscure that fact and defeat register promotion.
+ * Volatile retains each dynamic guest load, including polling without a guest
+ * fence. It does not supply PPC memory ordering: PPU_FENCE and the original
+ * store/device/callback paths remain responsible for that ordering.
+ * Packed scalar wrappers retain unaligned native loads without forming a
+ * misaligned scalar pointer. may_alias also permits byte-backed guest RAM. */
 #if defined(__GNUC__) || defined(__clang__)
-    __asm__ __volatile__("" ::: "memory");
-#elif defined(_MSC_VER)
-    _ReadWriteBarrier();
+#define PPU_INLINE_READ_PACKED __attribute__((packed, may_alias))
 #else
-#error "Inline PPU reads require a compiler memory barrier"
+#define PPU_INLINE_READ_PACKED
+#pragma pack(push, 1)
 #endif
-}
+typedef struct PPU_INLINE_READ_PACKED { uint16_t value; } ppu_inline_read_u16;
+typedef struct PPU_INLINE_READ_PACKED { uint32_t value; } ppu_inline_read_u32;
+typedef struct PPU_INLINE_READ_PACKED { uint64_t value; } ppu_inline_read_u64;
+#if !defined(__GNUC__) && !defined(__clang__)
+#pragma pack(pop)
+#endif
+#undef PPU_INLINE_READ_PACKED
 
 /* This is deliberately a narrow read-only fast path. The generated-code
  * force-include shim includes ppu_recomp.h first, then this header, then maps
@@ -64,10 +66,7 @@ ppu_inline_vm_read8(uint64_t addr)
 {
     const uint32_t ea = (uint32_t)addr;
     if (ppu_native_read_inline_range(ea, 1)) {
-        ppu_inline_read_compiler_barrier();
-        const uint8_t raw = vm_base[ea];
-        ppu_inline_read_compiler_barrier();
-        return raw;
+        return *(const volatile uint8_t*)(vm_base + ea);
     }
     return vm_read8(addr);
 }
@@ -77,10 +76,7 @@ ppu_inline_vm_read16(uint64_t addr)
 {
     const uint32_t ea = (uint32_t)addr;
     if (ppu_native_read_inline_range(ea, 2)) {
-        uint16_t raw;
-        ppu_inline_read_compiler_barrier();
-        memcpy(&raw, vm_base + ea, sizeof(raw));
-        ppu_inline_read_compiler_barrier();
+        const uint16_t raw = ((const volatile ppu_inline_read_u16*)(vm_base + ea))->value;
         return __builtin_bswap16(raw);
     }
     return vm_read16(addr);
@@ -92,10 +88,7 @@ ppu_inline_vm_read32(uint64_t addr)
     const uint32_t ea = (uint32_t)addr;
     if (ppu_native_read_inline_range(ea, 4) &&
         ea != ppu_hle_inject_base + 0x2008u) {
-        uint32_t raw;
-        ppu_inline_read_compiler_barrier();
-        memcpy(&raw, vm_base + ea, sizeof(raw));
-        ppu_inline_read_compiler_barrier();
+        const uint32_t raw = ((const volatile ppu_inline_read_u32*)(vm_base + ea))->value;
         return __builtin_bswap32(raw);
     }
     return vm_read32(addr);
@@ -106,10 +99,7 @@ ppu_inline_vm_read64(uint64_t addr)
 {
     const uint32_t ea = (uint32_t)addr;
     if (ppu_native_read_inline_range(ea, 8)) {
-        uint64_t raw;
-        ppu_inline_read_compiler_barrier();
-        memcpy(&raw, vm_base + ea, sizeof(raw));
-        ppu_inline_read_compiler_barrier();
+        const uint64_t raw = ((const volatile ppu_inline_read_u64*)(vm_base + ea))->value;
         return __builtin_bswap64(raw);
     }
     return vm_read64(addr);
