@@ -83,6 +83,7 @@ static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_sur
 static volatile long g_ld_ps1_vram_ready = 0;
 #include "rsx_restart_cuts.h"
 #include "rsx_vertex_compact.h"
+#include "rsx_vertex_refs.h"
 #include "rsx_vertex_pull.h"
 #include "rsx_vp_decompiler.h"
 #include "rsx_vp_program_cache.h"
@@ -5682,6 +5683,15 @@ static void fetch_batches_hoisted(
                 contiguous = guest_ptr(
                     index_array.location, (u32)start64, (u32)bytes64);
             }
+            /* Speculative batch writes are unpublished until every index has
+             * passed restart detection. A restart uses the original cut path;
+             * it overwrites any partial output at the unchanged n_refs. */
+            if ((g_ld_cpu_work & 8192u) && bulk_refs && contiguous &&
+                rsx_vertex_refs_decode_be(contiguous, count, index_array.is_u32,
+                    base_index, restart_enabled, restart_value, dc.refs + dc.n_refs)) {
+                dc.n_refs += count;
+                continue;
+            }
             for (u32 i = 0; i < count && dc.fetch_ok; i++) {
                 const u32 source_offset =
                     index_array.offset + (first + i) * element_size;
@@ -10063,7 +10073,7 @@ void rsx_live_draw_present(u32 buffer_id)
         if (work_control) {
             FILE* file=fopen(work_control,"r"); unsigned flags;
             if (file) {
-                if (fscanf(file,"%u",&flags)==1 && flags<=8191 && flags!=g_ld_cpu_work) {
+                if (fscanf(file,"%u",&flags)==1 && flags<=16383 && flags!=g_ld_cpu_work) {
                     g_ld_cpu_work=flags;
                     fprintf(stderr,"[cpu-work] frame=%u flags=%u\n",g_ld_frames,flags);
                 }
