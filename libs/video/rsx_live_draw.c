@@ -1242,6 +1242,12 @@ static u64 g_ld_shader_disk_misses[2] = {0, 0};
 static u64 g_ld_shader_disk_writes[2] = {0, 0};
 static u64 g_ld_shader_disk_rejects = 0;
 
+typedef enum {
+    LD_TEXTURE_DECODE_MISS = 1,
+    LD_TEXTURE_DECODE_REFRESH = 2,
+    LD_TEXTURE_DECODE_RETRY = 3
+} ld_texture_decode_kind;
+
 /*
  * Profile-lane-only renderer accounting.  These counters deliberately live
  * outside ld_state so the clean benchmark lane keeps the exact same state
@@ -1335,6 +1341,12 @@ typedef struct {
     u64 texture_upload_bytes;
     u64 texture_decode_calls;
     u64 texture_decode_qpc;
+    u64 texture_decode_miss_calls, texture_decode_refresh_calls;
+    u64 texture_decode_retry_calls;
+    u64 texture_decode_create_qpc, texture_decode_create_calls;
+    u64 texture_decode_upload_memcpy_qpc, texture_decode_upload_rows;
+    u64 texture_decode_copy_record_qpc, texture_decode_copy_regions;
+    u64 texture_decode_barrier_record_qpc, texture_decode_barriers;
     u64 texture_hash_qpc;
     u64 texture_hash_bytes;
     u64 texture_watch_qpc;
@@ -1366,6 +1378,12 @@ typedef struct {
     u32 frame_upload_high;
     u32 frame_vb_high;
     u32 frame_retired_high;
+    u64 frame_texture_create_max_qpc;
+    u32 frame_texture_create_max_width, frame_texture_create_max_height;
+    u32 frame_texture_create_max_format, frame_texture_create_max_mips;
+    u32 frame_texture_create_max_array_size, frame_texture_create_max_kind;
+    int texture_decode_active;
+    u32 texture_decode_kind;
     u32 total_upload_high;
     u32 total_vb_high;
     u32 total_retired_high;
@@ -1404,6 +1422,24 @@ static LONGLONG ld_profile_qpc(void)
     LARGE_INTEGER value;
     QueryPerformanceCounter(&value);
     return value.QuadPart;
+}
+
+static void ld_profile_note_texture_create(
+    LONGLONG begin, const D3D12_RESOURCE_DESC* desc)
+{
+    if (!g_ld_profile.texture_decode_active) return;
+    const u64 ticks = (u64)(ld_profile_qpc() - begin);
+    g_ld_profile.total.texture_decode_create_qpc += ticks;
+    ++g_ld_profile.total.texture_decode_create_calls;
+    if (ticks > g_ld_profile.frame_texture_create_max_qpc) {
+        g_ld_profile.frame_texture_create_max_qpc = ticks;
+        g_ld_profile.frame_texture_create_max_width = (u32)desc->Width;
+        g_ld_profile.frame_texture_create_max_height = desc->Height;
+        g_ld_profile.frame_texture_create_max_format = (u32)desc->Format;
+        g_ld_profile.frame_texture_create_max_mips = desc->MipLevels;
+        g_ld_profile.frame_texture_create_max_array_size = desc->DepthOrArraySize;
+        g_ld_profile.frame_texture_create_max_kind = g_ld_profile.texture_decode_kind;
+    }
 }
 
 static void ld_profile_note_ring_highwater(void)
@@ -2343,17 +2379,41 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     rd.Width = lv[0].w; rd.Height = lv[0].h; rd.DepthOrArraySize = 1;
     rd.MipLevels = (u16)n; rd.Format = fmt; rd.SampleDesc.Count = 1;
     ID3D12Resource* tex = NULL;
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG create_begin = g_ld_profile.texture_decode_active
+        ? ld_profile_qpc() : 0;
+#endif
     if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
                                                       D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-                                                      &IID_ID3D12Resource, (void**)&tex)))
+                                                      &IID_ID3D12Resource, (void**)&tex))) {
+#if defined(YZ_PERF_PROFILE)
+        if (g_ld_profile.texture_decode_active)
+            ld_profile_note_texture_create(create_begin, &rd);
+#endif
         return NULL;
+    }
+#if defined(YZ_PERF_PROFILE)
+    if (g_ld_profile.texture_decode_active)
+        ld_profile_note_texture_create(create_begin, &rd);
+#endif
     for (u32 m = 0; m < n; m++) {
         const u32 pitch = (lv[m].row_bytes + 255) & ~255u;
         const u32 start = (g.upload_used + 511) & ~511u;
         if ((u64)start + (u64)pitch * lv[m].rows > UPLOAD_SIZE) break;
+#if defined(YZ_PERF_PROFILE)
+        const LONGLONG memcpy_begin = g_ld_profile.texture_decode_active
+            ? ld_profile_qpc() : 0;
+#endif
         for (u32 y = 0; y < lv[m].rows; y++)
             memcpy(g.upload_mapped + start + (size_t)y * pitch,
                    lv[m].data + (size_t)y * lv[m].row_bytes, lv[m].row_bytes);
+#if defined(YZ_PERF_PROFILE)
+        if (g_ld_profile.texture_decode_active) {
+            g_ld_profile.total.texture_decode_upload_memcpy_qpc +=
+                (u64)(ld_profile_qpc() - memcpy_begin);
+            g_ld_profile.total.texture_decode_upload_rows += lv[m].rows;
+        }
+#endif
         D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
         src.pResource = g.upload; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint.Offset = start;
@@ -2364,7 +2424,18 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
         src.PlacedFootprint.Footprint.RowPitch = pitch;
         dst.pResource = tex; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst.SubresourceIndex = m;
+#if defined(YZ_PERF_PROFILE)
+        const LONGLONG copy_begin = g_ld_profile.texture_decode_active
+            ? ld_profile_qpc() : 0;
+#endif
         g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+#if defined(YZ_PERF_PROFILE)
+        if (g_ld_profile.texture_decode_active) {
+            g_ld_profile.total.texture_decode_copy_record_qpc +=
+                (u64)(ld_profile_qpc() - copy_begin);
+            ++g_ld_profile.total.texture_decode_copy_regions;
+        }
+#endif
         g.upload_used = start + pitch * lv[m].rows;
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.texture_upload_bytes +=
@@ -2377,7 +2448,18 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG barrier_begin = g_ld_profile.texture_decode_active
+        ? ld_profile_qpc() : 0;
+#endif
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+#if defined(YZ_PERF_PROFILE)
+    if (g_ld_profile.texture_decode_active) {
+        g_ld_profile.total.texture_decode_barrier_record_qpc +=
+            (u64)(ld_profile_qpc() - barrier_begin);
+        ++g_ld_profile.total.texture_decode_barriers;
+    }
+#endif
     return tex;
 }
 
@@ -2393,11 +2475,24 @@ static ID3D12Resource* create_texture_cube(
     rd.Width = lv[0].w; rd.Height = lv[0].h; rd.DepthOrArraySize = 6;
     rd.MipLevels = (u16)n_mips; rd.Format = fmt; rd.SampleDesc.Count = 1;
     ID3D12Resource* tex = NULL;
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG create_begin = g_ld_profile.texture_decode_active
+        ? ld_profile_qpc() : 0;
+#endif
     if (FAILED(g.dev->lpVtbl->CreateCommittedResource(
             g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
             D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-            &IID_ID3D12Resource, (void**)&tex)))
+            &IID_ID3D12Resource, (void**)&tex))) {
+#if defined(YZ_PERF_PROFILE)
+        if (g_ld_profile.texture_decode_active)
+            ld_profile_note_texture_create(create_begin, &rd);
+#endif
         return NULL;
+    }
+#if defined(YZ_PERF_PROFILE)
+    if (g_ld_profile.texture_decode_active)
+        ld_profile_note_texture_create(create_begin, &rd);
+#endif
     for (u32 face = 0; face < 6; face++) {
         for (u32 mip = 0; mip < n_mips; mip++) {
             const tex_level_t* level = &lv[face * n_mips + mip];
@@ -2407,10 +2502,21 @@ static ID3D12Resource* create_texture_cube(
                 tex->lpVtbl->Release(tex);
                 return NULL;
             }
+#if defined(YZ_PERF_PROFILE)
+            const LONGLONG memcpy_begin = g_ld_profile.texture_decode_active
+                ? ld_profile_qpc() : 0;
+#endif
             for (u32 y = 0; y < level->rows; y++)
                 memcpy(g.upload_mapped + start + (size_t)y * pitch,
                        level->data + (size_t)y * level->row_bytes,
                        level->row_bytes);
+#if defined(YZ_PERF_PROFILE)
+            if (g_ld_profile.texture_decode_active) {
+                g_ld_profile.total.texture_decode_upload_memcpy_qpc +=
+                    (u64)(ld_profile_qpc() - memcpy_begin);
+                g_ld_profile.total.texture_decode_upload_rows += level->rows;
+            }
+#endif
             D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
             src.pResource = g.upload;
             src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -2423,8 +2529,19 @@ static ID3D12Resource* create_texture_cube(
             dst.pResource = tex;
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             dst.SubresourceIndex = face * n_mips + mip;
+#if defined(YZ_PERF_PROFILE)
+            const LONGLONG copy_begin = g_ld_profile.texture_decode_active
+                ? ld_profile_qpc() : 0;
+#endif
             g.list->lpVtbl->CopyTextureRegion(
                 g.list, &dst, 0, 0, 0, &src, NULL);
+#if defined(YZ_PERF_PROFILE)
+            if (g_ld_profile.texture_decode_active) {
+                g_ld_profile.total.texture_decode_copy_record_qpc +=
+                    (u64)(ld_profile_qpc() - copy_begin);
+                ++g_ld_profile.total.texture_decode_copy_regions;
+            }
+#endif
             g.upload_used = start + pitch * level->rows;
 #if defined(YZ_PERF_PROFILE)
             g_ld_profile.total.texture_upload_bytes +=
@@ -2439,7 +2556,18 @@ static ID3D12Resource* create_texture_cube(
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG barrier_begin = g_ld_profile.texture_decode_active
+        ? ld_profile_qpc() : 0;
+#endif
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+#if defined(YZ_PERF_PROFILE)
+    if (g_ld_profile.texture_decode_active) {
+        g_ld_profile.total.texture_decode_barrier_record_qpc +=
+            (u64)(ld_profile_qpc() - barrier_begin);
+        ++g_ld_profile.total.texture_decode_barriers;
+    }
+#endif
     return tex;
 }
 
@@ -2876,11 +3004,20 @@ static u64 texture_override_revision(const rsx_dsp_texture* t)
 }
 
 static ID3D12Resource* decode_guest_texture_profiled(
-    const rsx_dsp_texture* texture, u32 remap, int* override_rgba)
+    const rsx_dsp_texture* texture, u32 remap, int* override_rgba,
+    ld_texture_decode_kind kind)
 {
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG begin = ld_profile_qpc();
     g_ld_profile.total.texture_decode_calls++;
+    if (kind == LD_TEXTURE_DECODE_MISS)
+        ++g_ld_profile.total.texture_decode_miss_calls;
+    else if (kind == LD_TEXTURE_DECODE_REFRESH)
+        ++g_ld_profile.total.texture_decode_refresh_calls;
+    else if (kind == LD_TEXTURE_DECODE_RETRY)
+        ++g_ld_profile.total.texture_decode_retry_calls;
+    g_ld_profile.texture_decode_active = 1;
+    g_ld_profile.texture_decode_kind = (u32)kind;
 #endif
     *override_rgba=0;
     ID3D12Resource* result = NULL;
@@ -2898,6 +3035,8 @@ static ID3D12Resource* decode_guest_texture_profiled(
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.texture_decode_qpc +=
         (u64)(ld_profile_qpc() - begin);
+    g_ld_profile.texture_decode_active = 0;
+    g_ld_profile.texture_decode_kind = 0;
 #endif
     return result;
 }
@@ -3018,7 +3157,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
          * scan and decode attempt at every binding of an unsupported format. */
         if (!entry->tex && entry->last_hash_frame != g_ld_frames) {
             entry->last_hash_frame=g_ld_frames;
-            entry->tex=decode_guest_texture_profiled(t,remap,&entry->override_rgba);
+            entry->tex=decode_guest_texture_profiled(
+                t, remap, &entry->override_rgba, LD_TEXTURE_DECODE_RETRY);
             if (entry->tex) {
                 entry->override_revision=override_revision;
                 int readable=0;
@@ -3117,7 +3257,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
             if (hash_changed || override_changed) {
                 int override_rgba=0;
                 ID3D12Resource* replacement =
-                    decode_guest_texture_profiled(t, remap, &override_rgba);
+                    decode_guest_texture_profiled(
+                        t, remap, &override_rgba, LD_TEXTURE_DECODE_REFRESH);
                 if (replacement) {
                     ID3D12Resource* old = entry->tex;
                     entry->tex = replacement;
@@ -3195,7 +3336,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         replacement.content_hash = texture_content_hash(t, &readable);
         replacement.content_hash_kind = texture_hash_kind();
     }
-    replacement.tex = decode_guest_texture_profiled(t, remap, &replacement.override_rgba);
+    replacement.tex = decode_guest_texture_profiled(
+        t, remap, &replacement.override_rgba, LD_TEXTURE_DECODE_MISS);
     replacement.override_revision=override_revision;
     /* Commit negative entries even when full. Previously this branch kept the
      * old LRU entry on failure, so the same descriptor missed forever. */
@@ -6307,7 +6449,7 @@ static void ld_profile_present(u32 frame)
                 "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
                 "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work,"
                 "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses,topology_index_ms,"
-                "texture_watch_ms,texture_watch_queries,texture_watch_dirty_pages,texture_watch_skip_bytes,texture_watch_skips,texture_watch_audits,texture_watch_races,texture_watch_failures,vertex_cache,vertex_cache_hits,vertex_cache_misses,vertex_cache_bypasses,vertex_cache_compared_bytes,vertex_cache_storage_bytes,geometry_cache,geometry_cache_hits,geometry_cache_misses,geometry_cache_bypasses,geometry_cache_queries,geometry_cache_dirty_pages,geometry_cache_storage_bytes,geometry_cache_audits,geometry_cache_races,geometry_cache_failures,geometry_cache_query_ms,geometry_cache_begin_ms,geometry_cache_store_ms,geometry_cache_copy_ms,geometry_cache_hit_vertices,geometry_cache_hit_refs,vertex_workers,vertex_worker_draws,vertex_worker_vertices,vertex_worker_large_draws,vertex_worker_large_vertices,vertex_worker_parallel_draws,vertex_worker_parallel_vertices,vertex_worker_jobs,vertex_worker_bypasses,vertex_worker_audits,vertex_worker_races,vertex_worker_failures,vertex_worker_wait_ms,shader_disk_load_ms,shader_disk_store_ms,shader_blob_create_ms,shader_disk_load_calls,shader_disk_store_calls,vs_blob_lookup_ms,ps_blob_lookup_ms,shader_disk_load_open_ms,shader_disk_load_read_ms,shader_disk_load_close_ms,shader_disk_load_progress_ms,shader_disk_load_other_ms,shader_disk_load_open_calls,shader_disk_load_read_calls,shader_disk_load_close_calls,shader_disk_load_progress_writes\n",32768,2048))
+                "texture_watch_ms,texture_watch_queries,texture_watch_dirty_pages,texture_watch_skip_bytes,texture_watch_skips,texture_watch_audits,texture_watch_races,texture_watch_failures,vertex_cache,vertex_cache_hits,vertex_cache_misses,vertex_cache_bypasses,vertex_cache_compared_bytes,vertex_cache_storage_bytes,geometry_cache,geometry_cache_hits,geometry_cache_misses,geometry_cache_bypasses,geometry_cache_queries,geometry_cache_dirty_pages,geometry_cache_storage_bytes,geometry_cache_audits,geometry_cache_races,geometry_cache_failures,geometry_cache_query_ms,geometry_cache_begin_ms,geometry_cache_store_ms,geometry_cache_copy_ms,geometry_cache_hit_vertices,geometry_cache_hit_refs,vertex_workers,vertex_worker_draws,vertex_worker_vertices,vertex_worker_large_draws,vertex_worker_large_vertices,vertex_worker_parallel_draws,vertex_worker_parallel_vertices,vertex_worker_jobs,vertex_worker_bypasses,vertex_worker_audits,vertex_worker_races,vertex_worker_failures,vertex_worker_wait_ms,shader_disk_load_ms,shader_disk_store_ms,shader_blob_create_ms,shader_disk_load_calls,shader_disk_store_calls,vs_blob_lookup_ms,ps_blob_lookup_ms,shader_disk_load_open_ms,shader_disk_load_read_ms,shader_disk_load_close_ms,shader_disk_load_progress_ms,shader_disk_load_other_ms,shader_disk_load_open_calls,shader_disk_load_read_calls,shader_disk_load_close_calls,shader_disk_load_progress_writes,texture_decode_calls,texture_decode_miss_calls,texture_decode_refresh_calls,texture_decode_retry_calls,texture_decode_create_ms,texture_decode_create_calls,texture_decode_create_max_ms,texture_decode_create_max_width,texture_decode_create_max_height,texture_decode_create_max_format,texture_decode_create_max_mips,texture_decode_create_max_array_size,texture_decode_create_max_kind,texture_decode_upload_memcpy_ms,texture_decode_upload_rows,texture_decode_copy_record_ms,texture_decode_copy_regions,texture_decode_barrier_record_ms,texture_decode_barriers,texture_decode_other_ms\n",32768,2048))
                 fprintf(stderr,"[profile-buffer] renderer allocation failed\n");
         }
     }
@@ -6335,9 +6477,20 @@ static void ld_profile_present(u32 frame)
         const u64 shader_load_other_ticks =
             shader_load_ticks > shader_load_subphase_ticks
                 ? shader_load_ticks - shader_load_subphase_ticks : 0;
+        const u64 texture_decode_ticks = LD_PROFILE_DELTA(texture_decode_qpc);
+        const u64 texture_decode_subphase_ticks =
+            LD_PROFILE_DELTA(texture_decode_create_qpc) +
+            LD_PROFILE_DELTA(texture_decode_upload_memcpy_qpc) +
+            LD_PROFILE_DELTA(texture_decode_copy_record_qpc) +
+            LD_PROFILE_DELTA(texture_decode_barrier_record_qpc);
+        const u64 texture_decode_other_ticks =
+            texture_decode_ticks > texture_decode_subphase_ticks
+                ? texture_decode_ticks - texture_decode_subphase_ticks : 0;
         rsx_profile_buffer_printf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
             "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,"
-            "%.6f,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%llu,%llu\n", frame, now, frame_ms,
+            "%.6f,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%llu,%llu,"
+            "%llu,%llu,%llu,%llu,%.6f,%llu,%.6f,%u,%u,%u,%u,%u,%u,"
+            "%.6f,%llu,%.6f,%llu,%.6f,%llu,%.6f\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
@@ -6430,7 +6583,27 @@ static void ld_profile_present(u32 frame)
             (unsigned long long)LD_PROFILE_DELTA(shader_disk_load_open_calls),
             (unsigned long long)LD_PROFILE_DELTA(shader_disk_load_read_calls),
             (unsigned long long)LD_PROFILE_DELTA(shader_disk_load_close_calls),
-            (unsigned long long)LD_PROFILE_DELTA(shader_disk_load_progress_writes));
+            (unsigned long long)LD_PROFILE_DELTA(shader_disk_load_progress_writes),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_calls),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_miss_calls),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_refresh_calls),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_retry_calls),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(texture_decode_create_qpc)),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_create_calls),
+            ld_profile_ticks_ms(g_ld_profile.frame_texture_create_max_qpc),
+            g_ld_profile.frame_texture_create_max_width,
+            g_ld_profile.frame_texture_create_max_height,
+            g_ld_profile.frame_texture_create_max_format,
+            g_ld_profile.frame_texture_create_max_mips,
+            g_ld_profile.frame_texture_create_max_array_size,
+            g_ld_profile.frame_texture_create_max_kind,
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(texture_decode_upload_memcpy_qpc)),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_upload_rows),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(texture_decode_copy_record_qpc)),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_copy_regions),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(texture_decode_barrier_record_qpc)),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_barriers),
+            ld_profile_ticks_ms(texture_decode_other_ticks));
         previous_workers=g_vertex_worker_stats;
         previous_worker_wait_ticks=g_vertex_worker_wait_ticks;
         previous_geom_hits=g_geom_stats.hits; previous_geom_misses=g_geom_stats.misses;
@@ -6710,6 +6883,13 @@ static void ld_profile_present(u32 frame)
     g_ld_profile.frame_upload_high = 0;
     g_ld_profile.frame_vb_high = 0;
     g_ld_profile.frame_retired_high = 0;
+    g_ld_profile.frame_texture_create_max_qpc = 0;
+    g_ld_profile.frame_texture_create_max_width = 0;
+    g_ld_profile.frame_texture_create_max_height = 0;
+    g_ld_profile.frame_texture_create_max_format = 0;
+    g_ld_profile.frame_texture_create_max_mips = 0;
+    g_ld_profile.frame_texture_create_max_array_size = 0;
+    g_ld_profile.frame_texture_create_max_kind = 0;
     g_ld_profile.frame_used_attribute_max = 0;
 #undef LD_PROFILE_DELTA
 }
