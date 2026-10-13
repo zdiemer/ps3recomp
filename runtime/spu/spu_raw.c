@@ -239,6 +239,8 @@ static DWORD WINAPI raw_spu_thread(LPVOID arg)
     publish(s);
 
     int halted = spu_run_with_halt(s->entry, c);
+    { extern void spu_mfc_release(spu_context*);
+      spu_mfc_release(c); }
 
     /* A raw SPU that returns has executed `stop`. Report it the way hardware
      * does -- run bit clear, stop bit set, stop code in the high half -- so the

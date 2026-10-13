@@ -48,6 +48,28 @@ typedef const u8* (*rsx_live_guest_ptr_fn)(void* user, u32 location, u32 offset,
  * Cheap; safe to call from the hot method hook. */
 int  rsx_live_draw_enabled(void);
 
+/* Optional title-owned main scene size (before its final scanout upscale).
+ * Call before init. Custom RSX_RENDER_RESOLUTION scales this scene to the
+ * requested size; an unset option preserves all native dimensions. */
+void rsx_live_draw_set_render_reference(u32 width, u32 height);
+/* Optional square shadow atlas size. Independent shadow scaling applies to
+ * all raster attachments of this exact guest extent. Call before init. */
+void rsx_live_draw_set_shadow_reference(u32 size);
+
+/* Optional title-owned replacement for non-cubemap, single-level color
+ * textures. Register before init. Both callbacks run on the render consumer.
+ * revision must be cheap; changing it refreshes a cached resource even when
+ * guest bytes are unchanged. Return zero for descriptors of no interest.
+ * pixels receives bounded original source bytes and returns canonical RGBA8
+ * at the original extent, or NULL to retain the guest texture. The returned
+ * memory must remain valid until the callback's caller returns. Guest channel
+ * remapping is preserved. Render-target/depth aliases bypass this path. */
+typedef u64 (*rsx_live_texture_revision_fn)(u32 format, u32 width, u32 height, void* user);
+typedef const u8* (*rsx_live_texture_pixels_fn)(u32 format, u32 width, u32 height,
+    const u8* source, size_t source_bytes, void* user);
+void rsx_live_draw_set_texture_override(rsx_live_texture_revision_fn revision,
+    rsx_live_texture_pixels_fn pixels, void* user);
+
 /* Bring up the D3D12 device + swap chain bound to an existing HWND (the
  * runtime already opens the present window). Returns 0 on success. Safe to
  * call when disabled (returns 0 and stays inert). `hwnd` is an HWND cast to

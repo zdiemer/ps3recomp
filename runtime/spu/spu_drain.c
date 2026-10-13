@@ -6,6 +6,7 @@
  * functions (not macros) means the SPU_DRAIN/SPU_RET call sites are already in
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
+#include "spu_code_lookup.h"
 #include <setjmp.h>
 
 /* See spu_context.h `irq_frame`. */
@@ -36,6 +37,7 @@ void* volatile    g_pm_flow_ctx = 0;
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdatomic.h>
 
 /* Sync-model ring-drain: the wwsjob PM's job ring drains only when jobs mark
  * their record's "done" bit (0x8000 in the record's first halfword @LS 0xDF0).
@@ -57,7 +59,19 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
     return k;
 }
 
-void spu_task_launch_check(spu_context* ctx, void* fn)
+static __attribute__((noinline, cold)) void spu_note_ls0_complete(const spu_context* ctx)
+{
+    static int n;
+    if (n++ < 8)
+        fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
+                ctx->image_id);
+}
+
+/* Keep optional trace/ring-recovery code out of the per-basic-block prologue.
+ * Every original hook remains available when its environment is configured or
+ * a policy-module flow recorder is armed dynamically. */
+static __attribute__((noinline, cold)) void
+spu_task_launch_check_diagnostic(spu_context* ctx, void* fn)
 {
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
@@ -83,10 +97,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
 
     if (!s_no_ls0 && ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
         !ctx->policy_mode && ctx->image_id > 0) {
-        static int _n = 0;
-        if (_n++ < 8)
-            fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
-                    ctx->image_id);
+        spu_note_ls0_complete(ctx);
         if (s_et >= 0 && ctx->image_id == s_et) {
             fprintf(stderr, "[spu-exit] img=%d last PCs:", ctx->image_id);
             for (int i = 32; i >= 1; i--)
@@ -113,6 +124,15 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
               fprintf(stderr, "[step] pc=0x%05X r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n",
                       (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[1]._u32[0],
                       ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
+              if (getenv("SPU_STEPTRACE_REGS")) {
+                  const unsigned regs[] = {3, 4, 5, 16, 17, 81};
+                  for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); ++i) {
+                      const unsigned r = regs[i];
+                      fprintf(stderr, "[step-reg] r%u=%08X %08X %08X %08X\n", r,
+                              ctx->gpr[r]._u32[0], ctx->gpr[r]._u32[1],
+                              ctx->gpr[r]._u32[2], ctx->gpr[r]._u32[3]);
+                  }
+              }
               fflush(stderr);
           }
       } }
@@ -147,6 +167,40 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     static int _n = 0;
     if (marked && _n++ < 12)
         fprintf(stderr, "[pm-jobdrain] ring-full spin: marked %d pending records done\n", marked);
+}
+
+static __attribute__((noinline, cold)) int spu_launch_probes_configured(void)
+{
+    const char* names[] = { "SPU_NO_LS0_END", "SPU_EXITTRACE", "SPU_STEPTRACE",
+                           "SPU_STEPTRACE_FROM", "SPU_STEPTRACE_REGS", "SPU_JOBDRAIN" };
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+        if (getenv(names[i])) return 1;
+    return 0;
+}
+
+void spu_task_launch_check(spu_context* ctx, void* fn)
+{
+    /* Environment settings are startup configuration, as in the diagnostic
+     * implementation. Concurrent first callers may resolve the same immutable
+     * settings; no partially initialized configuration is published. */
+    static _Atomic int probes = -1;
+    int configured = atomic_load_explicit(&probes, memory_order_relaxed);
+    if (configured < 0) {
+        configured = spu_launch_probes_configured();
+        atomic_store_explicit(&probes, configured, memory_order_relaxed);
+    }
+    if (configured || g_pm_flow_ctx) {
+        spu_task_launch_check_diagnostic(ctx, fn);
+        return;
+    }
+    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+    spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+    if (ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
+        !ctx->policy_mode && ctx->image_id > 0) {
+        spu_note_ls0_complete(ctx);
+        spu_halt(ctx);
+    }
 }
 
 /* Restore the active image after a lifted call bracket. The brsl/bisl emission
@@ -335,33 +389,54 @@ void (*spu_take_interrupt(spu_context* ctx,
 /* See the declaration in spu_context.h. */
 void spu_depth_guard(spu_context* ctx)
 {
-    static uint32_t s_max = 0;
+    static _Thread_local uint32_t s_max = 0;
+    static _Thread_local const char* control;
     if (!s_max) {
         const char* e = getenv("SPU_HOST_DEPTH_MAX");
         s_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
+        control=getenv("SPU_DEPTH_RING_FILE");
+    }
+    /* The usual path needs no diagnostic writes or benchmark bookkeeping. */
+    if (!control && ctx->host_depth < s_max) return;
+
+    /* The per-thread trampoline history already records these PCs. The former
+     * shared diagnostic ring wrote the same cache lines from every SPU on each
+     * drain entry, racing and mixing unrelated threads' histories. Retain a
+     * race-free approximation only for an opt-in same-process cost comparison. */
+    enum { RING = 24 };
+    static _Atomic uint32_t shared_ring[RING], shared_n;
+    static _Thread_local int configured, private_history;
+    static _Thread_local unsigned checks;
+    if (!configured) {
+        private_history=1; configured=1;
+    }
+    if (control && (++checks & 65535u)==0) {
+        FILE* file=fopen(control,"r"); unsigned flags;
+        if (file) {
+            if (fscanf(file,"%u",&flags)==1 && private_history!=((flags & 16u)!=0)) {
+                private_history=(flags & 16u)!=0;
+                fprintf(stderr,"[spu-depth-history] image=%d private=%d\n",ctx->image_id,private_history);
+            }
+            fclose(file);
+        }
+    }
+    if (!private_history) {
+        const uint32_t n=atomic_load_explicit(&shared_n,memory_order_relaxed);
+        atomic_store_explicit(&shared_ring[n%RING],(uint32_t)ctx->pc & SPU_LS_MASK,memory_order_relaxed);
+        atomic_store_explicit(&shared_n,n+1,memory_order_relaxed);
     }
 
-    /* Ring of recent drain sites. When the depth trips, the useful question is
-     * not "where are we" but "what cycle got us here" -- one pc names a point,
-     * a ring names the loop. */
-    enum { RING = 24 };
-    static uint32_t s_ring[RING];
-    static uint32_t s_n;
-    s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
-    s_n++;
-
     if (ctx->host_depth < s_max) return;
-    static int s_reported = 0;
-    if (s_reported < 1) {   /* one report: five SPU threads all trip together */
-        s_reported++;
+    static atomic_flag reported = ATOMIC_FLAG_INIT;
+    if (!atomic_flag_test_and_set_explicit(&reported,memory_order_relaxed)) {
         fprintf(stderr, "[spu-depth] img=%d pc=0x%05X lr=0x%05X host_depth=%u"
                         " -- lifted call recursion, halting the SPU\n",
                 ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->host_depth);
         fprintf(stderr, "[spu-depth] recent drain sites (oldest first):");
-        uint32_t start = (s_n > RING) ? (s_n - RING) : 0;
-        for (uint32_t k = start; k < s_n; k++)
-            fprintf(stderr, " %05X", s_ring[k % RING]);
+        uint32_t recent[RING];
+        const unsigned count=spu_recent_pcs(recent,RING);
+        for (unsigned k=0; k<count; ++k) fprintf(stderr," %05X",recent[k]);
         fprintf(stderr, "\n");
         fflush(stderr);
     }
@@ -449,8 +524,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
         }
         {
             uint32_t pc = ctx->pc & SPU_LS_MASK;
-            spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
-            if (!fn) fn = spu_lookup(pc, ctx->image_id);
+            spu_drain_fn fn = spu_lookup_resident(ctx, pc);
             if (fn) {
                 { static int _n = 0; if (_n++ < 8)
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",

@@ -2862,6 +2862,19 @@ class PPULifter:
                     f"memcpy(&ctx->vr[{vd}], r, 16); }}")
 
         # Shifts and rotates
+        if mn == "vsl":
+            # Shift the architectural 128-bit vector by 0..7 bits. The ISA
+            # requires matching low three bits in every byte of vB; using its
+            # last byte selects that common count. Keep cross-byte carries
+            # and snapshot the input so vD can alias vA or vB.
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint8_t a[16], o[16]; "
+                    f"unsigned s=((const uint8_t*)&ctx->vr[{vb}])[15]&7u; "
+                    f"memcpy(a, &ctx->vr[{va}], 16); "
+                    f"for(int i=0;i<16;i++) o[i]=(uint8_t)((a[i]<<s)|"
+                    f"((s && i<15)?(a[i+1]>>(8u-s)):0)); "
+                    f"memcpy(&ctx->vr[{vd}], o, 16); }}")
+
         if mn == "vslb":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
             return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
@@ -2944,6 +2957,21 @@ class PPULifter:
                     f"if(acc<-2147483648LL) acc=-2147483648LL; "
                     f"uint32_t r=(uint32_t)(int32_t)acc; "
                     f"for(int k=0;k<4;k++) o[j*4+k]=(uint8_t)(r>>(8*(3-k))); }} "
+                    f"memcpy(&ctx->vr[{vd}], o, 16); }}")
+
+        # vsum4ubs: each word receives the sum of its four unsigned bytes
+        # in vA and the corresponding unsigned word of vB, saturating to u32.
+        # Snapshot both sources before writing: vD may alias either source.
+        if mn == "vsum4ubs":
+            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
+            return (f"{{ uint8_t a[16], b[16], o[16]; "
+                    f"memcpy(a, &ctx->vr[{va}], 16); memcpy(b, &ctx->vr[{vb}], 16); "
+                    f"for(int j=0;j<4;j++){{ "
+                    f"uint64_t acc=((uint32_t)b[j*4]<<24)|((uint32_t)b[j*4+1]<<16)|"
+                    f"((uint32_t)b[j*4+2]<<8)|b[j*4+3]; "
+                    f"for(int k=0;k<4;k++) acc+=a[j*4+k]; "
+                    f"if(acc>0xFFFFFFFFULL){{ acc=0xFFFFFFFFULL; ctx->vscr|=1u; }} "
+                    f"for(int k=0;k<4;k++) o[j*4+k]=(uint8_t)(acc>>(8*(3-k))); }} "
                     f"memcpy(&ctx->vr[{vd}], o, 16); }}")
 
         # vsumsws vD,vA,vB: sum the four signed words of vA plus word 3 of vB,

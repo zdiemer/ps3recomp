@@ -64,6 +64,7 @@ extern unsigned long long g_rsx_fp_nonfinite_constants;
  *          control word is available (standalone tests) to fall back to the
  *          legacy "whichever of r0/h0 was written" heuristic. */
 #define RSX_FP_CTRL_AUTO 0xFFFFFFFFu
+#define RSX_FP_CTRL_DEPTH_EXPORT 0x0Eu
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size);
 
 /* Apply the NV4097 fixed-function alpha test to an already-decompiled pixel
@@ -107,6 +108,14 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
  * call-site guidance. */
 int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size);
+
+/* Depth-comparison variant. Selected 2D units use comparison samplers and
+ * compare TEX's source Z, or TXP's projected source Z/W. Other units retain
+ * ordinary sampling. A selected cube unit or unsupported shadow texture
+ * opcode returns -1 rather than silently emitting a raw depth read. */
+int rsx_fp_decompile_shadow_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
+    u32 tex_cube_mask, u32 tex_shadow_mask, int buffered,
+    char* out, u32 out_size, u32* out_constant_count);
 
 /* Buffered-constant variant of rsx_fp_decompile_ex. Inline CONST payloads are
  * represented as fp_constants[N] in a b1 PSConstants cbuffer rather than
@@ -160,6 +169,19 @@ const char* rsx_fp_opcode_name(u32 opcode);
  * walk logic so callers (e.g. a shader cache hashing the bytecode) agree with
  * the decompiler on where a program ends. */
 u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes);
+
+/* Convert Direct3D SV_POSITION XY to the RSX SET_SHADER_WINDOW contract.
+ * Bits 0..11 are window height, 12..15 select top/bottom origin (0/1),
+ * and 16..19 select half/integer pixel centers (0/1). Host Z and W
+ * are preserved. Returns 1 when WPOS reads were patched, 0 if unnecessary,
+ * or -1 for invalid state/source or insufficient output capacity. */
+int rsx_fp_apply_window_position(char* hlsl, u32 out_size, u32 window);
+/* Additionally convert host interpolated clip W to RSX reciprocal W when
+ * reciprocal_w is nonzero. Z remains unchanged. Same return contract. */
+int rsx_fp_apply_window_position_scaled(char* hlsl, u32 out_size, u32 window,
+    int reciprocal_w, float scale_x, float scale_y);
+int rsx_fp_apply_window_position_ex(char* hlsl, u32 out_size, u32 window,
+                                  int reciprocal_w);
 
 #ifdef __cplusplus
 }

@@ -71,6 +71,9 @@ typedef struct {
     int n_pipeline_create;
     int n_draw, n_clear_color, n_clear_ds, n_present;
     u32 cleared[STUB_MAX_CLEARED];
+    u32 clear_channels, clear_rect[4];
+    float clear_depth;
+    u8 clear_stencil;
 
     /* the last draw's bindings */
     u32 bound_tex[RSX_BE_MAX_TEXTURES];
@@ -86,6 +89,7 @@ typedef struct {
     u32 stencil_ref;
     u32 last_created_texture, last_created_color;
     u32 last_released;
+    char fragment_source[16384];
 } StubState;
 
 static StubState stub;
@@ -161,6 +165,7 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
     if (!vs || !ps || !*vs || !*ps) return 0;
     stub.n_pipeline_create++;
     stub.pipeline_rt_count = rt_count;
+    snprintf(stub.fragment_source, sizeof stub.fragment_source, "%s", ps);
     return stub_handle();
 }
 
@@ -227,7 +232,16 @@ static void stub_clear_color(void* u, u32 s, const float rgba[4])
 }
 
 static void stub_clear_ds(void* u, u32 d, u32 f, float z, u8 s)
-{ (void)u; (void)d; (void)f; (void)z; (void)s; stub.n_clear_ds++; }
+{ (void)u; (void)d; (void)f; stub.clear_depth=z; stub.clear_stencil=s; stub.n_clear_ds++; }
+
+static void stub_clear_color_rect(void* u, u32 surface, const float rgba[4],
+                                  u32 channels, u32 x, u32 y, u32 w, u32 h)
+{
+    stub_clear_color(u, surface, rgba);
+    stub.clear_channels = channels;
+    stub.clear_rect[0] = x; stub.clear_rect[1] = y;
+    stub.clear_rect[2] = w; stub.clear_rect[3] = h;
+}
 
 static u32 presented_surface;
 static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.n_present++; }
@@ -273,6 +287,7 @@ static const rsx_draw_backend g_stub_backend = {
     .clear_depth_stencil = stub_clear_ds,
     .present = stub_present,
     .readback = stub_readback,
+    .clear_color_rect = stub_clear_color_rect,
 };
 
 /* ---- driving the engine -------------------------------------------------- */
@@ -300,6 +315,7 @@ static const rsx_draw_backend g_stub_backend = {
 #define M_TEX_UNIT            0x1A00   /* + unit * 0x20 */
 #define M_STENCIL_FUNC_REF    0x0334
 #define M_CLEAR_BUFFERS       0x1D94
+#define M_ZSTENCIL_CLEAR      0x1D8C
 #define M_VP_UPLOAD_CONST_ID  0x1EFC
 #define M_VP_UPLOAD_CONST     0x1F00
 
@@ -640,6 +656,49 @@ static void test_pipeline_key(void)
     engine_down();
 }
 
+static void test_unnormalized_texture_coordinates(void)
+{
+    engine_up();
+    /* MOV o0, ATTR0; TEX r0, TC0 on unit 0. The backend records the actual
+     * guest shader source, so this exercises both decompilation and caching. */
+    const u32 vp[4] = {1u << 30, 1u << 22, 2u << 23, (15u << 13) | 1u};
+    m(0x1E9C, 0);
+    for (u32 i = 0; i < 4; i++) m(0x0B80 + i * 4, vp[i]);
+    const u32 fp[4] = {(0x17u << 24) | (15u << 9) | (4u << 13) | 1u,
+        1u | (1u << 11) | (2u << 13) | (3u << 15) |
+        (7u << 18) | (1u << 23) | (2u << 25) | (3u << 27), 0, 0};
+    for (u32 i = 0; i < 4; i++) {
+        const u32 swapped = (fp[i] << 16) | (fp[i] >> 16);
+        u8* bytes = vm_base + 0x30000u + i * 4;
+        bytes[0] = (u8)(swapped >> 24); bytes[1] = (u8)(swapped >> 16);
+        bytes[2] = (u8)(swapped >> 8); bytes[3] = (u8)swapped;
+    }
+    m(0x08E4, 0x30000u | 2u); m(0x1D60, 0x40u);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    const u32 normalized = stub.bound_pipeline;
+    CHECK(strstr(stub.fragment_source, ".Sample(") != NULL,
+          "the coordinate regression uses a guest texture instruction");
+    m(M_TEX_UNIT + 0x04, 2u | (2u << 4) | (0xE5u << 8) | (1u << 16));
+    draw_triangle();
+    const u32 texel4 = stub.bound_pipeline;
+    CHECK(texel4 != normalized && strstr(stub.fragment_source, "* float2(0.25, 0.25)"),
+          "texel coordinates scale by the image dimensions");
+    draw_triangle();
+    CHECK(stub.bound_pipeline == texel4, "unchanged texel addressing reuses its pipeline");
+    m(M_TEX_UNIT + 0x18, (8u << 16) | 4u);
+    draw_triangle();
+    CHECK(stub.bound_pipeline != texel4 && strstr(stub.fragment_source, "* float2(0.125, 0.25)"),
+          "changing the image width rebuilds its baked coordinate divisor");
+    m(M_TEX_UNIT + 0x18, (4u << 16) | 4u);
+    draw_triangle();
+    CHECK(stub.bound_pipeline == texel4, "restoring dimensions reuses the earlier pipeline");
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    CHECK(stub.bound_pipeline == normalized, "normalized addressing keeps its original pipeline");
+    engine_down();
+}
+
 /* ---- 5. restart cuts and topology expansion ------------------------------ */
 
 static void test_restart_expansion(void)
@@ -865,6 +924,68 @@ static void test_scissor(void)
 
 /* ---- 8. the presented pixel ---------------------------------------------- */
 
+static u32 feedback_calls, feedback_surface, feedback_texture;
+static u32 stub_color_snapshot(void* user, u32 surface)
+{
+    (void)user;
+    feedback_calls++; feedback_surface = surface;
+    if (!feedback_texture) feedback_texture = stub_handle();
+    return feedback_texture;
+}
+
+static void test_color_feedback(void)
+{
+    engine_up();
+    rsx_draw_backend precise = g_stub_backend;
+    precise.color_snapshot = stub_color_snapshot;
+    rsx_draw_engine_set_backend(&precise);
+    feedback_calls = feedback_surface = feedback_texture = 0;
+    m(M_CONTEXT_DMA_COLOR_A, DMA_MAIN);
+    m(M_COLOR_A_OFFSET, TEX_OFFSET);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    const u32 surface = stub.last_created_color;
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    m(M_TEX_UNIT + 0x20, TEX_OFFSET);
+    m(M_TEX_UNIT + 0x24, 2u | (2u << 4) | (0xA5u << 8) | (1u << 16));
+    m(M_TEX_UNIT + 0x2C, 0x80000000u);
+    m(M_TEX_UNIT + 0x30, 0xAAE4u);
+    m(M_TEX_UNIT + 0x38, (4u << 16) | 4u);
+    draw_triangle();
+    CHECK(feedback_calls == 1 && feedback_surface == surface &&
+          stub.bound_tex[0] == feedback_texture && stub.bound_tex[1] == feedback_texture &&
+          stub.n_texture_create == 0,
+          "units sampling their render target share one pre-draw snapshot, not stale guest bytes");
+    draw_triangle();
+    CHECK(feedback_calls == 2 && stub.bound_tex[0] == feedback_texture,
+          "the next feedback draw refreshes the reusable snapshot");
+    engine_down();
+}
+
+static void test_color_clear_mask(void)
+{
+    engine_up();
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.clear_channels == 15 && stub.clear_rect[0] == 0 &&
+          stub.clear_rect[1] == 0 && stub.clear_rect[2] == 256 && stub.clear_rect[3] == 256,
+          "an unwritten clear scissor covers the full surface");
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    m(M_CLEAR_BUFFERS, RSX_CLEAR_COLOR_A);
+    CHECK(stub.clear_channels == 8 && stub.clear_rect[0] == 16 &&
+          stub.clear_rect[1] == 8 && stub.clear_rect[2] == 64 && stub.clear_rect[3] == 32,
+          "an alpha-only clear preserves its channel mask and guest rectangle");
+    m(M_SCISSOR_H, (10u << 16) | 250u);
+    m(M_SCISSOR_V, (10u << 16) | 252u);
+    m(M_CLEAR_BUFFERS, RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G);
+    CHECK(stub.clear_channels == 3 && stub.clear_rect[2] == 6 && stub.clear_rect[3] == 4,
+          "a masked clear clips at the surface edge");
+    const int clears = stub.n_clear_color;
+    m(M_SCISSOR_H, 0);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_clear_color == clears, "an explicitly empty clear scissor writes no pixels");
+    engine_down();
+}
+
 static void test_readback(void)
 {
     printf("-- readback\n");
@@ -963,6 +1084,31 @@ static void test_inline_array(void)
     engine_down();
 }
 
+static void test_depth_clear_packing(void)
+{
+    printf("-- depth clear packing\n");
+    engine_up();
+    m(M_ZETA_OFFSET, 0x60000u);
+    m(M_SURFACE_FORMAT, 1u << 5); /* Z16 shadow atlas */
+    m(M_ZSTENCIL_CLEAR, 0x0000FFFFu);
+    m(M_CLEAR_BUFFERS, 1u);
+    CHECK(stub.n_clear_ds == 1 && stub.clear_depth == 1.0f,
+          "Z16 shadow clear uses the low 16 bits as far depth");
+    m(M_ZSTENCIL_CLEAR, 0);
+    m(M_CLEAR_BUFFERS, 1u);
+    CHECK(stub.clear_depth == 0.0f, "zero is a valid Z16 near-depth clear");
+    m(M_SURFACE_FORMAT, 2u << 5); /* Z24S8 */
+    m(M_ZSTENCIL_CLEAR, 0xFFFFFF37u);
+    m(M_CLEAR_BUFFERS, 3u);
+    CHECK(stub.clear_depth == 1.0f && stub.clear_stencil == 0x37,
+          "Z24S8 decodes depth above the stencil byte");
+    m(M_ZSTENCIL_CLEAR, 0x000000ABu);
+    m(M_CLEAR_BUFFERS, 3u);
+    CHECK(stub.clear_depth == 0.0f && stub.clear_stencil == 0xAB,
+          "Z24S8 preserves zero depth and its independent stencil value");
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -980,9 +1126,13 @@ int main(void)
     test_mrt_set();
     test_texture_cache();
     test_pipeline_key();
+    test_unnormalized_texture_coordinates();
     test_restart_expansion();
     test_indexed_draws();
     test_scissor();
+    test_color_clear_mask();
+    test_depth_clear_packing();
+    test_color_feedback();
     test_readback();
     test_custom_guest_mapping();
     test_queued_flip_buffer();

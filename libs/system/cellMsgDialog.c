@@ -117,8 +117,14 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
            type, guest_str(msgString));
 
     if (s_dialog_open) {
-        printf("[cellMsgDialog] WARNING: dialog already open, closing previous\n");
+        return (s32)0x8002B105; /* CELL_SYSUTIL_ERROR_BUSY */
     }
+
+    /* Dialog ownership is announced through the registered system callbacks,
+     * alongside the dialog's button callback. Queue both channels in one FIFO so BEGIN,
+     * END, then the button result keep their order at the next sysutil poll. */
+    s32 event_result = cellSysutilBroadcastEvent(CELL_SYSUTIL_DRAWING_BEGIN, 0);
+    if (event_result != CELL_OK) return event_result;
 
     s_dialog_open = 1;
     s_callback    = callback;
@@ -235,6 +241,7 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
 
         /* Close and queue the callback; never enter guest code here. */
         s_dialog_open = 0;
+        cellSysutilBroadcastEvent(CELL_SYSUTIL_DRAWING_END, 0);
         if (s_callback) {
             CellMsgDialogCallback cb = s_callback;
             s_callback = NULL;
@@ -272,6 +279,7 @@ s32 cellMsgDialogClose(float delayMs)
 
     s_dialog_open = 0;
     s_nobutton_deadline = 0;
+    cellSysutilBroadcastEvent(CELL_SYSUTIL_DRAWING_END, 0);
 
     if (s_callback) {
         CellMsgDialogCallback cb = s_callback;
@@ -292,13 +300,11 @@ s32 cellMsgDialogAbort(void)
 
     s_dialog_open = 0;
     s_nobutton_deadline = 0;
+    cellSysutilBroadcastEvent(CELL_SYSUTIL_DRAWING_END, 0);
 
-    if (s_callback) {
-        CellMsgDialogCallback cb = s_callback;
-        s_callback = NULL;
-        return queue_dialog_callback(cb, CELL_MSGDIALOG_BUTTON_ESCAPE, s_userdata);
-    }
-
+    /* Firmware Abort destroys a dialog without delivering a button result.
+     * In particular, taking down an install bar must not look like Cancel. */
+    s_callback = NULL;
     return CELL_OK;
 }
 
@@ -362,6 +368,7 @@ void cellMsgDialog_tick(void)
     if (GetTickCount64() < s_nobutton_deadline) return;
     s_nobutton_deadline = 0;
     s_dialog_open = 0;
+    cellSysutilBroadcastEvent(CELL_SYSUTIL_DRAWING_END, 0);
     printf("[cellMsgDialog] no-button dialog auto-dismissed after %u ms\n",
            nobutton_grace_ms());
     if (s_callback) {

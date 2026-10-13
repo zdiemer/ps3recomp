@@ -514,7 +514,7 @@ class SPULifter:
                     func.body_lines.append(f"    spu_trace_pc(ctx, 0x{insn.addr:X});")
                 func.body_lines.append(f"    {c}")
                 if self.trace and insn.mnemonic not in _NO_RT_WRITE:
-                    rt_idx = insn.raw & 0x7F
+                    rt_idx = _dest_reg(insn)
                     func.body_lines.append(f"    spu_trace_rt(ctx, {rt_idx});")
             last_insn = insn
 
@@ -1108,13 +1108,17 @@ def main() -> None:
                         "dispatch table at 0x1BD8, `br` into a fallthrough chain, "
                         "dispatched blocks later -- classified as a return, which "
                         "silently skipped every job-command handler).")
+    p.add_argument("--segment", type=int,
+                   help="Explicit PT_LOAD program-header index for an ELF overlay; requires --auto-functions")
     args = p.parse_args()
+    if args.segment is not None and not args.auto_functions:
+        p.error("--segment requires --auto-functions")
 
     if args.auto_functions:
         from find_spu_functions import detect_functions, parse_elf, pick_text
         with open(args.auto_functions, "rb") as f:
             elf_buf = f.read()
-        funcs, (text_off, base, size) = detect_functions(elf_buf)
+        funcs, (text_off, base, size) = detect_functions(elf_buf, segment_index=args.segment)
         data = elf_buf[text_off:text_off + size]
         if args.base != 0:
             base = args.base  # caller override

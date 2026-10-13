@@ -1,12 +1,17 @@
 #include "rsx_vertex_compact.h"
 #include "rsx_commands.h"
 #include "rsx_vertex_formats.h"
+#include "rsx_texture_hash.h"
 
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__SSE4_1__) || defined(_M_X64)
+#include <smmintrin.h>
+#define RSX_COMPACT_SIMD 1
+#endif
 
-static float rsx_compact_be_f32(const u8* p)
+static inline float rsx_compact_be_f32(const u8* p)
 {
     const u32 w = ((u32)p[0] << 24) | ((u32)p[1] << 16) |
                   ((u32)p[2] << 8) | (u32)p[3];
@@ -15,7 +20,7 @@ static float rsx_compact_be_f32(const u8* p)
     return f;
 }
 
-static float rsx_compact_be_f16(const u8* p)
+static inline float rsx_compact_be_f16(const u8* p)
 {
     const u16 h = (u16)((p[0] << 8) | p[1]);
     const u32 sign = (u32)(h >> 15) << 31;
@@ -180,6 +185,12 @@ void rsx_vertex_fetch_plan_prepare(
 {
     if (!plan)
         return;
+    u32 vertex_first=UINT_MAX, vertex_last=0;
+    for (u32 i=0; refs && i<count; ++i) {
+        const u32 element=(refs[i].vertex_id+refs[i].base_index)&0xFFFFFu;
+        if (element<vertex_first) vertex_first=element;
+        if (element>vertex_last) vertex_last=element;
+    }
     for (u32 slot = 0; slot < plan->layout.count; slot++) {
         const u32 attr = plan->layout.attrs[slot];
         rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
@@ -213,8 +224,10 @@ void rsx_vertex_fetch_plan_prepare(
         if (!plan->guest_ptr)
             continue;
 
-        u32 first = UINT_MAX;
-        u32 last = 0;
+        u32 first = vertex_first;
+        u32 last = vertex_last;
+        if (fetch->desc.frequency>1) {
+        first=UINT_MAX; last=0;
         for (u32 i = 0; i < count; i++) {
             const u32 element = rsx_vertex_element_index(
                 refs[i].vertex_id, refs[i].base_index,
@@ -222,6 +235,7 @@ void rsx_vertex_fetch_plan_prepare(
                 (plan->divider_mask >> attr) & 1u);
             if (element < first) first = element;
             if (element > last) last = element;
+        }
         }
 
         const u64 prefix =
@@ -292,6 +306,320 @@ int rsx_vertex_fetch_one(
     return 1;
 }
 
+/* Native samples concentrated in SINT16 byte swaps/conversions and the F32
+ * helper. Decode their lanes together, with exact-width reads at buffer ends.
+ * Other formats continue through the scalar reference decoder. */
+static inline int rsx_vertex_decode_batch_element(
+    u32 type, u32 size, const u8* source, float value[4])
+{
+#ifdef RSX_COMPACT_SIMD
+    if (type==RSX_VTX_TYPE_SINT16 && size && size<=4) {
+        u64 packed=0;
+        switch (size) {
+        case 4: memcpy(&packed,source,8); break;
+        case 3: {
+            u32 lo; u16 hi;
+            memcpy(&lo,source,4); memcpy(&hi,source+4,2);
+            packed=(u64)lo|((u64)hi<<32); break;
+        }
+        case 2: { u32 lo; memcpy(&lo,source,4); packed=lo; break; }
+        case 1: { u16 lo; memcpy(&lo,source,2); packed=lo; break; }
+        }
+        const __m128i words=_mm_shuffle_epi8(_mm_cvtsi64_si128((long long)packed),
+            _mm_setr_epi8(1,0,3,2,5,4,7,6,-1,-1,-1,-1,-1,-1,-1,-1));
+        _mm_storeu_ps(value,_mm_cvtepi32_ps(_mm_cvtepi16_epi32(words)));
+        if (size<4) value[3]=1.0f;
+        return 1;
+    }
+#endif
+    return rsx_vertex_decode_element(type,size,source,value);
+}
+
+static int rsx_vertex_fetch_many_reference(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out)
+{
+    if (!plan || (!refs && count) || (!out && plan->layout.stride && count)) return 0;
+    /* Rare/fallback plans retain the exact scalar resolver semantics. Inline
+     * streams can have out-of-range references, so leave them on that path. */
+    int fast = !plan->inline_data;
+    for (u32 slot=0; slot<plan->layout.count; ++slot) {
+        const rsx_vertex_fetch_attr* f=&plan->attr[plan->layout.attrs[slot]];
+        if (f->desc.type && f->desc.size && (!f->stable_base || f->desc.frequency>1)) fast=0;
+    }
+    if (!fast) {
+        for (u32 i=0; i<count; ++i)
+            if (!rsx_vertex_fetch_one(plan,&refs[i],out+(u64)i*plan->layout.stride)) return 0;
+        return 1;
+    }
+    for (u32 slot=0; slot<plan->layout.count; ++slot) {
+        const u32 attr=plan->layout.attrs[slot];
+        const rsx_vertex_fetch_attr* f=&plan->attr[attr];
+        const u32 type=f->desc.type, size=f->desc.size;
+        for (u32 i=0; i<count; ++i) {
+            float* value=(float*)(out+(u64)i*plan->layout.stride+slot*16);
+            if (!type || !size) { memcpy(value,f->default_value,16); continue; }
+            const u32 element=(refs[i].vertex_id+refs[i].base_index)&0xFFFFFu;
+            if (element<f->stable_first || element>f->stable_last) {
+                if (!rsx_vertex_fetch_one(plan,&refs[i],out+(u64)i*plan->layout.stride)) return 0;
+                continue;
+            }
+            const u8* source=f->stable_base+(u64)(element-f->stable_first)*f->stride;
+            if (type==RSX_VTX_TYPE_FLOAT) {
+                value[0]=value[1]=value[2]=0; value[3]=1;
+                for (u32 k=0; k<size && k<4; ++k) value[k]=rsx_compact_be_f32(source+k*4);
+            } else if (!rsx_vertex_decode_batch_element(type,size,source,value)) {
+                if (attr==0) return 0;
+                memcpy(value,f->default_value,16);
+            }
+        }
+    }
+    return 1;
+}
+
+#ifdef RSX_COMPACT_SIMD
+/* Constant sizes at the call sites let the compiler keep only the exact-width
+ * loads required by each kernel. In particular, a three-component position
+ * must not read a fourth component beyond a protected guest buffer tail. */
+static inline __m128 rsx_compact_float_lanes(const u8* source, u32 size)
+{
+    __m128i packed;
+    if (size == 4) packed = _mm_loadu_si128((const __m128i*)source);
+    else if (size == 3) {
+        u64 low; u32 high;
+        memcpy(&low, source, 8); memcpy(&high, source + 8, 4);
+        packed = _mm_insert_epi32(_mm_cvtsi64_si128((long long)low), (int)high, 2);
+    } else if (size == 2) {
+        u64 low; memcpy(&low, source, 8);
+        packed = _mm_cvtsi64_si128((long long)low);
+    } else {
+        u32 low; memcpy(&low, source, 4);
+        packed = _mm_cvtsi32_si128((int)low);
+    }
+    packed = _mm_shuffle_epi8(packed,
+        _mm_setr_epi8(3,2,1,0,7,6,5,4,11,10,9,8,15,14,13,12));
+    if (size < 4) packed = _mm_insert_epi32(packed, 0x3F800000, 3);
+    return _mm_castsi128_ps(packed);
+}
+
+static inline __m128 rsx_compact_byte_lanes(const u8* source, u32 size, int normalized)
+{
+    u32 packed = 0;
+    if (size == 4) memcpy(&packed, source, 4);
+    else if (size == 3) {
+        u16 low; memcpy(&low, source, 2);
+        packed = (u32)low | ((u32)source[2] << 16);
+    } else if (size == 2) {
+        u16 low; memcpy(&low, source, 2); packed = low;
+    } else packed = source[0];
+    __m128 value = _mm_cvtepi32_ps(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)packed)));
+    /* Division preserves the reference decoder's rounding, including values
+     * for which multiplying by a rounded reciprocal gives a different bit. */
+    if (normalized) value = _mm_div_ps(value, _mm_set1_ps(255.0f));
+    if (size < 4) value = _mm_blend_ps(value, _mm_set1_ps(1.0f), 8);
+    return value;
+}
+#endif
+
+int rsx_vertex_fetch_many_ex(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out, int specialized)
+{
+#ifndef RSX_COMPACT_SIMD
+    (void)specialized;
+#else
+    if (specialized && plan && refs && out && count && !plan->inline_data) {
+        /* Validate the whole batch once before writing anything. Callers can
+         * reuse a prepared plan with different references; those still retain
+         * the original resolver/failure behavior rather than overreading. */
+        u32 first = UINT_MAX, last = 0;
+        for (u32 i = 0; i < count; ++i) {
+            const u32 element = (refs[i].vertex_id + refs[i].base_index) & 0xFFFFFu;
+            if (element < first) first = element;
+            if (element > last) last = element;
+        }
+        for (u32 slot = 0; slot < plan->layout.count; ++slot) {
+            const rsx_vertex_fetch_attr* f = &plan->attr[plan->layout.attrs[slot]];
+            if (f->desc.type && f->desc.size &&
+                (!f->stable_base || f->desc.frequency > 1 ||
+                 first < f->stable_first || last > f->stable_last))
+                return rsx_vertex_fetch_many_reference(plan, refs, count, out);
+        }
+        for (u32 slot = 0; slot < plan->layout.count; ++slot) {
+            const u32 attr = plan->layout.attrs[slot];
+            const rsx_vertex_fetch_attr* f = &plan->attr[attr];
+            const u32 type = f->desc.type, size = f->desc.size;
+            u8* destination = out + slot * 16;
+            const u32 output_stride = plan->layout.stride;
+            if (!type || !size) {
+                for (u32 i = 0; i < count; ++i, destination += output_stride)
+                    memcpy(destination, f->default_value, 16);
+                continue;
+            }
+            /* Dispatch once per attribute, rather than testing format and
+             * component count inside every vertex. Each expression below has
+             * constant type/size and is inlined into its own small loop. */
+#define RSX_DECODE_BATCH(expression) do { \
+                for (u32 i = 0; i < count; ++i, destination += output_stride) { \
+                    const u32 element = (refs[i].vertex_id + refs[i].base_index) & 0xFFFFFu; \
+                    const u8* source = f->stable_base + (u64)(element - f->stable_first) * f->stride; \
+                    _mm_storeu_ps((float*)destination, (expression)); \
+                } \
+            } while (0)
+#define RSX_FLOAT_CASE(n) case (RSX_VTX_TYPE_FLOAT * 8 + n): \
+                RSX_DECODE_BATCH(rsx_compact_float_lanes(source, n)); break
+#define RSX_BYTE_CASE(t,n) case (t * 8 + n): \
+                RSX_DECODE_BATCH(rsx_compact_byte_lanes(source, n, t == RSX_VTX_TYPE_UNORM8)); break
+            switch (size <= 4 && type <= RSX_VTX_TYPE_UINT8 ? type * 8 + size : 0) {
+            RSX_FLOAT_CASE(1); RSX_FLOAT_CASE(2); RSX_FLOAT_CASE(3); RSX_FLOAT_CASE(4);
+            RSX_BYTE_CASE(RSX_VTX_TYPE_UNORM8,1); RSX_BYTE_CASE(RSX_VTX_TYPE_UNORM8,2);
+            RSX_BYTE_CASE(RSX_VTX_TYPE_UNORM8,3); RSX_BYTE_CASE(RSX_VTX_TYPE_UNORM8,4);
+            RSX_BYTE_CASE(RSX_VTX_TYPE_UINT8,1); RSX_BYTE_CASE(RSX_VTX_TYPE_UINT8,2);
+            RSX_BYTE_CASE(RSX_VTX_TYPE_UINT8,3); RSX_BYTE_CASE(RSX_VTX_TYPE_UINT8,4);
+            default:
+                for (u32 i = 0; i < count; ++i, destination += output_stride) {
+                    const u32 element = (refs[i].vertex_id + refs[i].base_index) & 0xFFFFFu;
+                    const u8* source = f->stable_base + (u64)(element - f->stable_first) * f->stride;
+                    if (!rsx_vertex_decode_batch_element(type,size,source,(float*)destination)) {
+                        if (attr == 0) return 0;
+                        memcpy(destination, f->default_value, 16);
+                    }
+                }
+                break;
+            }
+#undef RSX_BYTE_CASE
+#undef RSX_FLOAT_CASE
+#undef RSX_DECODE_BATCH
+        }
+        return 1;
+    }
+#endif
+    return rsx_vertex_fetch_many_reference(plan, refs, count, out);
+}
+
+int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out)
+{
+    return rsx_vertex_fetch_many_ex(plan, refs, count, out, 1);
+}
+
+enum { VERTEX_CACHE_SLOTS=2048 };
+#define VERTEX_CACHE_BUDGET (128ull*1024*1024)
+typedef struct rsx_vertex_payload_entry {
+    rsx_vertex_fetch_plan key;
+    u8* storage;
+    u32 count, source_bytes[RSX_DSP_NUM_VERTEX_ATTR];
+    u64 storage_size, hash;
+} rsx_vertex_payload_entry;
+
+void rsx_vertex_payload_cache_clear(rsx_vertex_payload_cache* cache)
+{
+    if (!cache) return;
+    rsx_vertex_payload_entry* entries=(rsx_vertex_payload_entry*)cache->entries;
+    if (entries) {
+        for (u32 i=0; i<VERTEX_CACHE_SLOTS; ++i) free(entries[i].storage);
+        free(entries);
+    }
+    memset(cache,0,sizeof(*cache));
+}
+
+int rsx_vertex_fetch_cached(rsx_vertex_payload_cache* cache,
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs,
+    u32 count, u8* out)
+{
+    if (!cache) return rsx_vertex_fetch_many(plan,refs,count,out);
+    if (!plan || (!refs && count) || (!out && plan->layout.stride && count)) return 0;
+    u32 spans[RSX_DSP_NUM_VERTEX_ATTR]={0};
+    const u64 ref_bytes=(u64)count*sizeof(*refs);
+    const u64 payload_bytes=(u64)count*plan->layout.stride;
+    u64 source_bytes=0;
+    rsx_vertex_fetch_plan key={0};
+    key.layout=plan->layout;
+    if (plan->inline_data || count<16 || !payload_bytes || payload_bytes>1024*1024) goto bypass;
+    u32 first=UINT32_MAX, last=0;
+    for (u32 i=0; i<count; ++i) {
+        const u32 element=(refs[i].vertex_id+refs[i].base_index)&0xFFFFFu;
+        if (element<first) first=element;
+        if (element>last) last=element;
+    }
+    for (u32 slot=0; slot<plan->layout.count; ++slot) {
+        const u32 attr=plan->layout.attrs[slot];
+        const rsx_vertex_fetch_attr* f=&plan->attr[attr];
+        if (!f->desc.type || !f->desc.size) {
+            memcpy(key.attr[attr].default_value,f->default_value,sizeof(f->default_value));
+            continue;
+        }
+        if (f->desc.type>7) goto bypass;
+        if (!f->stable_base || f->desc.frequency>1 || first<f->stable_first || last>f->stable_last)
+            goto bypass;
+        const u64 size=(u64)(f->stable_last-f->stable_first)*f->stride+f->elem_size;
+        if (!size || size>1024*1024) goto bypass;
+        spans[attr]=(u32)size; source_bytes+=size;
+        /* Unused registers, resolver metadata and enabled-attribute defaults do
+         * not affect this mapped conversion. Avoid creating variants for them. */
+        key.attr[attr].desc.type=f->desc.type; key.attr[attr].desc.size=f->desc.size;
+        key.attr[attr].stride=f->stride; key.attr[attr].elem_size=f->elem_size;
+        key.attr[attr].stable_base=f->stable_base;
+        key.attr[attr].stable_first=f->stable_first; key.attr[attr].stable_last=f->stable_last;
+    }
+    if (source_bytes>4*1024*1024) goto bypass;
+    if (!cache->entries) {
+        cache->entries=calloc(VERTEX_CACHE_SLOTS,sizeof(rsx_vertex_payload_entry));
+        if (!cache->entries) goto bypass;
+    }
+    const u64 hash=rsx_texture_hash(&key,sizeof(key)) ^ rsx_texture_hash(refs,(size_t)ref_bytes);
+    rsx_vertex_payload_entry* entries=(rsx_vertex_payload_entry*)cache->entries;
+    const u32 base=(u32)hash&(VERTEX_CACHE_SLOTS-1);
+    rsx_vertex_payload_entry* entry=NULL;
+    /* Four probes preserve hot entries through ordinary hash collisions. */
+    for (u32 probe=0; probe<4; ++probe) {
+        rsx_vertex_payload_entry* candidate=&entries[(base+probe)&(VERTEX_CACHE_SLOTS-1)];
+        if (candidate->storage && candidate->hash==hash && candidate->count==count &&
+            !memcmp(&candidate->key,&key,sizeof(key)) &&
+            !memcmp(candidate->storage,refs,(size_t)ref_bytes)) { entry=candidate; break; }
+        if (!entry || !candidate->storage) entry=candidate;
+    }
+    const u64 storage_size=ref_bytes+source_bytes+payload_bytes;
+    if (entry->storage && entry->hash==hash && entry->count==count &&
+        !memcmp(&entry->key,&key,sizeof(key)) &&
+        !memcmp(entry->storage,refs,(size_t)ref_bytes)) {
+        const u8* snapshot=entry->storage+ref_bytes;
+        int same=1;
+        for (u32 attr=0; attr<RSX_DSP_NUM_VERTEX_ATTR; ++attr) {
+            if (spans[attr]) {
+                cache->compared_bytes+=spans[attr];
+                if (memcmp(snapshot,plan->attr[attr].stable_base,spans[attr])) { same=0; break; }
+                snapshot+=spans[attr];
+            }
+        }
+        if (same) {
+            memcpy(out,entry->storage+ref_bytes+source_bytes,(size_t)payload_bytes);
+            ++cache->hits; return 1;
+        }
+    }
+    ++cache->misses;
+    if (cache->bytes-entry->storage_size+storage_size>VERTEX_CACHE_BUDGET) goto bypass;
+    u8* storage=(u8*)malloc((size_t)storage_size);
+    if (!storage) goto bypass;
+    memcpy(storage,refs,(size_t)ref_bytes);
+    u8* snapshot=storage+ref_bytes;
+    rsx_vertex_fetch_plan frozen=*plan;
+    for (u32 attr=0; attr<RSX_DSP_NUM_VERTEX_ATTR; ++attr) if (spans[attr]) {
+        memcpy(snapshot,plan->attr[attr].stable_base,spans[attr]);
+        frozen.attr[attr].stable_base=snapshot;
+        snapshot+=spans[attr];
+    }
+    /* Convert the same snapshot later used to validate hits. */
+    if (!rsx_vertex_fetch_many(&frozen,refs,count,snapshot)) { free(storage); return 0; }
+    memcpy(out,snapshot,(size_t)payload_bytes);
+    cache->bytes=cache->bytes-entry->storage_size+storage_size;
+    free(entry->storage); entry->storage=storage; entry->storage_size=storage_size;
+    entry->key=key; entry->count=count; entry->hash=hash;
+    memcpy(entry->source_bytes,spans,sizeof(spans));
+    return 1;
+bypass:
+    ++cache->bypasses;
+    return rsx_vertex_fetch_many(plan,refs,count,out);
+}
+
 static u64 rsx_vertex_remap_hash(u64 value)
 {
     value ^= value >> 33;
@@ -302,9 +630,9 @@ static u64 rsx_vertex_remap_hash(u64 value)
     return value;
 }
 
-int rsx_vertex_remap_build(
+int rsx_vertex_remap_build_ex(
     rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
-    u32* unique_count)
+    u32* unique_count, int direct_dense)
 {
     if (!remap || (!refs && count) || !unique_count)
         return 0;
@@ -323,6 +651,21 @@ int rsx_vertex_remap_build(
 
     if (count > UINT_MAX / 2u)
         return 0;
+    // Dense indexed meshes need no hash/probe chain. Preserve the complete
+    // (base_index, vertex_id) identity by requiring a common base first.
+    u32 min_id=refs[0].vertex_id, max_id=min_id;
+    int common_base=1, ascending=1;
+    for (u32 i=1; i<count; ++i) {
+        if (refs[i].base_index!=refs[0].base_index) common_base=0;
+        if (refs[i].vertex_id<=refs[i-1].vertex_id) ascending=0;
+        if (refs[i].vertex_id<min_id) min_id=refs[i].vertex_id;
+        if (refs[i].vertex_id>max_id) max_id=refs[i].vertex_id;
+    }
+    if (common_base && ascending) {
+        for (u32 i=0; i<count; ++i) remap->occurrence_to_unique[i]=i;
+        return 1;
+    }
+    const int dense=common_base && (u64)max_id-min_id+1 <= (u64)count*2;
     u32 slot_capacity = 16u;
     const u32 required_slots = count * 2u;
     while (slot_capacity < required_slots) {
@@ -350,11 +693,27 @@ int rsx_vertex_remap_build(
     }
 
     u32 unique = 0;
+    if (dense && direct_dense) {
+        /* A common base and bounded range make vertex_id-min_id an exact
+         * identity, so neither a 64-bit key nor a probe chain is needed. */
+        for (u32 occurrence = 0; occurrence < count; ++occurrence) {
+            const rsx_vertex_ref ref = refs[occurrence];
+            rsx_vertex_remap_slot* slot = &remap->slots[ref.vertex_id-min_id];
+            if (slot->generation != remap->generation) {
+                slot->generation = remap->generation;
+                slot->value = unique;
+                refs[unique++] = ref;
+            }
+            remap->occurrence_to_unique[occurrence] = slot->value;
+        }
+        *unique_count = unique;
+        return 1;
+    }
     const u32 mask = remap->slot_capacity - 1u;
     for (u32 occurrence = 0; occurrence < count; occurrence++) {
         const rsx_vertex_ref ref = refs[occurrence];
         const u64 key = ((u64)ref.base_index << 32) | ref.vertex_id;
-        u32 slot_index = (u32)rsx_vertex_remap_hash(key) & mask;
+        u32 slot_index = dense ? ref.vertex_id-min_id : (u32)rsx_vertex_remap_hash(key) & mask;
         for (;;) {
             rsx_vertex_remap_slot* slot = &remap->slots[slot_index];
             if (slot->generation != remap->generation) {
@@ -375,6 +734,13 @@ int rsx_vertex_remap_build(
     }
     *unique_count = unique;
     return 1;
+}
+
+int rsx_vertex_remap_build(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* unique_count)
+{
+    return rsx_vertex_remap_build_ex(remap, refs, count, unique_count, 1);
 }
 
 u32 rsx_vertex_remap_index(

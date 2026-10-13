@@ -16,16 +16,25 @@ extern "C" {
 #endif
 
 /* Error codes */
-#define CELL_SAIL_ERROR_NOT_INITIALIZED       0x80610701
-#define CELL_SAIL_ERROR_ALREADY_INITIALIZED   0x80610702
-#define CELL_SAIL_ERROR_INVALID_ARGUMENT      0x80610703
-#define CELL_SAIL_ERROR_INVALID_STATE         0x80610704
-#define CELL_SAIL_ERROR_NOT_SUPPORTED         0x80610705
-#define CELL_SAIL_ERROR_NOT_FOUND             0x80610706
-#define CELL_SAIL_ERROR_OUT_OF_MEMORY         0x80610707
+#define CELL_SAIL_ERROR_INVALID_ARGUMENT      0x80610701
+#define CELL_SAIL_ERROR_INVALID_STATE         0x80610702
+#define CELL_SAIL_ERROR_NOT_SUPPORTED         0x80610703 /* unsupported stream */
+#define CELL_SAIL_ERROR_EMPTY                 0x80610705
+#define CELL_SAIL_ERROR_NOT_FOUND             0x80610708 /* not available */
+#define CELL_SAIL_ERROR_OUT_OF_MEMORY         0x8061070A
+#define CELL_SAIL_ERROR_NOT_INITIALIZED       CELL_SAIL_ERROR_INVALID_STATE
+#define CELL_SAIL_ERROR_ALREADY_INITIALIZED   CELL_SAIL_ERROR_INVALID_STATE
 
 /* Constants */
 #define CELL_SAIL_PLAYER_MAX    4
+
+/* Host lifecycle observer, registered before guest threads start. URI is a
+ * temporary host string; copy it inside the callback if retaining it. This
+ * reports lifecycle only, not successful decoding or rendered media frames. */
+typedef void (*CellSailHostPlaybackCallback)(u32 player, const char* uri,
+                                             int started, void* user);
+void cellSail_set_host_playback_callback(CellSailHostPlaybackCallback callback,
+                                          void* user);
 
 /* Player state */
 #define CELL_SAIL_PLAYER_STATE_CLOSED     0
@@ -141,7 +150,19 @@ typedef struct CellSailMemAllocatorFuncs {
  * struct pointer needing host-pointer translation, not a raw callback value. */
 s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
                               u32 pUserParam, u32 pAttribute, u32 pResource);
+/* Deprecated scalar-attribute ABI; pSpurs is the ninth PPU argument. */
+s32 cellSailPlayerInitialize(u32 pSelf, s32 legacyMode, u32 pAllocator,
+                            u32 pCallback, u32 pUserParam, u32 maxAudio,
+                            u32 maxVideo, u32 maxUser, u32 pSpurs);
+s32 cellSailPlayerFinalize(u32 pSelf);
+s32 cellSailPlayerSetParameter(u32 pSelf, s32 type, u64 param0, u64 param1);
+s32 cellSailPlayerGetParameter(u32 pSelf, s32 type, u32 pParam0, u32 pParam1);
 s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg);
+s32 cellSailSoundAdapterFinalize(u32 pSelf);
+s32 cellSailGraphicsAdapterFinalize(u32 pSelf);
+s32 cellSailGraphicsAdapterGetFrame2(u32 pSelf, u32 pInfo, u32 pPrevInfo,
+                                   u32 pFlipTime, u64 flags);
+s32 cellSailSoundAdapterGetFrame(u32 pSelf, u32 samples, u32 pInfo);
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
                                      CellSailMemAllocatorFuncs* pFuncs);
 

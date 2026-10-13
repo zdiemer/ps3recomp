@@ -17,6 +17,7 @@
  * Compiled as C++ (matches the lifted output). Game-agnostic.
  */
 #include "ppu_recomp.h"   /* ppu_context */
+#include "ppu_wait_profile.h"
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include <stdlib.h>       /* getenv */
@@ -72,6 +73,19 @@ extern "C" int ps3_hle_has(uint32_t nid)
 /* Generic PPC integer/pointer ABI adapter. */
 typedef uint64_t (*hle_generic)(uint64_t, uint64_t, uint64_t, uint64_t,
                                 uint64_t, uint64_t, uint64_t, uint64_t);
+
+/* The deprecated SAIL initializer has nine integer arguments. The generic
+ * bridge covers only r3..r10; argument nine lives at the ELFv1 stack slot 0x70. */
+extern "C" int32_t cellSailPlayerInitialize(uint32_t, int32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+extern "C" void ps3_sail_player_initialize(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)cellSailPlayerInitialize(
+        (uint32_t)ctx->gpr[3], (int32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5],
+        (uint32_t)ctx->gpr[6], (uint32_t)ctx->gpr[7], (uint32_t)ctx->gpr[8],
+        (uint32_t)ctx->gpr[9], (uint32_t)ctx->gpr[10],
+        (uint32_t)vm_read64(ctx->gpr[1] + 0x70));
+}
 
 /* Host VM store (defined in ppu_loader.cpp) — used for the TOC save below. */
 void vm_write64(uint64_t addr, uint64_t val);
@@ -181,6 +195,7 @@ extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    PpuWaitProfile wait_profile(ctx, "hle", nid);
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
      * event queue, which misses a thread that stops looping while it is BUSY --
@@ -240,7 +255,14 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
+#ifdef __EMSCRIPTEN__
+    /* Wasm return addresses require a JS stack walk and are code offsets,
+     * not the function-table indices used by the native inverse map. Keep
+     * the guest LR as an approximate breadcrumb without walking each call. */
+    ppu_prof_stamp(ctx, (uint32_t)ctx->lr);
+#else
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
+#endif
     g_last_hle_nid = nid;
     /* Stamp the NAME here too, not only where a handler is found below.
      *
@@ -658,8 +680,6 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
-        static int logged = 0;
-        if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
          * protocol so it can be implemented. */
@@ -706,7 +726,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               ctx->gpr[3] = 0x80010002u; /* generic failure (net unavailable) */
               return;
           } } }
-        ctx->gpr[3] = 0;   /* CELL_OK-ish so the game keeps going */
+        ps3_hle_unresolved(nid, ctx);
         return;
     }
     g_last_hle_name = e->name;

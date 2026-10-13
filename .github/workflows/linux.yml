@@ -105,6 +105,14 @@ jobs:
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
 
+      - name: Check SPU extended single precision against exact arithmetic
+        run: |
+          python runtime/spu/tests/test_spu_float_oracle.py /tmp/spu-float-oracle.bin
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -O2 -I include \
+            -o /tmp/test_spu_float runtime/spu/tests/test_spu_float.c -lm
+          /tmp/test_spu_float /tmp/spu-float-oracle.bin
+
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test

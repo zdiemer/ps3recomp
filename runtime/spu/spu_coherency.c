@@ -15,9 +15,67 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+/* Native HLE queues may sleep on their raw eight-byte BE header. All registry
+ * access, snapshots and notifications occur under the existing lock-line lock.
+ * Watches are reference counted and removed before their HLE calls return, so
+ * freed queues leave no host pointers. Collisions retain timeout polling. */
+#ifdef _WIN32
+#include <windows.h>
+#pragma comment(lib, "synchronization.lib")
+static struct {
+    uint32_t line;
+    void* host;
+    uint64_t value;
+    unsigned references;
+} s_queue_watches[1024];
+static unsigned s_queue_watch_count;
+static unsigned queue_watch_index(uint32_t ea)
+{ return ((ea >> 7) ^ (ea >> 17)) & 1023u; }
+int spu_coh_watch_queue(uint32_t ea, void* host_address)
+{
+    unsigned slot = queue_watch_index(ea);
+    if (s_queue_watches[slot].references) {
+        if (s_queue_watches[slot].line != (ea & ~127u) ||
+            s_queue_watches[slot].host != host_address) return -1;
+        ++s_queue_watches[slot].references;
+        return (int)slot;
+    }
+    s_queue_watches[slot].line = ea & ~127u;
+    s_queue_watches[slot].host = host_address;
+    memcpy(&s_queue_watches[slot].value, host_address, 8);
+    s_queue_watches[slot].references = 1;
+    ++s_queue_watch_count;
+    return (int)slot;
+}
+void spu_coh_unwatch_queue(int cookie)
+{
+    if (cookie < 0 || cookie >= 1024 || !s_queue_watches[cookie].references) return;
+    if (!--s_queue_watches[cookie].references) {
+        s_queue_watches[cookie].host = NULL;
+        --s_queue_watch_count;
+    }
+}
+static void queue_notify_publication(uint32_t ea)
+{
+    if (!s_queue_watch_count) return;
+    unsigned slot = queue_watch_index(ea);
+    if (s_queue_watches[slot].host && s_queue_watches[slot].line == (ea & ~127u)) {
+        uint64_t value;
+        memcpy(&value, s_queue_watches[slot].host, 8);
+        if (value != s_queue_watches[slot].value) {
+            s_queue_watches[slot].value = value;
+            WakeByAddressAll(s_queue_watches[slot].host);
+        }
+    }
+}
+#else
+#define queue_notify_publication(ea) ((void)0)
 #endif
 
 /* ===========================================================================
@@ -81,10 +139,10 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
  * one missed event on the very first reservation of the run. */
 static int s_coh_armed;
 
-/* The SPU contexts that have reserved a line. Sized to match the MFC engine
- * registry in spu_channels.c, which is the ceiling on live SPU contexts. */
-#define SPU_COH_MAX_CTX 8
-static spu_context* s_coh_ctxs[SPU_COH_MAX_CTX];
+/* Compact live set, always accessed under the lock-line lock. Async jobs may
+ * outnumber physical SPUs, so an eight-entry ceiling can lose real holders. */
+static spu_context** s_coh_ctxs;
+static size_t s_coh_count, s_coh_capacity;
 
 unsigned long g_spu_lr_raise = 0;
 
@@ -95,18 +153,20 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     s_coh_armed = 1;
 
     if (!ctx) return;
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+    /* Search the whole live set before inserting. Filling an early hole
+     * before finding an existing later entry registered the same object twice;
+     * unregister then left a dangling pointer after its first removal. */
+    for (size_t i = 0; i < s_coh_count; i++) {
         if (s_coh_ctxs[i] == ctx) return;
-        if (s_coh_ctxs[i] == NULL) { s_coh_ctxs[i] = ctx; return; }
     }
-    /* More live SPU contexts than the registry holds. The ones already in it
-     * still get their events; this one would silently never wake, so say so. */
-    { static int warned = 0;
-      if (!warned) { warned = 1;
-          fprintf(stderr, "[spu-coh] more than %d reserving SPU contexts -- "
-                          "spu=0x%X will not receive lock-line events\n",
-                  SPU_COH_MAX_CTX, ctx->spu_id);
-          fflush(stderr); } }
+    if (s_coh_count == s_coh_capacity) {
+        size_t capacity = s_coh_capacity ? s_coh_capacity * 2 : 8;
+        if (capacity < s_coh_capacity || capacity > SIZE_MAX / sizeof(*s_coh_ctxs)) abort();
+        spu_context** holders = (spu_context**)realloc(s_coh_ctxs, capacity * sizeof(*holders));
+        if (!holders) { fputs("[spu-coh] cannot retain reservation holders\n",stderr); abort(); }
+        s_coh_ctxs = holders; s_coh_capacity = capacity;
+    }
+    s_coh_ctxs[s_coh_count++] = ctx;
 }
 
 /* Drop a context from the reserving set.
@@ -128,8 +188,9 @@ void spu_coh_unregister(spu_context* ctx)
      * (or its whole async thread) was gone. GH3 at -O2 crashed that way in
      * spu_coh_notify_write, reading a freed thread stack. */
     spu_lockline_lock();
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
-        if (s_coh_ctxs[i] == ctx) { s_coh_ctxs[i] = NULL; break; }
+    for (size_t i = 0; i < s_coh_count;)
+        if (s_coh_ctxs[i] == ctx) s_coh_ctxs[i] = s_coh_ctxs[--s_coh_count];
+        else ++i;
     spu_lockline_unlock();
 }
 
@@ -142,15 +203,15 @@ void spu_coh_unregister(spu_context* ctx)
 void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 {
     spu_lockline_lock();
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+    for (size_t i = 0; i < s_coh_count;) {
         uintptr_t c = (uintptr_t)s_coh_ctxs[i];
         if (c >= lo && c < hi) {
             static int _n = 0;
             if (_n++ < 16)
                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
                         (void*)c, s_coh_ctxs[i]->image_id);
-            s_coh_ctxs[i] = NULL;
-        }
+            s_coh_ctxs[i] = s_coh_ctxs[--s_coh_count];
+        } else ++i;
     }
     spu_lockline_unlock();
 }
@@ -174,8 +235,9 @@ int spu_coh_is_reserved(uint32_t addr)
  * before notifying; this gives the DMA path the same ability. */
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
+    queue_notify_publication(ea);
     uint32_t line = ea & ~127u;
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+    for (size_t i = 0; i < s_coh_count; i++) {
         spu_context* c = s_coh_ctxs[i];
         if (!c || (const void*)c == self) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
@@ -189,8 +251,9 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 
 void spu_coh_notify_write(uint32_t ea)
 {
+    queue_notify_publication(ea);
     uint32_t line = ea & ~127u;
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+    for (size_t i = 0; i < s_coh_count; i++) {
         spu_context* c = s_coh_ctxs[i];
         if (!c) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {

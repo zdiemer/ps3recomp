@@ -146,6 +146,11 @@ void spurs_taskset_init(uint32_t taskset_ea, uint32_t spurs_ea, uint64_t args,
 void spurs_taskset_add_task(uint32_t taskset_ea, uint32_t taskId, uint64_t elf_ea,
                             uint64_t context, const uint32_t arg[4],
                             const uint32_t ls_pattern[4]);
+/* Atomically reserve a free slot and publish its complete descriptor. Returns
+ * 128 when full. Shares the scheduler/SPU reservation lock with task exit. */
+uint32_t spurs_taskset_create_task(uint32_t taskset_ea, uint64_t elf_ea,
+                                  uint64_t context, const uint32_t arg[4],
+                                  const uint32_t ls_pattern[4]);
 void spurs_taskset_set_exit_handler(uint32_t taskset_ea, uint64_t handler_ea);
 
 /* ---- PM logic (spurs_pm.c, phase B3) ------------------------------------- */

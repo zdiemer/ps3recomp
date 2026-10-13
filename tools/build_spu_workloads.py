@@ -84,6 +84,13 @@ def sanitize(name):
         s = "img_" + s
     return s
 
+def overlay_code_span(base, span, code_end=None):
+    if code_end is None:
+        return span
+    if code_end & 3 or not base < code_end <= base + span:
+        raise ValueError("overlay code end must be aligned and inside its segment")
+    return code_end - base
+
 # ---- include rewrite: make the lifted tree location-independent --------------
 
 _INC_RE = re.compile(r'#include\s+"(?:\.\./)+runtime/spu/([A-Za-z0-9_]+\.h)"')
@@ -123,6 +130,11 @@ def main():
     ap.add_argument("--relift", action="store_true", help="re-lift even if a prior lift exists")
     ap.add_argument("--skip-lift", action="store_true",
                     help="do not run the lifter; assume --lifted already populated (still fixes includes + emits registry)")
+    ap.add_argument("--lift-overlays", action="store_true",
+                    help="Also lift cellOvis PT_LOAD overlays (physical address >= 0x40000)")
+    ap.add_argument("--overlay-code-end", action="append", default=[],
+                    metavar="IMAGE:INDEX=ADDR",
+                    help="End of translated code before an overlay's writable data tail; repeatable")
     args = ap.parse_args()
 
     elfs = sorted(glob.glob(os.path.join(args.images, "*.elf")))
@@ -136,8 +148,18 @@ def main():
         k, v = spec.split("=", 1)
         extra_funcs[k.strip()] = v.strip()
 
+    code_ends = {}
+    for spec in args.overlay_code_end:
+        try:
+            key, value = spec.split("=", 1)
+            image, index = key.rsplit(":", 1)
+            code_ends[(image, int(index, 0))] = int(value, 0)
+        except ValueError:
+            ap.error(f"--overlay-code-end wants IMAGE:INDEX=ADDR, got {spec!r}")
+
     imgs = []  # (img, prefix, fingerprint, e_entry)
     text_fps = {}  # img -> executable-segment fingerprint
+    overlays = []  # (name, prefix, fingerprint, span), ids follow resident images
     for e in elfs:
         b = open(e, "rb").read()
         if not is_spu_elf(b):
@@ -167,6 +189,40 @@ def main():
         e_entry = be32(b, 0x18)
         imgs.append((img, prefix, fnv1a64(b[:sz]), e_entry))
         text_fps[img] = text_fp(b)
+        if args.lift_overlays:
+            phoff, stride, count = be32(b, 28), be16(b, 42), be16(b, 44)
+            for index in range(count):
+                ph = phoff + index * stride
+                if (be32(b, ph) != 1 or be32(b, ph + 12) < 0x40000
+                        or not (be32(b, ph + 24) & 1)):
+                    continue
+                off, base, span = be32(b, ph + 4), be32(b, ph + 8), be32(b, ph + 16)
+                if not span or base + span > 0x40000 or off + span > len(b):
+                    continue
+                code_end = code_ends.pop((img, index), None)
+                try:
+                    code_span = overlay_code_span(base, span, code_end)
+                except ValueError as error:
+                    ap.error(f"{img} overlay {index}: {error}")
+                name = f"{img}_overlay_{index}"
+                ovl_prefix = sanitize(name) + "_"
+                ovl_dir = os.path.join(args.lifted, name)
+                ovl_source = os.path.join(ovl_dir, "spu_recomp.c")
+                if not args.skip_lift and (args.relift or not os.path.exists(ovl_source)):
+                    cmd = [sys.executable, args.lifter, "--auto-functions", e,
+                           "--segment", str(index), "--symbol-prefix", ovl_prefix, "-o", ovl_dir]
+                    if code_end is not None:
+                        cmd += ["--code-end", hex(code_end)]
+                    if subprocess.run(cmd).returncode != 0:
+                        sys.exit(f"[build_spu_workloads] overlay lift FAILED: {name}")
+                if not os.path.exists(ovl_source):
+                    sys.exit(f"[build_spu_workloads] missing overlay lift: {name}")
+                debase_includes(os.path.join(ovl_dir, "spu_recomp.h"))
+                debase_includes(ovl_source)
+                overlays.append((name, ovl_prefix, fnv1a64(b[off:off + span]), span, code_span))
+
+    if code_ends:
+        ap.error(f"overlay code-end hints did not match lifted overlays: {sorted(code_ends)}")
 
     if not imgs:
         sys.exit("[build_spu_workloads] no SPU images lifted")
@@ -191,10 +247,14 @@ def main():
     L.append('#include "spu_workload.h"')
     L.append("")
     L.append("extern void spu_begin_image(int image_id);")
+    if overlays:
+        L.append("extern void spu_overlay_register_fingerprint_range(uint64_t fingerprint, uint32_t span, uint32_t code_span, int image_id);")
     L.append("")
     L.append("/* per-image extern decls (prefixed entry fn + recomp_register) */")
     for img, prefix, fp, ent in imgs:
         L.append(f"extern void {prefix}spu_func_{ent:08X}(spu_context*);")
+        L.append(f"extern void {prefix}spu_recomp_register(void);")
+    for name, prefix, fp, span, code_span in overlays:
         L.append(f"extern void {prefix}spu_recomp_register(void);")
     L.append("")
     L.append(f"void {args.register_fn}(void)")
@@ -204,6 +264,9 @@ def main():
         L.append(f"    spu_workload_register_img(0x{fp:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}\");")
         if text_fps.get(img):  # same entry, keyed by the text segment (raw SPU proxy-DMA load)
             L.append(f"    spu_workload_register_img(0x{text_fps[img]:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}.text\");")
+    for image_id, (name, prefix, fp, span, code_span) in enumerate(overlays, len(imgs) + 1):
+        L.append(f"    spu_begin_image({image_id}); {prefix}spu_recomp_register();")
+        L.append(f"    spu_overlay_register_fingerprint_range(0x{fp:016X}ULL, 0x{span:X}, 0x{code_span:X}, {image_id});")
     L.append("    spu_begin_image(0);")
     L.append("}")
     if args.constructor:

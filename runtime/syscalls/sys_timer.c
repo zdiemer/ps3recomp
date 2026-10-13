@@ -8,6 +8,7 @@
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdlib.h>
+#include "../platform/win32_usleep.h"
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -214,6 +215,34 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */
+    {
+        static _Thread_local const char* control = NULL;
+        static _Thread_local int initialized = 0;
+        static _Thread_local unsigned checks = 0;
+        static _Thread_local unsigned mode = 0;
+        static _Thread_local int reported = -1;
+        if (!initialized) {
+            control = getenv("PS3_USLEEP_MODE_FILE");
+            initialized = 1;
+        }
+        if (control && (++checks & 255u)==0) {
+            FILE* file = fopen(control,"r"); unsigned flags;
+            if (file) {
+                if (fscanf(file,"%u",&flags)==1 && mode!=(flags & 8u)) {
+                    mode=flags & 8u;
+                }
+                fclose(file);
+            }
+        }
+        if (control && reported != (int)mode) {
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            fprintf(stderr,"[usleep-mode] tid=%lu guest_tid=%llu timer=%u qpc=%lld\n",
+                GetCurrentThreadId(), (unsigned long long)ctx->thread_id,
+                mode!=0, now.QuadPart);
+            reported = (int)mode;
+        }
+        if (mode && usec>=50 && ps3_usleep_high_resolution(usec)) return CELL_OK;
+    }
     if (usec >= 1000) {
         HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
         if (timer) {

@@ -72,6 +72,17 @@ typedef struct rsx_vertex_fetch_plan {
     u32 inline_stride;                       /* decoded once, at _init      */
 } rsx_vertex_fetch_plan;
 
+/* Single-consumer cache. Every hit compares the complete mapped source spans
+ * and reference list, including data replaced at the same guest address. */
+typedef struct rsx_vertex_payload_cache {
+    void* entries;
+    u64 bytes, hits, misses, bypasses, compared_bytes;
+} rsx_vertex_payload_cache;
+int rsx_vertex_fetch_cached(rsx_vertex_payload_cache* cache,
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs,
+    u32 count, u8* out);
+void rsx_vertex_payload_cache_clear(rsx_vertex_payload_cache* cache);
+
 /* Deterministic ascending-register layout; each selected register remains a
  * float4 and retains its original ATTR semantic index. */
 void rsx_vertex_layout_plan_init(
@@ -115,6 +126,12 @@ void rsx_vertex_fetch_plan_prepare(
  * invalid enabled ATTR0 remains fatal. */
 int rsx_vertex_fetch_one(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
+/* Batch equivalent, with attribute state hoisted out of the vertex loop. */
+int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out);
+/* Diagnostic comparison of specialized SIMD loops and the previous batch path. */
+int rsx_vertex_fetch_many_ex(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out, int specialized);
 
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map
@@ -122,6 +139,10 @@ int rsx_vertex_fetch_one(
 int rsx_vertex_remap_build(
     rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
     u32* unique_count);
+/* Diagnostic comparison of direct dense lookup and the original probe loop. */
+int rsx_vertex_remap_build_ex(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* unique_count, int direct_dense);
 
 u32 rsx_vertex_remap_index(
     const rsx_vertex_remap* remap, u32 occurrence);

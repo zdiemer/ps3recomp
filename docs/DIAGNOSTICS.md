@@ -1010,7 +1010,10 @@ not changed while a title runs.
   `runtime/spu/spu_dma.h:1193`
 - **`SPU_DMA_LAX`** — the guest image. YDKJ issues exactly one such PUT -- 16 KB from a 4-byte-aligned EA of 0x00542004, straight over the title's own data -- and every later call through the clobbered OPDs reports "code 0x00000000 not registered". SPU_DMA_LAX=1 restores the old permissive behaviour. */
   `runtime/spu/spu_dma.h:215`
-- **`SPU_DMA_REPEAT_LIMIT`** — _(no description in source)_
+- **`SPU_DMA_REPEAT_LIMIT`** — Optional stop after this many consecutive transfers
+  with identical EA, LS address, size, and opcode on one SPU. Unset or zero
+  disables it. Repeated transfers can be legitimate polling or status updates;
+  this heuristic is for debugging only and does not establish a deadlock.
   `runtime/spu/spu_dma.h:1099`
 - **`SPU_DMA_SKIP_DUMP`** — SPU_DMA_SKIP_DUMP=1: show the LS payload a skipped PUT was carrying. A job that DMAs a small buffer to a garbage EA in a tight loop is usually an SPU-side assert/print path, and the payload names the actual complaint -- far more useful than the address it failed at. */
   `runtime/spu/spu_dma.h:392`
@@ -1117,6 +1120,10 @@ not changed while a title runs.
 - **`SPU_STEPTRACE`** — _(no description in source)_
   `runtime/spu/spu_drain.c:81`
 - **`SPU_STEPTRACE_FROM`** — _(no description in source)_
+
+- **`SPU_STEPTRACE_REGS`** — With `SPU_STEPTRACE`, include all four words of
+  registers 3, 4, 5, 16, 17, and 81 in the bounded 40-step trace. Useful when
+  the preferred word is zero but a 64-bit pointer's low word is nonzero.
   `runtime/spu/spu_drain.c:83`
 - **`SPU_TAGPROBE`** — _(no description in source)_
   `runtime/spu/spu_dma.h:1440`
@@ -1461,3 +1468,11 @@ not changed while a title runs.
 - **`YDKJ_TUNERFIX`** — YDKJ_TUNERFIX (at the top so it wins over any registered handler): the profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre _cellSpursIsLaunchedFromTuner (0x3000D318), must return 0x8001112E ("profiler not loaded") on a normal run. Anything else trips the usertrace.c:123 assert AND makes the fn report "launched from tuner", so the caller runs tuner/trace setup that fails with CELL_SPURS_CORE_ERROR_STAT -> the SPURS task workload never attaches. */
   `runtime/ppu/ppu_hle.cpp:223`  _(+1 more sites)_
 
+
+### Haze rendering probes
+
+- `VTX_INPUTS=N`: log one fetched vertex per distinct fragment program (up to 32), including enabled attributes and the color/UV slots.
+- `VP_MVP=N`: also print constants c0 through c3 and the guest viewport transform.
+- `FPK_DBG=1`: shader bytes now come from the program's actual local/main location.
+- `FP_FORCE=1`: replace the fragment shader with solid magenta; this now works with the current decompiler. Diagnostic output is not game rendering.
+- `LD_FRAME_DUMP_COUNT=N`: stop live-renderer PPM captures after N attempts; unset or zero retains unlimited capture. Use with `LD_FRAME_DUMP`, `LD_FRAME_DUMP_FROM`, and `LD_FRAME_DUMP_EVERY`.

@@ -23,8 +23,8 @@ extern "C" {
 
 /* Output modes */
 #define CELL_AUDIO_OUT_CODING_TYPE_LPCM    0
-#define CELL_AUDIO_OUT_CODING_TYPE_AC3     4
-#define CELL_AUDIO_OUT_CODING_TYPE_DTS     8
+#define CELL_AUDIO_OUT_CODING_TYPE_AC3     1
+#define CELL_AUDIO_OUT_CODING_TYPE_DTS     6
 
 /* Channel counts */
 #define CELL_AUDIO_OUT_CHNUM_2             2
@@ -49,6 +49,7 @@ typedef struct CellAudioOutSoundMode {
     u8  channel;
     u8  fs;
     u8  reserved;
+    u32 layout; /* guest big-endian */
 } CellAudioOutSoundMode;
 
 typedef struct CellAudioOutDeviceInfo {
@@ -56,6 +57,7 @@ typedef struct CellAudioOutDeviceInfo {
     u8  availableModeCount;
     u8  state;
     u8  reserved[3];
+    u16 latency; /* guest big-endian */
     CellAudioOutSoundMode availableModes[16];
 } CellAudioOutDeviceInfo;
 
@@ -65,6 +67,9 @@ typedef struct CellAudioOutConfiguration {
     u8  reserved[10];
     u32 downMixer;
 } CellAudioOutConfiguration;
+
+/* Host stereo mixer routing selected by the guest's primary output. */
+u32 ps3_audio_out_downmixer(void);
 
 /* ---------------------------------------------------------------------------
  * Functions

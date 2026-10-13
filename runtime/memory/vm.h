@@ -122,10 +122,17 @@ extern uint8_t* vm_base;
 /* mprotect over the host pages covering [addr, addr+size). */
 static inline int vm__mprotect_pages(uint32_t addr, uint32_t size, int prot)
 {
+#ifdef __EMSCRIPTEN__
+    // The browser host owns a fully backed, zero-initialized linear arena.
+    // Wasm does not provide per-page host access protections.
+    (void)prot;
+    return vm_base && (uint64_t)addr + size <= VM_TOTAL_SIZE ? 0 : -1;
+#else
     uint64_t pg = vm_host_page_size();
     uint64_t a0 = (uint64_t)addr & ~(pg - 1u);
     uint64_t a1 = ((uint64_t)addr + size + pg - 1u) & ~(pg - 1u);
     return mprotect(vm_base + a0, (size_t)(a1 - a0), prot);
+#endif
 }
 #endif
 

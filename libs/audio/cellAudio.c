@@ -14,6 +14,7 @@
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
 #include "cellAudio.h"
+#include "../misc/cellAvconfExt.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
 #include <string.h>
@@ -34,7 +35,10 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
  * Backend selection
  * -----------------------------------------------------------------------*/
 
-#if defined(PS3RECOMP_AUDIO_USE_SDL2)
+#if defined(__EMSCRIPTEN__)
+  #define AUDIO_BACKEND_SDL2    0
+  #define AUDIO_BACKEND_WASAPI  0
+#elif defined(PS3RECOMP_AUDIO_USE_SDL2)
   #define AUDIO_BACKEND_SDL2    1
   #define AUDIO_BACKEND_WASAPI  0
 #elif defined(_WIN32)
@@ -159,6 +163,17 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
 /* ---------------------------------------------------------------------------
  * Host audio output backend
  * -----------------------------------------------------------------------*/
+
+#if defined(__EMSCRIPTEN__)
+/* The browser's main page owns Web Audio; the guest mixer only produces PCM. */
+extern int ps3_wasm_audio_init(void) __attribute__((weak));
+extern void ps3_wasm_audio_shutdown(void) __attribute__((weak));
+extern void ps3_wasm_audio_submit(const float*, u32) __attribute__((weak));
+static int audio_backend_init(void) { return ps3_wasm_audio_init ? ps3_wasm_audio_init() : -1; }
+static void audio_backend_shutdown(void) { if (ps3_wasm_audio_shutdown) ps3_wasm_audio_shutdown(); }
+static void audio_backend_submit(const float* samples, u32 frames)
+{ if (ps3_wasm_audio_submit) ps3_wasm_audio_submit(samples, frames); }
+#endif
 
 #if AUDIO_BACKEND_SDL2
 
@@ -345,6 +360,14 @@ static void audio_backend_shutdown(void)
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
     if (!s_wasapi_render) return;
+    /* Silence only the device submission. Mixing, event notifications and the
+     * device clock still run normally, and AUDIO_WAV captures the original mix. */
+    static int muted = -1;
+    if (muted < 0) {
+        const char* setting = getenv("AUDIO_MUTE");
+        muted = setting && *setting == '1';
+        if (muted) fprintf(stderr, "[cellAudio] device output muted; mixing/capture active\n");
+    }
 
     UINT32 padding = 0;
     s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
@@ -360,7 +383,8 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     HRESULT hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
     if (SUCCEEDED(hr) && buf) {
         memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
-        s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples, 0);
+        s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples,
+            muted ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
     }
 }
 
@@ -411,6 +435,7 @@ static inline float ld_be_f32(const float* p)
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
 static void audio_mix_one_block(void)
 {
+    const u32 downmixer = ps3_audio_out_downmixer();
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
 
     mutex_lock(&s_audio_mutex);
@@ -452,8 +477,8 @@ static void audio_mix_one_block(void)
          * vs which block the read cursor is on -- distinguishes "writer never
          * writes" from "writer and reader cycle out of phase". */
         { static int s_pk = -1; if (s_pk < 0) s_pk = getenv("AUDIO_PEAK") ? 1 : 0;
-          if (s_pk) { static _Thread_local unsigned _c;
-            if ((++_c % 400) == 0) {
+          if (s_pk) { static _Thread_local unsigned _c[CELL_AUDIO_PORT_MAX];
+            if ((++_c[p] % 400) == 0) {
                 char map[36]; u32 b;
                 for (b = 0; b < nblock && b < 32; b++) {
                     const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
@@ -477,16 +502,17 @@ static void audio_mix_one_block(void)
                 left = right = ld_be_f32(&src[s]) * level;
             }
 
-            /* If 7.1, mix center and other channels into stereo */
-            if (nch == 8) {
-                float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
-                float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * 0.5f;
-                float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
-                float rr     = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
-                float sl     = ld_be_f32(&src[s * 8 + 6]) * level * 0.3f;
-                float sr     = ld_be_f32(&src[s * 8 + 7]) * level * 0.3f;
-                left  += center + lfe + rl + sl;
-                right += center + lfe + rr + sr;
+            /* Type A folds surround into stereo without LFE. With NONE (or
+             * type B's six-channel routing), only front L/R reach this stereo
+             * output; the other port channels must not be added again. */
+            if (nch == 8 && downmixer == 1) {
+                float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.5f;
+                float sl = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
+                float sr = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
+                float rl = ld_be_f32(&src[s * 8 + 6]) * level * 0.5f;
+                float rr = ld_be_f32(&src[s * 8 + 7]) * level * 0.5f;
+                left = left * 0.707f + center + sl + rl;
+                right = right * 0.707f + center + sr + rr;
             }
 
             s_mix_buffer[s * 2 + 0] += left;
@@ -608,17 +634,35 @@ static void* audio_mix_thread_func(void* arg)
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
+#ifdef __EMSCRIPTEN__
+    struct timespec anchor;
+    clock_gettime(CLOCK_MONOTONIC, &anchor);
+    uint64_t origin = (uint64_t)anchor.tv_sec * 1000000000ull + anchor.tv_nsec;
+    uint64_t blocks = 0;
+#endif
     while (s_mix_thread_running) {
+#ifdef __EMSCRIPTEN__
+        struct timespec current;
+        clock_gettime(CLOCK_MONOTONIC, &current);
+        uint64_t now = (uint64_t)current.tv_sec * 1000000000ull + current.tv_nsec;
+        uint64_t deadline = origin + blocks * CELL_AUDIO_BLOCK_SAMPLES * 1000000000ull / CELL_AUDIO_SAMPLE_RATE;
+        if (now < deadline) { usleep(1000); continue; }
+        /* A suspended tab must not advance thousands of guest blocks at once. */
+        if (now - deadline > 50000000ull) { origin = now; blocks = 0; }
+        ++blocks;
+#endif
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
 
+#ifndef __EMSCRIPTEN__
         u32 queued = audio_backend_queued_samples();
         if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
             usleep(5000);
         } else {
             usleep(2000);
         }
+#endif
     }
 
     printf("[cellAudio] Mixing thread stopped\n");

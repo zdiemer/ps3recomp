@@ -81,6 +81,14 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
+static CellPadHostInputCallback s_host_input_callback;
+static void* s_host_input_user;
+
+void cellPad_set_host_input_callback(CellPadHostInputCallback callback, void* user)
+{
+    s_host_input_callback = callback;
+    s_host_input_user = user;
+}
 
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
@@ -440,8 +448,21 @@ static void pad_poll_backend(void)
     pad_poll_sdl2();
 #endif
 #ifdef _WIN32
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+    if (!s_host_input_callback && !s_host_state[0].connected) pad_poll_keyboard();
 #endif
+    if (s_host_input_callback) {
+        for (u32 i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+            CellPadHostInput input = {0,128,128,128,128,0,0};
+            if (!s_host_input_callback(i, &input, s_host_input_user)) continue;
+            PadHostState* hs = &s_host_state[i];
+            memset(hs, 0, sizeof(*hs));
+            hs->connected = 1;
+            hs->buttons = input.buttons;
+            hs->analog_lx = input.lx; hs->analog_ly = input.ly;
+            hs->analog_rx = input.rx; hs->analog_ry = input.ry;
+            hs->trigger_l2 = input.l2; hs->trigger_r2 = input.r2;
+        }
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -672,28 +693,43 @@ skip_inject: ;
      */
     { static int s_pf = -1; static char pf_path[512];
       static unsigned held_mask = 0; static int held_n = 0;
+      static unsigned char held_sticks[4]; static int stick_n = 0;
       if (s_pf < 0) { const char* e = getenv("PAD_FILE");
                       s_pf = (e && *e) ? 1 : 0;
                       if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0; } }
       if (s_pf && port_no == 0) {
-          if (held_n <= 0) {
+          if (held_n <= 0 && stick_n <= 0) {
               FILE* f = fopen(pf_path, "rb");
               if (f) {
-                  char buf[64]; buf[0] = 0;
+                  char buf[128]; buf[0] = 0;
                   if (fgets(buf, sizeof buf, f)) {
+                    int a,b,c,d,n;
+                    if (sscanf(buf, "sticks %d %d %d %d %d", &a,&b,&c,&d,&n) == 5) {
+                      if ((unsigned)a <= 255 && (unsigned)b <= 255 &&
+                          (unsigned)c <= 255 && (unsigned)d <= 255 && n > 0 && n <= 10000) {
+                        held_sticks[0]=(u8)a; held_sticks[1]=(u8)b;
+                        held_sticks[2]=(u8)c; held_sticks[3]=(u8)d; stick_n=n;
+                        printf("[cellPad] PAD_FILE sticks %d,%d,%d,%d for %d polls\n",a,b,c,d,n);
+                        fflush(stdout);
+                      }
+                    } else {
                       char* rest;
                       unsigned m = (unsigned)strtoul(buf, &rest, 0);
                       int n = (int)strtol(rest, 0, 0);
                       if (m) { held_mask = m; held_n = n > 0 ? n : 40;
                                printf("[cellPad] PAD_FILE press 0x%04X\n", m); fflush(stdout); }
+                    }
                   }
                   fclose(f);
-                  if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
+                  if (held_n > 0 || stick_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
               }
           }
           if (held_n > 0) { held_n--;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
+          if (stick_n > 0) { stick_n--;
+              hs->analog_lx = held_sticks[0]; hs->analog_ly = held_sticks[1];
+              hs->analog_rx = held_sticks[2]; hs->analog_ry = held_sticks[3]; }
       } }
 
     /* Analog sticks */

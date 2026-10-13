@@ -114,6 +114,12 @@ typedef struct mfc_engine {
 
     /* Per-tag completion tracking (bitmask: bit N = tag N completed) */
     uint32_t    tag_completed;
+
+    /* Optional diagnostic watchdog, private to this engine/context. Repeated
+     * DMA is valid polling behavior; zero disables the heuristic. */
+    uint32_t    repeat_limit, repeat_count;
+    uint64_t    repeat_ea;
+    uint32_t    repeat_lsa, repeat_size, repeat_cmd;
 } mfc_engine;
 
 /* External: pointer to host mapping of PS3 main memory.
@@ -127,6 +133,25 @@ static inline void mfc_engine_init(mfc_engine* mfc)
 {
     memset(mfc, 0, sizeof(*mfc));
     mfc->tag_completed = 0xFFFFFFFF; /* all tags idle = completed */
+    const char* limit = getenv("SPU_DMA_REPEAT_LIMIT");
+    mfc->repeat_limit = limit ? (uint32_t)strtoul(limit, NULL, 0) : 0;
+}
+
+static inline int mfc_repeat_limit_reached(mfc_engine* mfc, uint64_t ea,
+                                          uint32_t lsa, uint32_t size, uint32_t cmd)
+{
+    if (!mfc->repeat_limit) return 0;
+    if (mfc->repeat_count && mfc->repeat_ea == ea && mfc->repeat_lsa == lsa &&
+        mfc->repeat_size == size && mfc->repeat_cmd == cmd) {
+        if (mfc->repeat_count < UINT32_MAX) ++mfc->repeat_count;
+    } else {
+        mfc->repeat_ea = ea;
+        mfc->repeat_lsa = lsa;
+        mfc->repeat_size = size;
+        mfc->repeat_cmd = cmd;
+        mfc->repeat_count = 1;
+    }
+    return mfc->repeat_count >= mfc->repeat_limit;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1170,28 +1195,19 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
-    /* A job re-issuing the SAME transfer forever is wedged, not slow: nothing
-     * about its state can change if the DMA is all it is doing. This used to
-     * count only REJECTED transfers, so once the EA check started committing
-     * pages on demand the counter never advanced and a spinning job simply hung
-     * the chain walker instead. Count repeats whether or not the transfer
-     * succeeds, and halt at a known pc rather than hanging silently. */
-    { static uint32_t s_last_ea, s_last_lsa, s_rep;
-      static uint32_t s_limit = 0;
-      if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
-                      s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u; }
-      if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
-          if (++s_rep >= s_limit) {
-              s_rep = 0;   /* re-arm: the chain may run this job again */
-              extern void spu_halt(spu_context*);
-              fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
-                      "transfers to ea=0x%08X -- halting the SPU\n",
-                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
-                      (uint32_t)ea);
-              fflush(stderr);
-              spu_halt(spu);
-          }
-      } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; } }
+    /* A repeated GET can observe another processor's writes and a repeated
+     * PUT can publish changing status. Neither proves a hang. Only stop when
+     * explicitly requested for diagnosis; never share counters across SPUs. */
+    if (mfc_repeat_limit_reached(mfc, ea, lsa, size, cmd)) {
+        extern void spu_halt(spu_context*);
+        fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
+                "transfers to ea=0x%08X -- diagnostic limit, halting the SPU\n",
+                spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
+                mfc->repeat_limit, (uint32_t)ea);
+        mfc->repeat_count = 0;
+        fflush(stderr);
+        spu_halt(spu);
+    }
 
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);

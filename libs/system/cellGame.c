@@ -133,6 +133,17 @@ static int dir_exists(const char* path)
  * so installation checks use the destination volume, without creating data. */
 static s32 content_free_kb(void)
 {
+#ifdef __EMSCRIPTEN__
+    /* The page supplies the origin's actual IndexedDB quota before startup.
+     * Emscripten's synthetic statvfs capacity is unrelated to that quota. */
+    const char* value = getenv("PS3_BROWSER_STORAGE_FREE_KB");
+    if (value && *value) {
+        char* end;
+        unsigned long long kb = strtoull(value, &end, 10);
+        if (!*end) return kb > INT32_MAX ? INT32_MAX : (s32)kb;
+    }
+    return 0;
+#endif
     char path[CELL_GAME_PATH_MAX];
     snprintf(path, sizeof(path), "%s", s_content_path[0] ? s_content_path : ".");
     for (;;) {
@@ -464,11 +475,85 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
  * stalls, and the cellSaveDataAutoLoad2 (auto-save notice) dialog never appears.
  *
  * funcStat(cbResult, get, set): the title reads `get` (isNewData, free space, params)
- * and writes cbResult->result. We report existing data (isNewData=0) + ample space;
- * DeS's callback returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK. */
+ * and writes cbResult->result. New/existing status follows the host directory;
+ * installing data and persisting callback-provided parameters remain separate. */
 #define GAMEDATA_CB_BASE   0x02520000u   /* guest scratch (distinct from savedata's) */
 #define CELL_GAMEDATA_CBRESULT_OK_CANCEL  1
 #define CELL_GAMEDATA_CBRESULT_OK         0
+
+/* PARAM.SFO has little-endian tables even though its source guest fields are
+ * big-endian. Persist the callback's metadata so subsequent boots see it. */
+static void sfo_put32(unsigned char* p, u32 v)
+{
+    p[0] = (unsigned char)v; p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16); p[3] = (unsigned char)(v >> 24);
+}
+
+static int gamedata_write_sfo(const char* dir, u32 param)
+{
+    struct Entry { char key[24]; u32 offset, capacity, integer; } entries[26];
+    unsigned count = 0;
+#define SFO_ENTRY(k, o, c, i) do { \
+    snprintf(entries[count].key, sizeof entries[count].key, "%s", k); \
+    entries[count].offset = o; entries[count].capacity = c; \
+    entries[count++].integer = i; } while (0)
+    SFO_ENTRY("CATEGORY", 0, 4, 0);
+    SFO_ENTRY("PARENTAL_LEVEL", 0xA94, 4, 1);
+    SFO_ENTRY("TITLE", 0, 128, 0);
+    for (unsigned i = 0; i < 20; ++i) {
+        if (!vm_base[param + 0x80 + i * 128]) continue;
+        char key[24]; snprintf(key, sizeof key, "TITLE_%02u", i);
+        SFO_ENTRY(key, 0x80 + i * 128, 128, 0);
+    }
+    SFO_ENTRY("TITLE_ID", 0xA80, 16, 0);
+    SFO_ENTRY("VERSION", 0xA8C, 8, 0);
+#undef SFO_ENTRY
+    unsigned char data[8192] = {0};
+    u32 keys = 0x14 + count * 16, key_end = keys;
+    for (unsigned i = 0; i < count; ++i) {
+        unsigned char* e = data + 0x14 + i * 16;
+        u32 offset = key_end - keys;
+        e[0] = (unsigned char)offset; e[1] = (unsigned char)(offset >> 8);
+        e[2] = 4; e[3] = entries[i].integer ? 4 : 2;
+        size_t len = strlen(entries[i].key) + 1;
+        memcpy(data + key_end, entries[i].key, len); key_end += (u32)len;
+    }
+    u32 values = (key_end + 3) & ~3u, end = values;
+    memcpy(data, "\0PSF", 4); sfo_put32(data + 4, 0x101);
+    sfo_put32(data + 8, keys); sfo_put32(data + 12, values);
+    sfo_put32(data + 16, count);
+    for (unsigned i = 0; i < count; ++i) {
+        struct Entry* item = &entries[i];
+        unsigned char* e = data + 0x14 + i * 16;
+        u32 len = 4;
+        if (item->integer) sfo_put32(data + end, vm_read32(param + item->offset));
+        else {
+            const char* src = (const char*)(vm_base + param + item->offset);
+            unsigned limit = item->capacity - 1;
+            if (!strcmp(item->key, "CATEGORY")) src = "GD";
+            if (!strcmp(item->key, "TITLE_ID")) limit = 9;
+            if (!strcmp(item->key, "VERSION")) limit = 5;
+            len = 0; while (len < limit && src[len]) ++len;
+            memcpy(data + end, src, len); ++len;
+        }
+        sfo_put32(e + 4, len); sfo_put32(e + 8, item->capacity);
+        sfo_put32(e + 12, end - values); end += item->capacity;
+    }
+    char path[CELL_GAME_PATH_MAX], temp[CELL_GAME_PATH_MAX];
+    snprintf(path, sizeof path, "%s/PARAM.SFO", dir);
+    snprintf(temp, sizeof temp, "%s/PARAM.SFO.tmp", dir);
+    FILE* fp = fopen(temp, "wb");
+    if (!fp) return -1;
+    int ok = fwrite(data, 1, end, fp) == end;
+    if (fclose(fp) != 0) ok = 0;
+#ifdef _WIN32
+    if (ok) ok = MoveFileExA(temp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    if (ok) ok = rename(temp, path) == 0;
+#endif
+    if (!ok) remove(temp);
+    return ok ? 0 : -1;
+}
 
 /* Shared body for the two firmware entry points that hand a title a
  * (CBResult, StatGet, StatSet) triple and run its funcStat callback:
@@ -490,25 +575,43 @@ static s32 gamedata_stat_callback(const char* tag, u32 version, uint32_t dir_ea,
     if (!g_ps3_guest_caller)
         return CELL_GAMEDATA_CBRESULT_OK;
 
-    /* Guest scratch for the 3 callback structs: CBResult(0x18)/StatGet(0xBE8)/StatSet(0x0C). */
+    /* Firmware StatGet is 0x1448 bytes: getParam at 0x860 alone occupies
+     * 0xB9C bytes. The old 0xC00 stride placed StatSet INSIDE getParam and
+     * wrote sizeKB into its localized-title array. Keep all three disjoint.
+     * Layout reference: RPCS3 Emu/Cell/Modules/cellGame.h. */
     uint32_t cb  = GAMEDATA_CB_BASE;
     uint32_t get = cb + 0x20;
-    uint32_t set = get + 0xC00;
+    uint32_t set = get + 0x1450;
     memset(vm_base + cb, 0, (set + 0x20) - cb);
 
     /* CellGameDataStatGet (offsets per SDK, RPCS3-verified). */
     vm_write32(get + 0x000, (u32)content_free_kb());
-    vm_write32(get + 0x004, is_new_data);                            /* isNewData = 0 (data exists) */
+    vm_write32(get + 0x004, is_new_data);
     snprintf((char*)(vm_base + get + 0x008), 96, "/dev_hdd0/game/%s", dir);          /* contentInfoPath */
     snprintf((char*)(vm_base + get + 0x427), 96, "/dev_hdd0/game/%s/USRDIR", dir);   /* gameDataPath */
-    vm_write32(get + 0xB9C, 0xFFFFFFFFu);                  /* sizeKB = NOTCALC (-1) */
-    vm_write32(get + 0xBA0, 0);                            /* sysSizeKB */
+    vm_write32(get + 0x13FC, is_new_data ? 0 : 0xFFFFFFFFu); /* sizeKB */
+    vm_write32(get + 0x1400, 0);                           /* sysSizeKB */
     /* getParam (CellGameDataSystemFileParam @0x860): title / titleId / dataVersion / attribute. */
     uint32_t gp = get + 0x860;
     snprintf((char*)(vm_base + gp + 0x000), 128, "%s", s_title);
     snprintf((char*)(vm_base + gp + 0xA80), 10,  "%s", dir);        /* titleId = dir (e.g. BLUS30443) */
     snprintf((char*)(vm_base + gp + 0xA8C), 6,   "%s", s_app_ver);  /* dataVersion */
     vm_write32(gp + 0xA98, 0);                                      /* attribute = CELL_GAMEDATA_ATTR_NORMAL */
+    if (!is_new_data) {
+        char sfo[CELL_GAME_PATH_MAX];
+        snprintf(sfo, sizeof sfo, "%s/%s/PARAM.SFO", content_root(), dir);
+        sfo_read_string(sfo, "TITLE", (char*)vm_base + gp, 128);
+        sfo_read_string(sfo, "TITLE_ID", (char*)vm_base + gp + 0xA80, 10);
+        sfo_read_string(sfo, "VERSION", (char*)vm_base + gp + 0xA8C, 6);
+        for (unsigned i = 0; i < 20; ++i) {
+            char key[24]; snprintf(key, sizeof key, "TITLE_%02u", i);
+            sfo_read_string(sfo, key, (char*)vm_base + gp + 0x80 + i * 128, 128);
+        }
+        unsigned char level[5] = {0};
+        if (sfo_read_string(sfo, "PARENTAL_LEVEL", (char*)level, sizeof level) == 0)
+            vm_write32(gp + 0xA94, (u32)level[0] | ((u32)level[1] << 8) |
+                       ((u32)level[2] << 16) | ((u32)level[3] << 24));
+    }
 
     /* StatSet left zeroed (setParam = NULL: callback chooses whether to modify). */
 
@@ -529,13 +632,27 @@ s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
     if (version != 0 || !dir_ea || !func_opd)
         return CELL_GAME_ERROR_PARAM;
 
-    /* We report existing data (isNewData=0) + ample space; DeS's callback
-     * returns CELL_GAMEDATA_CBRESULT_OK_CANCEL (check-only) -> CELL_OK. */
+    const char* dir = (const char*)(vm_base + dir_ea);
+    char path[CELL_GAME_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s", content_root(), dir);
+    u32 is_new_data = dir_exists(path) ? 0u : 1u;
     s32 result = gamedata_stat_callback("DataCheckCreate2", version, dir_ea,
-                                        func_opd, 0);
+                                        func_opd, is_new_data);
     if (result < 0)
         return CELL_GAME_ERROR_PARAM;   /* callback reported an error */
-    /* OK / OK_CANCEL: succeed (our HLE doesn't create/modify the on-disk data). */
+    if (result == CELL_GAMEDATA_CBRESULT_OK_CANCEL) return CELL_OK;
+    if (result != CELL_GAMEDATA_CBRESULT_OK || !g_ps3_guest_caller)
+        return CELL_GAME_ERROR_PARAM;
+    u32 param = vm_read32(GAMEDATA_CB_BASE + 0x20 + 0x1450);
+    if (is_new_data && !param) return CELL_GAME_ERROR_PARAM;
+    if (is_new_data) {
+        char usrdir[CELL_GAME_PATH_MAX];
+        snprintf(usrdir, sizeof usrdir, "%s/USRDIR", path);
+        ensure_dirs(usrdir);
+        if (!dir_exists(usrdir)) return CELL_GAME_ERROR_ACCESS_ERROR;
+    }
+    if (param && gamedata_write_sfo(path, param) != 0)
+        return CELL_GAME_ERROR_ACCESS_ERROR;
     return CELL_OK;
 }
 

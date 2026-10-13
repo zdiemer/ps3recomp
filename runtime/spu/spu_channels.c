@@ -8,8 +8,7 @@
  *   - spu_indirect_branch : resolves ctx->pc to a lifted spu_func_* via a
  *     registry that generated code populates by calling spu_recomp_register().
  *
- * The MFC engine state is kept per spu_context here (spu_context.h does not
- * embed one), in a small lazily-populated registry.
+ * Each spu_context owns a lazily allocated MFC engine, released on job exit.
  */
 
 #include "spu_dma.h"
@@ -17,6 +16,8 @@
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
+#include "spu_overlay_registry.h"
+#include "spu_code_lookup.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,6 +137,34 @@ void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
 
 void spu_halt(spu_context* ctx)
 {
+    /* Optional bounded fault artifact: one full LS/register snapshot, only at
+     * a real halt assertion. Register words use guest big-endian byte order. */
+    if (ctx->status == SPU_STATUS_STOPPED_BY_HALT ||
+        ((ctx->pc & SPU_LS_MASK) == 0 && getenv("SPU_HALT_DUMP_AT_ZERO"))) {
+        const char* prefix = getenv("SPU_HALT_DUMP");
+        const char* filter = getenv("SPU_HALT_DUMP_IMG");
+        static volatile LONG claimed;
+        if (prefix && *prefix && (!filter || atoi(filter) == ctx->image_id) &&
+            InterlockedCompareExchange(&claimed, 1, 0) == 0) {
+            char path[512];
+            snprintf(path, sizeof path, "%s_img%d.ls.bin", prefix, ctx->image_id);
+            FILE* f = fopen(path, "wb");
+            if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f); }
+            snprintf(path, sizeof path, "%s_img%d.regs.bin", prefix, ctx->image_id);
+            f = fopen(path, "wb");
+            if (f) {
+                for (unsigned r = 0; r < 128; ++r)
+                    for (unsigned w = 0; w < 4; ++w) {
+                        uint32_t v = ctx->gpr[r]._u32[w];
+                        uint8_t bytes[4] = {(uint8_t)(v >> 24), (uint8_t)(v >> 16),
+                                            (uint8_t)(v >> 8), (uint8_t)v};
+                        fwrite(bytes, 1, 4, f);
+                    }
+                fclose(f);
+            }
+            fprintf(stderr, "[spu-halt] wrote first fault snapshot: %s_img%d\n", prefix, ctx->image_id);
+        }
+    }
     /* Register/context dump at halt-asserts: the WWS job's parameter guard
      * (heqi 0x1650 in job_wws_7BD900) checks (r12 bit0) & (r9 16-aligned) &
      * (r15 != 0) -- job descriptor/ABI values our execute path must supply.
@@ -273,94 +302,11 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     return halted;
 }
 
-/* ===========================================================================
- * Per-context MFC engine registry
- *
- * One MFC engine per live SPU context, in a small table. A thread group starts
- * all of its threads at once and each one arrives here on its first DMA, so the
- * table is written concurrently by as many host threads as the group has.
- *
- * Two rules keep that safe without putting a lock on the lookup, which every
- * MFC channel access goes through:
- *
- *   - A slot's owner field is written only by the thread that owns the context
- *     in it: the claim below, and the release when that context is done. Every
- *     reader is comparing the field against ITS OWN context pointer, so a read
- *     that races a claim either matches (its own slot, which only it can have
- *     written) or does not, and can never be handed another context's engine.
- *   - Choosing which free slot to claim is done under a lock. It used to be a
- *     scan followed by a store, and two threads that scanned before either
- *     stored both took the same slot and then shared one engine's queue and tag
- *     state -- one SPU's tag wait satisfied by the other SPU's transfer.
- * ===========================================================================*/
-#define SPU_MAX_CONTEXTS 8
-
-typedef struct {
-    spu_context* volatile ctx;
-    mfc_engine   mfc;
-} spu_mfc_slot;
-
-static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
-static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
-
-static mfc_engine* mfc_for(spu_context* ctx)
-{
-    for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
-        if (s_mfc_slots[i].ctx == ctx)
-            return &s_mfc_slots[i].mfc;
-
-    /* No slot yet: take one. The engine is initialized before the slot is
-     * published, so it is never visible to anyone in a half-reset state. */
-    mfc_engine* e = NULL;
-    AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (int i = 0; i < SPU_MAX_CONTEXTS && !e; i++) {
-        if (s_mfc_slots[i].ctx != NULL) continue;
-        mfc_engine_init(&s_mfc_slots[i].mfc);
-        s_mfc_slots[i].ctx = ctx;
-        e = &s_mfc_slots[i].mfc;
-    }
-    if (!e) {
-        /* Out of slots: fall back to a shared engine (correct for single-SPU).
-         * Reachable only with more than SPU_MAX_CONTEXTS contexts running at
-         * the same time, which is more SPUs than the machine has -- and the
-         * sharing is silent, so say it once. Its one-time init is inside the
-         * lock as well, or two threads arriving together would each memset an
-         * engine the other is already using. */
-        static mfc_engine fallback;
-        static int fallback_init = 0;
-        if (!fallback_init) {
-            mfc_engine_init(&fallback);
-            fallback_init = 1;
-            fprintf(stderr, "[SPU] more than %d contexts hold an MFC engine at "
-                    "once; the rest share one\n", SPU_MAX_CONTEXTS);
-            fflush(stderr);
-        }
-        e = &fallback;
-    }
-    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
-    return e;
-}
-
-/* Give the slot `ctx` holds back to the table, called when its context is done.
- * Slots used to be claimed and never released, so a title with more SPU
- * contexts over its life than there are slots ran the rest of them on the
- * shared fallback engine -- and by then it is not a fresh engine but whatever
- * tag and queue state the previous owners left in it.
- *
- * Only the owner calls this, and only after its SPU has stopped, so the engine
- * is idle. The next claimant re-initializes it. A context that never issued a
- * DMA holds no slot and this is a scan that finds nothing. */
-void spu_mfc_release(spu_context* ctx)
-{
-    if (!ctx) return;
-    AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
-        if (s_mfc_slots[i].ctx != ctx) continue;
-        s_mfc_slots[i].ctx = NULL;
-        break;
-    }
-    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
-}
+/* Each executing context owns its DMA command/tag state, including when the
+ * host dispatches more tasks concurrently than a physical PS3 has SPUs. */
+#include "spu_mfc_state.h"
+static mfc_engine* mfc_for(spu_context* ctx) { return spu_mfc_state_get(ctx); }
+void spu_mfc_release(spu_context* ctx) { spu_mfc_state_release(ctx); }
 
 /* ===========================================================================
  * Atomic reservation (GETLLAR / PUTLLC / PUTLLUC) -- real lock-line semantics
@@ -1456,7 +1402,7 @@ int spu_have_function(uint32_t addr)
  * spu_fn_registry.c before the registry was consolidated into this TU. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
-    return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
+    return (spu_lifted_fn)spu_lookup_resident(ctx, lsa);
 }
 
 /* ---- Swappable code overlays (see spu_context.resident_ovl) --------------
@@ -1641,13 +1587,39 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
     spu_ovl_dump(ctx, ea, lsa, ls, size);
-    for (unsigned slot = 0; slot < 4; ++slot) {
-        if (!ctx->resident_code[slot].image_id) continue;
-        uint32_t base = ctx->resident_code[slot].lsa;
-        uint32_t end = base + ctx->resident_code[slot].size;
-        if (lsa < end && lsa + size > base &&
-            (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)))
-            ctx->resident_code[slot].image_id = 0;
+    spu_code_note_overwrite(ctx, ea, lsa, size);
+    uint32_t bound_span = 0;
+    /* Guest copies can relocate PIC modules into reusable heap staging buffers.
+     * Match the entire compiled segment, even when DMA includes padding. */
+    uint32_t offset = 0;
+    int matched = 0, bound_image;
+    while ((bound_image = spu_overlay_match_loaded_range(ls, size, lsa, &offset, &bound_span)) != 0) {
+        for (unsigned slot = 0; slot < 4; ++slot) {
+            if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa + offset)
+                continue;
+            ctx->resident_code[slot].lsa = lsa + offset;
+            ctx->resident_code[slot].size = bound_span;
+            ctx->resident_code[slot].source_ea = ea + offset;
+            ctx->resident_code[slot].image_id = bound_image;
+            matched = 1;
+            break;
+        }
+        offset += bound_span;
+    }
+    if (matched) return;
+    bound_image = spu_overlay_lookup_bound_at(ea, lsa, &bound_span);
+    if (bound_image && (uint64_t)lsa + bound_span <= SPU_LS_SIZE) {
+        for (unsigned slot = 0; slot < 4; ++slot) {
+            if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+                continue;
+            ctx->resident_code[slot].lsa = lsa;
+            ctx->resident_code[slot].size = bound_span;
+            ctx->resident_code[slot].source_ea = ea;
+            ctx->resident_code[slot].image_id = bound_image;
+            return;
+        }
+        fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", bound_image);
+        return;
     }
     for (int i = 0; i < s_ovl_src_count; i++) {
         const spu_ovl_src* o = &s_ovl_src[i];
@@ -2203,23 +2175,7 @@ void spu_indirect_branch(spu_context* ctx)
     /* The launched task owns the shared task-code region: resolve it there FIRST
      * so a co-resident task at the same LS base cannot shadow it. (resident_task
      * is 0 outside the region, so this only ever fires for genuine task code.) */
-    spu_fn fn = NULL;
-    int code_owner = 0;
-    for (unsigned slot = 0; slot < 4; ++slot) {
-        if (ctx->resident_code[slot].image_id && ctx->pc >= ctx->resident_code[slot].lsa &&
-            ctx->pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
-            code_owner = ctx->resident_code[slot].image_id;
-            fn = spu_lookup(ctx->pc, code_owner);
-            break;
-        }
-    }
-    if (!code_owner && ctx->resident_task)
-        fn = spu_lookup(ctx->pc, ctx->resident_task);
-    /* Resident overlay next: streamed code overwrote that LS range, so its lift
-     * is the truth there -- the base image's stale bytes at the same addresses
-     * may also be registered (historical junk lifts) and must lose. */
-    if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
-    if (!code_owner && !fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    spu_fn fn = spu_lookup_resident(ctx, ctx->pc);
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second
@@ -2733,6 +2689,24 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
       if (s_ti == -2) { const char* e = getenv("SPU_TRACE_IMG");
                         s_ti = e ? atoll(e) : -1; }
       if (s_ti >= 0 && ctx->image_id != (int)s_ti) { s_trace_suppress = 1; return; } }
+    /* Reserve the trace budget for later invocations of a repeated task.
+     * SPU_TRACE_ENTRY_PC names its entry; SPU_TRACE_SKIP_RUNS skips N launches.
+     * A host thread runs one task, so its selected launch stays thread-local. */
+    { static long s_skip = -1;
+      static uint32_t s_entry;
+      static volatile LONG s_runs;
+      static SPU_THREAD_LOCAL long t_run;
+      if (s_skip < 0) {
+          const char* n = getenv("SPU_TRACE_SKIP_RUNS");
+          const char* p = getenv("SPU_TRACE_ENTRY_PC");
+          s_skip = n && p ? strtol(n, 0, 0) : 0;
+          s_entry = p ? (uint32_t)strtoul(p, 0, 0) : 0;
+          if (s_skip < 0) s_skip = 0;
+      }
+      if (s_skip) {
+          if (pc == s_entry) t_run = InterlockedIncrement(&s_runs);
+          if (t_run <= s_skip) { s_trace_suppress = 1; return; }
+      } }
     s_trace_suppress = 0;
     if (s_trace_left < 0) {
         if (s_trace_left == -1) {

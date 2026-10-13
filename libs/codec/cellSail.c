@@ -19,6 +19,15 @@
 
 static int s_initialized = 0;
 
+static CellSailHostPlaybackCallback s_host_playback;
+static void* s_host_playback_user;
+void cellSail_set_host_playback_callback(CellSailHostPlaybackCallback callback,
+                                          void* user)
+{
+    s_host_playback = callback;
+    s_host_playback_user = user;
+}
+
 typedef struct {
     int in_use;
     s32 state;
@@ -31,8 +40,38 @@ static SailPlayer s_players[CELL_SAIL_PLAYER_MAX];
 /* Players registered by cellSailPlayerInitialize2, keyed by the guest struct EA
  * the title passed as `pSelf`. Declared here because the adapter setters below
  * need it -- they take that same pointer, not an index into s_players[]. */
-static struct { u32 self_ea, allocator_ea, callback_ea, arg_ea; int in_use; int state; }
+static struct {
+    u32 self_ea, allocator_ea, callback_ea, arg_ea;
+    int in_use, state;
+    s32 legacy_mode;
+    u32 max_audio, max_video, max_user, spurs_ea;
+    u64 parameters[36][2];
+    char uri[512];
+}
     s_sail_players[CELL_SAIL_PLAYER_MAX];
+
+/* Opaque sound/graphics adapters, retained without guessing guest layout. */
+static struct { u32 self, callbacks, arg; int graphics; } s_adapters[16];
+static int sail_adapter_slot(u32 self, int graphics)
+{
+    for (int i = 0; i < 16; i++)
+        if (s_adapters[i].self == self && self && s_adapters[i].graphics == graphics) return i;
+    return -1;
+}
+static s32 sail_adapter_init(u32 self, u32 callbacks, u32 arg, int graphics)
+{
+    if (!self || !callbacks) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    if (sail_adapter_slot(self, graphics) >= 0) return (s32)CELL_SAIL_ERROR_INVALID_STATE;
+    for (int i = 0; i < 16; i++) {
+        if (s_adapters[i].self) continue;
+        s_adapters[i].self = self;
+        s_adapters[i].callbacks = callbacks;
+        s_adapters[i].arg = arg;
+        s_adapters[i].graphics = graphics;
+        return CELL_OK;
+    }
+    return (s32)CELL_SAIL_ERROR_OUT_OF_MEMORY;
+}
 
 /* A CellSailPlayer is a GUEST POINTER, not a small integer handle.
  *
@@ -54,6 +93,13 @@ static int sail_player_slot(u32 self_ea)
         if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea)
             return i;
     return -1;
+}
+
+static void sail_host_playback(int slot, int started)
+{
+    if (slot >= 0 && s_host_playback)
+        s_host_playback(s_sail_players[slot].self_ea,
+                       s_sail_players[slot].uri, started, s_host_playback_user);
 }
 
 /* Lifecycle */
@@ -109,6 +155,7 @@ s32 cellSailPlayerDestroy(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_host_playback(_sp, 0);
     s_sail_players[_sp].in_use = 0;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_CLOSED;
     return CELL_OK;
@@ -195,6 +242,7 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_host_playback(_sp, 0);
     sail_call(_sp, SAIL_CALL_CLOSE_STREAM, SAIL_ST_CLOSE_TRANSITION, SAIL_ST_CLOSED);
     return CELL_OK;
 }
@@ -214,6 +262,7 @@ s32 cellSailPlayerStart(CellSailPlayerHandle handle)
      * movie (Midway's logo AVIs) watches for. */
     sail_notify(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_STOP_TRANSITION);
     sail_notify(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_OPENED);
+    sail_host_playback(_sp, 1);
     return CELL_OK;
 }
 
@@ -223,6 +272,7 @@ s32 cellSailPlayerStop(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_host_playback(_sp, 0);
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
     sail_call(_sp, SAIL_CALL_STOP, SAIL_ST_STOP_TRANSITION, SAIL_ST_OPENED);
     return CELL_OK;
@@ -313,6 +363,7 @@ s32 cellSailPlayerCancel(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_host_playback(_sp, 0);
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
     return CELL_OK;
 }
@@ -407,10 +458,13 @@ s32 cellSailPlayerDestroyDescriptor(CellSailPlayerHandle handle,
 s32 cellSailPlayerAddDescriptor(CellSailPlayerHandle handle,
                                   CellSailDescriptorHandle desc)
 {
-    (void)handle;
     printf("[cellSail] AddDescriptor(player=%u, desc=%u)\n", handle, desc);
-    if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
+    int slot = sail_player_slot(handle);
+    if (slot < 0 || desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use ||
+        s_descs[desc].player != handle)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    snprintf(s_sail_players[slot].uri, sizeof(s_sail_players[slot].uri),
+             "%s", s_descs[desc].uri);
     return CELL_OK;
 }
 
@@ -491,6 +545,75 @@ static void sail_zero_guest(u32 ea, u32 n)
     for (u32 i = 0; i < n; i += 4) vm_write32(ea + i, 0);
 }
 
+/* The deprecated API passes the attributes as scalars. Haze's lifted caller
+ * passes scalar selector 1, two audio streams, one video stream, no user streams and a
+ * null SPURS pointer in the ninth argument slot. Keep this ABI distinct from
+ * Initialize2: its second argument is a scalar, not an allocator pointer. Other
+ * legacy modes have not been validated and are rejected.
+ * This registers lifecycle bookkeeping only; media decoding is still absent.
+ * The player is opaque, so the old ABI does not clear an assumed struct size. */
+s32 cellSailPlayerInitialize(u32 pSelf, s32 legacyMode, u32 pAllocator,
+                            u32 pCallback, u32 pUserParam, u32 maxAudio,
+                            u32 maxVideo, u32 maxUser, u32 pSpurs)
+{
+    printf("[cellSail] PlayerInitialize(self=0x%08X mode=%d alloc=0x%08X cb=0x%08X audio=%u video=%u user=%u spurs=0x%08X) - lifecycle only\n",
+           pSelf, legacyMode, pAllocator, pCallback, maxAudio, maxVideo, maxUser, pSpurs);
+    if (!pSelf || !pAllocator || !pCallback || legacyMode != 1)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    if (getenv("PS3_NO_SAIL")) return (s32)CELL_SAIL_ERROR_NOT_SUPPORTED;
+    if (sail_player_slot(pSelf) >= 0) return (s32)CELL_SAIL_ERROR_INVALID_STATE;
+    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++) {
+        if (s_sail_players[i].in_use) continue;
+        memset(&s_sail_players[i], 0, sizeof s_sail_players[i]);
+        s_sail_players[i].in_use = 1;
+        s_sail_players[i].self_ea = pSelf;
+        s_sail_players[i].allocator_ea = pAllocator;
+        s_sail_players[i].callback_ea = pCallback;
+        s_sail_players[i].arg_ea = pUserParam;
+        s_sail_players[i].legacy_mode = legacyMode;
+        s_sail_players[i].max_audio = maxAudio;
+        s_sail_players[i].max_video = maxVideo;
+        s_sail_players[i].max_user = maxUser;
+        s_sail_players[i].spurs_ea = pSpurs;
+        s_sail_players[i].state = CELL_SAIL_PLAYER_STATE_INITIALIZED;
+        sail_notify(i, SAIL_EV_STATE_CHANGED, 0, 0); /* SDK INITIALIZED */
+        return CELL_OK;
+    }
+    return (s32)CELL_SAIL_ERROR_OUT_OF_MEMORY;
+}
+
+s32 cellSailPlayerFinalize(u32 pSelf)
+{
+    int slot = sail_player_slot(pSelf);
+    if (slot < 0) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_host_playback(slot, 0);
+    memset(&s_sail_players[slot], 0, sizeof s_sail_players[slot]);
+    return CELL_OK;
+}
+
+s32 cellSailPlayerSetParameter(u32 pSelf, s32 type, u64 param0, u64 param1)
+{
+    int slot = sail_player_slot(pSelf);
+    if (slot < 0 || type < 0 || type >= 36 || type == 30 || type == 31)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    s_sail_players[slot].parameters[type][0] = param0;
+    s_sail_players[slot].parameters[type][1] = param1;
+    printf("[cellSail] PlayerSetParameter(self=0x%08X type=%d values=0x%llX,0x%llX)\n",
+           pSelf, type, (unsigned long long)param0, (unsigned long long)param1);
+    return CELL_OK;
+}
+
+s32 cellSailPlayerGetParameter(u32 pSelf, s32 type, u32 pParam0, u32 pParam1)
+{
+    int slot = sail_player_slot(pSelf);
+    if (slot < 0 || type < 0 || type >= 36 || type == 30 || type == 31 ||
+        !pParam0 || !pParam1 || pParam0 > UINT32_MAX - 7 || pParam1 > UINT32_MAX - 7)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    vm_write64(pParam0, s_sail_players[slot].parameters[type][0]);
+    vm_write64(pParam1, s_sail_players[slot].parameters[type][1]);
+    return CELL_OK;
+}
+
 s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
                               u32 pUserParam, u32 pAttribute, u32 pResource)
 {
@@ -530,9 +653,7 @@ s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
 {
     printf("[cellSail] SoundAdapterInitialize(self=0x%08X funcs=0x%08X)\n",
            pSelf, pCallbacks);
-    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    sail_zero_guest(pSelf, SAIL_ADAPTER_CLEAR);
-    return CELL_OK;
+    return sail_adapter_init(pSelf, pCallbacks, pArg, 0);
 }
 
 /* cellSailGraphicsAdapterInitialize(pSelf, pCallbacks, pArg)
@@ -547,9 +668,50 @@ s32 cellSailGraphicsAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
     (void)pArg;
     printf("[cellSail] GraphicsAdapterInitialize(self=0x%08X funcs=0x%08X)\n",
            pSelf, pCallbacks);
-    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    sail_zero_guest(pSelf, SAIL_ADAPTER_CLEAR);
+    return sail_adapter_init(pSelf, pCallbacks, pArg, 1);
+}
+
+s32 cellSailSoundAdapterFinalize(u32 pSelf)
+{
+    int slot = sail_adapter_slot(pSelf, 0);
+    if (slot < 0) return (s32)CELL_SAIL_ERROR_INVALID_STATE;
+    memset(&s_adapters[slot], 0, sizeof s_adapters[slot]);
     return CELL_OK;
+}
+
+s32 cellSailGraphicsAdapterFinalize(u32 pSelf)
+{
+    int slot = sail_adapter_slot(pSelf, 1);
+    if (slot < 0) return (s32)CELL_SAIL_ERROR_INVALID_STATE;
+    memset(&s_adapters[slot], 0, sizeof s_adapters[slot]);
+    return CELL_OK;
+}
+
+/* There is no decoder yet. Return a defined empty frame, never stale guest
+ * stack words interpreted as a decoded frame pointer. Haze ignores the error
+ * return and examines pInfo->pBuffer, making initialization essential. */
+s32 cellSailGraphicsAdapterGetFrame2(u32 pSelf, u32 pInfo, u32 pPrevInfo,
+                                   u32 pFlipTime, u64 flags)
+{
+    (void)flags;
+    if (sail_adapter_slot(pSelf, 1) < 0) return (s32)CELL_SAIL_ERROR_INVALID_STATE;
+    if (!pInfo || pInfo > UINT32_MAX - 23 ||
+        (pPrevInfo && pPrevInfo > UINT32_MAX - 23) ||
+        (pFlipTime && pFlipTime > UINT32_MAX - 7))
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_zero_guest(pInfo, 24);
+    if (pPrevInfo) sail_zero_guest(pPrevInfo, 24);
+    if (pFlipTime) vm_write64(pFlipTime, 0);
+    return (s32)CELL_SAIL_ERROR_EMPTY;
+}
+
+s32 cellSailSoundAdapterGetFrame(u32 pSelf, u32 samples, u32 pInfo)
+{
+    if (sail_adapter_slot(pSelf, 0) < 0) return (s32)CELL_SAIL_ERROR_INVALID_STATE;
+    if (!pInfo || pInfo > UINT32_MAX - 23 || samples > 2048)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_zero_guest(pInfo, 24);
+    return (s32)CELL_SAIL_ERROR_EMPTY;
 }
 
 /* cellSailGraphicsAdapterSetPreferredFormat(pSelf, pFormat)

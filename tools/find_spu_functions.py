@@ -77,7 +77,7 @@ def parse_elf(buf):
         off = e_phoff + i * e_phentsize
         p_type, p_off, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align = \
             struct.unpack_from(">IIIIIIII", buf, off)
-        phs.append(dict(type=p_type, off=p_off, vaddr=p_vaddr, filesz=p_filesz,
+        phs.append(dict(type=p_type, off=p_off, vaddr=p_vaddr, paddr=p_paddr, filesz=p_filesz,
                         memsz=p_memsz, flags=p_flags))
 
     # Section headers (Elf32_Shdr = 40 bytes)
@@ -137,11 +137,25 @@ def read_symbols(buf, shs):
     return funcs
 
 
-def pick_text(phs):
-    """Return (file_off, vaddr, size) of the executable PT_LOAD segment."""
-    for ph in phs:
-        if ph["type"] == 1 and (ph["flags"] & 1):     # PT_LOAD + PF_X
-            return ph["off"], ph["vaddr"], ph["filesz"]
+def pick_text(phs, entry=None):
+    """Return the file-backed executable PT_LOAD containing the ELF entry.
+
+    Multi-segment SPU ELFs may place a small executable table before the real
+    startup code. Selecting the first PF_X segment can then omit the entry
+    entirely. This selects the resident entry segment; it does not implement
+    overlay switching or merge other executable segments.
+
+    Callers without an entry retain the original first-segment behavior.
+    """
+    executable = [ph for ph in phs
+                  if ph["type"] == 1 and (ph["flags"] & 1) and ph["filesz"]]
+    if entry is not None:
+        for ph in executable:
+            if ph["vaddr"] <= entry < ph["vaddr"] + ph["filesz"]:
+                return ph["off"], ph["vaddr"], ph["filesz"]
+        raise SystemExit(f"SPU entry 0x{entry:X} is not in a file-backed executable PT_LOAD segment")
+    for ph in executable:
+        return ph["off"], ph["vaddr"], ph["filesz"]
     raise SystemExit("No executable PT_LOAD segment found")
 
 
@@ -579,7 +593,28 @@ def find_end(start, insns_by_addr, sorted_starts, code_end):
     return min(next_start, code_end)
 
 
-def detect_functions(buf, base_override=None, verbose=True, raw=False):
+def collect_lifecycle_targets(buf, shs):
+    """ELF constructor/destructor arrays may contain a single indirect callee.
+
+    Unlike heuristic pointer tables, named lifecycle sections are authoritative
+    even when there is only one entry between the CRT's sentinel words.
+    The caller filters addresses against the selected executable segment.
+    """
+    targets = set()
+    for sh in shs:
+        if sh.get("name") not in (".ctors", ".dtors", ".init_array", ".fini_array"):
+            continue
+        off, size = sh["off"], sh["size"]
+        if off < 0 or size % 4 or off + size > len(buf):
+            continue
+        for pos in range(off, off + size, 4):
+            addr = be_u32(buf, pos)
+            if addr not in (0, 0xFFFFFFFF):
+                targets.add(addr)
+    return targets
+
+
+def detect_functions(buf, base_override=None, verbose=True, raw=False, segment_index=None):
     if raw:
         # A raw local-store image: a SPURS job binary, which the title loads
         # from its own data files as a flat code+data blob rather than as an
@@ -595,7 +630,15 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
         text_off, text_va, text_size = 0, base, len(buf)
     else:
         elf = parse_elf(buf)
-        text_off, text_va, text_size = pick_text(elf["phs"])
+        if segment_index is None:
+            text_off, text_va, text_size = pick_text(elf["phs"], elf["entry"])
+        else:
+            if not 0 <= segment_index < len(elf["phs"]):
+                raise ValueError("SPU program-header index is out of range")
+            ph = elf["phs"][segment_index]
+            if ph["type"] != 1 or not ph["filesz"] or ph["off"] + ph["filesz"] > len(buf):
+                raise ValueError("SPU segment must be a complete file-backed PT_LOAD")
+            text_off, text_va, text_size = ph["off"], ph["vaddr"], ph["filesz"]
     code = buf[text_off:text_off + text_size]
     base = base_override if base_override is not None else text_va
     insns = disassemble_spu(code, base_addr=base)
@@ -619,6 +662,21 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
     for t in collect_branch_targets(insns):
         if code_start <= t < code_end:
             seed_starts.add(t)
+    # Resident code can call an overlay entry which has no callers inside the
+    # overlay itself. Scan the other executable segments at their original LS
+    # addresses, then map targets into this segment's optional relocated base.
+    if not raw:
+        for ph in elf["phs"]:
+            if (ph["type"] != 1 or not (ph["flags"] & 1) or not ph["filesz"]
+                    or ph["off"] == text_off
+                    or ph["off"] + ph["filesz"] > len(buf)):
+                continue
+            other = disassemble_spu(buf[ph["off"]:ph["off"] + ph["filesz"]],
+                                    base_addr=ph["vaddr"])
+            for target in collect_branch_targets(other):
+                t = target + base - text_va
+                if code_start <= t < code_end and t in insns_by_addr:
+                    seed_starts.add(t)
     # Link-register resume addresses (`il`/`ila $r0, <code>` + a plain branch to
     # a stub that returns via `bi $r0`). Require the target to be 4-byte aligned
     # AND to decode as an instruction, so a scratch use of $r0 that happens to
@@ -630,7 +688,8 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
               | collect_jump_table_targets(insns, code, code_start, code_end)
               | collect_ila_continuation_targets(insns, code_start, code_end)
               | collect_duff_targets(insns, code_start, code_end)
-              | fptr_targets):
+              | fptr_targets
+              | collect_lifecycle_targets(buf, elf["shs"])):
         if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
             seed_starts.add(t)
     if fptr_targets and verbose:
