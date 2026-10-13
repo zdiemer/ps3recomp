@@ -68,6 +68,9 @@ typedef struct CellAudioOutConfiguration {
     u32 downMixer;
 } CellAudioOutConfiguration;
 
+/* Host stereo mixer routing selected by the guest's primary output. */
+u32 ps3_audio_out_downmixer(void);
+
 /* ---------------------------------------------------------------------------
  * Functions
  * -----------------------------------------------------------------------*/
