@@ -14,6 +14,7 @@
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
 #include "cellAudio.h"
+#include "../misc/cellAvconfExt.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
 #include <string.h>
@@ -434,6 +435,7 @@ static inline float ld_be_f32(const float* p)
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
 static void audio_mix_one_block(void)
 {
+    const u32 downmixer = ps3_audio_out_downmixer();
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
 
     mutex_lock(&s_audio_mutex);
@@ -475,8 +477,8 @@ static void audio_mix_one_block(void)
          * vs which block the read cursor is on -- distinguishes "writer never
          * writes" from "writer and reader cycle out of phase". */
         { static int s_pk = -1; if (s_pk < 0) s_pk = getenv("AUDIO_PEAK") ? 1 : 0;
-          if (s_pk) { static _Thread_local unsigned _c;
-            if ((++_c % 400) == 0) {
+          if (s_pk) { static _Thread_local unsigned _c[CELL_AUDIO_PORT_MAX];
+            if ((++_c[p] % 400) == 0) {
                 char map[36]; u32 b;
                 for (b = 0; b < nblock && b < 32; b++) {
                     const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
@@ -500,16 +502,17 @@ static void audio_mix_one_block(void)
                 left = right = ld_be_f32(&src[s]) * level;
             }
 
-            /* If 7.1, mix center and other channels into stereo */
-            if (nch == 8) {
-                float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
-                float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * 0.5f;
-                float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
-                float rr     = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
-                float sl     = ld_be_f32(&src[s * 8 + 6]) * level * 0.3f;
-                float sr     = ld_be_f32(&src[s * 8 + 7]) * level * 0.3f;
-                left  += center + lfe + rl + sl;
-                right += center + lfe + rr + sr;
+            /* Type A folds surround into stereo without LFE. With NONE (or
+             * type B's six-channel routing), only front L/R reach this stereo
+             * output; the other port channels must not be added again. */
+            if (nch == 8 && downmixer == 1) {
+                float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.5f;
+                float sl = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
+                float sr = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
+                float rl = ld_be_f32(&src[s * 8 + 6]) * level * 0.5f;
+                float rr = ld_be_f32(&src[s * 8 + 7]) * level * 0.5f;
+                left = left * 0.707f + center + sl + rl;
+                right = right * 0.707f + center + sr + rr;
             }
 
             s_mix_buffer[s * 2 + 0] += left;

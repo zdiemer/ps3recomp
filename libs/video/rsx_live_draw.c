@@ -24,6 +24,17 @@
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 
+static rsx_live_texture_revision_fn g_texture_revision;
+static rsx_live_texture_pixels_fn g_texture_pixels;
+static void* g_texture_override_user;
+void rsx_live_draw_set_texture_override(rsx_live_texture_revision_fn revision,
+    rsx_live_texture_pixels_fn pixels, void* user)
+{
+    g_texture_revision=revision;
+    g_texture_pixels=pixels;
+    g_texture_override_user=user;
+}
+
 #if !defined(_WIN32)
 
 /* Non-Windows: the whole path is a no-op (D3D12 is Windows-only). */
@@ -299,6 +310,8 @@ typedef struct {
     ID3D12Resource* tex;
     u64 content_hash;
     unsigned content_hash_kind;
+    u64 override_revision;
+    int override_rgba;
     u32 last_hash_frame;
     u64 last_use_serial;
 } texcache_t;
@@ -2195,7 +2208,20 @@ typedef struct { u32 w, h; const u8* data; u32 row_bytes, rows; } tex_level_t;
 
 static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t* lv, u32 n)
 {
-    if (n == 0) return NULL;
+    if (n == 0 || n > 14) return NULL;
+    /* Reject incomplete uploads before creating a resource or recording copy
+     * commands. Cached entries must represent every requested mip. */
+    if (g.upload_used > UPLOAD_SIZE) return NULL;
+    u64 upload_end = g.upload_used;
+    for (u32 m = 0; m < n; ++m) {
+        if (!lv[m].data || !lv[m].w || !lv[m].h || !lv[m].row_bytes || !lv[m].rows)
+            return NULL;
+        const u64 pitch = ((u64)lv[m].row_bytes + 255) & ~255ull;
+        upload_end = (upload_end + 511) & ~511ull;
+        if (upload_end > UPLOAD_SIZE || lv[m].rows > (UPLOAD_SIZE - upload_end) / pitch)
+            return NULL;
+        upload_end += pitch * lv[m].rows;
+    }
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -2209,7 +2235,6 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     for (u32 m = 0; m < n; m++) {
         const u32 pitch = (lv[m].row_bytes + 255) & ~255u;
         const u32 start = (g.upload_used + 511) & ~511u;
-        if ((u64)start + (u64)pitch * lv[m].rows > UPLOAD_SIZE) break;
         for (u32 y = 0; y < lv[m].rows; y++)
             memcpy(g.upload_mapped + start + (size_t)y * pitch,
                    lv[m].data + (size_t)y * lv[m].row_bytes, lv[m].row_bytes);
@@ -2239,6 +2264,8 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
     return tex;
 }
+
+#include "rsx_texture_content_cache.h"
 
 /* Cubemap faces are stored face-major in guest memory. D3D12 subresources use
  * that same order: face * mip_count + mip. */
@@ -2524,7 +2551,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
             mw = mw > 1 ? mw >> 1 : 1;
             mh = mh > 1 ? mh >> 1 : 1;
         }
-        return create_texture_mipped(dxgi, levels, n);
+        return create_texture_mipped_cached(dxgi, levels, n);
     }
 
     u32 texel_size;
@@ -2699,14 +2726,35 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
     return resource;
 }
 
+static u64 texture_override_revision(const rsx_dsp_texture* t)
+{
+    const u32 base_fmt=t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+    if (!g_texture_revision || !g_texture_pixels || t->cubemap ||
+        t->dimension!=2 || t->mipmaps>1 || !t->width || !t->height ||
+        t->width>4096 || t->height>4096 || (base_fmt>=0x90 && base_fmt<=0x93)) return 0;
+    return g_texture_revision(t->format,t->width,t->height,g_texture_override_user);
+}
+
 static ID3D12Resource* decode_guest_texture_profiled(
-    const rsx_dsp_texture* texture, u32 remap)
+    const rsx_dsp_texture* texture, u32 remap, int* override_rgba)
 {
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG begin = ld_profile_qpc();
     g_ld_profile.total.texture_decode_calls++;
 #endif
-    ID3D12Resource* result = decode_guest_texture(texture, remap);
+    *override_rgba=0;
+    ID3D12Resource* result = NULL;
+    if (texture_override_revision(texture)) {
+        const u32 bytes=texture_source_span(texture);
+        const u8* source=guest_ptr(texture->location,texture->offset,bytes);
+        const u8* pixels=source ? g_texture_pixels(texture->format,
+            texture->width,texture->height,source,bytes,g_texture_override_user) : NULL;
+        if (pixels) {
+            result=create_texture_rgba(pixels,texture->width,texture->height);
+            if (result) *override_rgba=1;
+        }
+    }
+    if (!result) result = decode_guest_texture(texture, remap);
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.texture_decode_qpc +=
         (u64)(ld_profile_qpc() - begin);
@@ -2744,7 +2792,7 @@ static void write_texture_srv(u32 index, const texcache_t* entry)
         desc.TextureCube.MipLevels = (UINT)-1;
         g.dev->lpVtbl->CreateShaderResourceView(
             g.dev, entry->tex, &desc, srv_cpu(SRV_TEXTURE_BASE + index));
-    } else if (compressed && entry->remap != 0xAAE4) {
+    } else if ((compressed || entry->override_rgba) && entry->remap != 0xAAE4) {
         static const u32 sel2d3d[4] = { 3, 0, 1, 2 };
         static const u32 out2comp[4] = { 1, 2, 3, 0 };
         u32 mapping[4];
@@ -2755,7 +2803,8 @@ static void write_texture_srv(u32 index, const texcache_t* entry)
             mapping[out] = op == 0 ? 4 : op == 1 ? 5 : sel2d3d[sel];
         }
         D3D12_SHADER_RESOURCE_VIEW_DESC desc = {0};
-        desc.Format = base_fmt == TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
+        desc.Format = entry->override_rgba ? DXGI_FORMAT_R8G8B8A8_UNORM
+                    : base_fmt == TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
                     : base_fmt == TEX_FMT_DXT23 ? DXGI_FORMAT_BC2_UNORM
                                                 : DXGI_FORMAT_BC3_UNORM;
         desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -2820,6 +2869,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         refresh_enabled = getenv("RSX_NO_TEX_REFRESH") ? 0 : 1;
 
     const u32 bucket = texture_cache_bucket(t);
+    const u64 override_revision=texture_override_revision(t);
     const u32 i = texture_cache_find(t, bucket);
     if (i != UINT32_MAX) {
         texcache_t* entry = &g.textures[i];
@@ -2828,16 +2878,18 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
          * scan and decode attempt at every binding of an unsupported format. */
         if (!entry->tex && entry->last_hash_frame != g_ld_frames) {
             entry->last_hash_frame=g_ld_frames;
-            entry->tex=decode_guest_texture_profiled(t,remap);
+            entry->tex=decode_guest_texture_profiled(t,remap,&entry->override_rgba);
             if (entry->tex) {
+                entry->override_revision=override_revision;
                 int readable=0;
                 entry->content_hash=texture_content_hash(t,&readable);
                 entry->content_hash_kind=texture_hash_kind();
                 write_texture_srv(i,entry);
             } else ++g_ld_texture_decode_fail;
         }
-        if (refresh_enabled && entry->tex &&
-            entry->last_hash_frame != g_ld_frames) {
+        const int override_changed=entry->override_revision!=override_revision;
+        if ((refresh_enabled || override_changed) && entry->tex &&
+            (entry->last_hash_frame != g_ld_frames || override_changed)) {
             int readable = 0;
             const u64 hash = texture_content_hash(t, &readable);
             const int hash_changed = texture_cached_content_changed(entry,t,hash,&readable);
@@ -2886,12 +2938,15 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                               t->pitch);
               } }
             entry->last_hash_frame = g_ld_frames;
-            if (hash_changed) {
+            if (hash_changed || override_changed) {
+                int override_rgba=0;
                 ID3D12Resource* replacement =
-                    decode_guest_texture_profiled(t, remap);
+                    decode_guest_texture_profiled(t, remap, &override_rgba);
                 if (replacement) {
                     ID3D12Resource* old = entry->tex;
                     entry->tex = replacement;
+                    entry->override_rgba=override_rgba;
+                    entry->override_revision=override_revision;
                     entry->content_hash = hash;
                     entry->content_hash_kind = texture_hash_kind();
                     write_texture_srv(i, entry);
@@ -2960,7 +3015,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         replacement.content_hash = texture_content_hash(t, &readable);
         replacement.content_hash_kind = texture_hash_kind();
     }
-    replacement.tex = decode_guest_texture_profiled(t, remap);
+    replacement.tex = decode_guest_texture_profiled(t, remap, &replacement.override_rgba);
+    replacement.override_revision=override_revision;
     /* Commit negative entries even when full. Previously this branch kept the
      * old LRU entry on failure, so the same descriptor missed forever. */
     texcache_t* entry = &g.textures[index];
@@ -10916,13 +10972,14 @@ void rsx_live_draw_present(u32 buffer_id)
 
 void rsx_live_draw_shutdown(void)
 {
-    if (!g.ready) return;
+    if (!g.ready) { ld_texture_content_clear(); return; }
     rsx_vertex_payload_cache_clear(&g_ld_vertex_cache);
     ld_vertex_diag_emit("shutdown", 1);
     ld_present_measure_dump();
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
+    ld_texture_content_clear();
     rsx_frame_limiter_destroy(&g_ld_frame_limiter);
 #if defined(YZ_PERF_PROFILE)
     fprintf(stderr,
