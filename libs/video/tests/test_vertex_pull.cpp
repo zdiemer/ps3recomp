@@ -35,7 +35,7 @@ int main(int argc,char**) try {
     ComPtr<ID3D11Buffer> readback;checked(device->CreateBuffer(&d,nullptr,&readback));
     rsx_vertex_pull_payload packet={};unsigned comparisons=0;
     for(unsigned size=1;size<=4;++size)for(unsigned alignment=0;alignment<4;++alignment)
-    for(unsigned variant=0;variant<3;++variant){
+    for(unsigned variant=0;variant<4;++variant){
         std::vector<u8> bytes(128*160+32);u32 random=0x31415926u+size+alignment+variant;
         for(auto& b:bytes){random^=random<<13;random^=random>>17;random^=random<<5;b=(u8)random;}
         // Include half zeros, subnormals, infinities and NaNs in both signs.
@@ -44,7 +44,9 @@ int main(int argc,char**) try {
         rsx_vertex_fetch_plan plan={};rsx_vertex_layout_plan_init(&plan.layout,255);
         rsx_vertex_ref refs[128];
         const u32 first=variant==1?37:0;
-        for(u32 i=0;i<128;++i){const u32 index=first+(i*37)%128;refs[i].base_index=variant?0xFFFF0u:0;refs[i].vertex_id=(index-refs[i].base_index)&0xFFFFFu;}
+        // The occurrence path must decode repeated source vertices identically,
+        // including a nonzero base and wrapped effective index arithmetic.
+        for(u32 i=0;i<128;++i){const u32 index=first+(variant==3?(i%17)*7:(i*37)%128);refs[i].base_index=variant?0xFFFF0u:0;refs[i].vertex_id=(index-refs[i].base_index)&0xFFFFFu;}
         for(u32 attr=0;attr<8;++attr){
             auto& f=plan.attr[attr];f.default_value[0]=.25f;f.default_value[1]=-2;f.default_value[2]=3;f.default_value[3]=1;
             if(attr==7 || (variant==2 && attr==3))continue;
