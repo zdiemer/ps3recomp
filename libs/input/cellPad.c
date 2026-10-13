@@ -11,6 +11,7 @@
  */
 
 #include <time.h>
+#include <ctype.h>
 #include "cellPad.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -691,6 +692,7 @@ skip_inject: ;
      *   echo 0x0040 4 > pad.txt  # DOWN for 4 polls (menus auto-repeat a
      *                            # long hold; the default is 40)
      */
+    /* BEGIN PAD_FILE COMMAND BLOCK */
     { static int s_pf = -1; static char pf_path[512];
       static unsigned held_mask = 0; static int held_n = 0;
       static unsigned char held_sticks[4]; static int stick_n = 0;
@@ -704,7 +706,17 @@ skip_inject: ;
                   char buf[128]; buf[0] = 0;
                   if (fgets(buf, sizeof buf, f)) {
                     int a,b,c,d,n;
-                    if (sscanf(buf, "sticks %d %d %d %d %d", &a,&b,&c,&d,&n) == 5) {
+                    const unsigned char* command = (const unsigned char*)buf;
+                    while (*command && isspace(*command)) command++;
+                    const unsigned char* command_end = command + strlen((const char*)command);
+                    while (command_end > command && isspace(command_end[-1])) command_end--;
+                    if ((size_t)(command_end - command) == 6 &&
+                        memcmp(command, "detach", 6) == 0) {
+                      s_pf = 0;
+                      held_mask = 0; held_n = 0;
+                      memset(held_sticks, 0, sizeof held_sticks); stick_n = 0;
+                      printf("[cellPad] PAD_FILE detached\n"); fflush(stdout);
+                    } else if (sscanf(buf, "sticks %d %d %d %d %d", &a,&b,&c,&d,&n) == 5) {
                       if ((unsigned)a <= 255 && (unsigned)b <= 255 &&
                           (unsigned)c <= 255 && (unsigned)d <= 255 && n > 0 && n <= 10000) {
                         held_sticks[0]=(u8)a; held_sticks[1]=(u8)b;
@@ -731,6 +743,7 @@ skip_inject: ;
               hs->analog_lx = held_sticks[0]; hs->analog_ly = held_sticks[1];
               hs->analog_rx = held_sticks[2]; hs->analog_ry = held_sticks[3]; }
       } }
+    /* END PAD_FILE COMMAND BLOCK */
 
     /* Analog sticks */
     /* PAD_STICK="lx,ly,rx,ry" (0-255, 128 = centred): hold the analog sticks at
