@@ -61,6 +61,20 @@ void rsx_live_draw_set_shadow_reference(u32 size);
  * RSX_TEXTURE_WRITE_WATCH_VALIDATE=1 checks proposed skips against full hashes. */
 int rsx_live_draw_set_texture_write_watch(void* base, size_t bytes);
 
+/* Optional title-owned replacement for non-cubemap, single-level color
+ * textures. Register before init. Both callbacks run on the render consumer.
+ * revision must be cheap; changing it refreshes a cached resource even when
+ * guest bytes are unchanged. Return zero for descriptors of no interest.
+ * pixels receives bounded original source bytes and returns canonical RGBA8
+ * at the original extent, or NULL to retain the guest texture. The returned
+ * memory must remain valid until the callback's caller returns. Guest channel
+ * remapping is preserved. Render-target/depth aliases bypass this path. */
+typedef u64 (*rsx_live_texture_revision_fn)(u32 format, u32 width, u32 height, void* user);
+typedef const u8* (*rsx_live_texture_pixels_fn)(u32 format, u32 width, u32 height,
+    const u8* source, size_t source_bytes, void* user);
+void rsx_live_draw_set_texture_override(rsx_live_texture_revision_fn revision,
+    rsx_live_texture_pixels_fn pixels, void* user);
+
 /* Bring up the D3D12 device + swap chain bound to an existing HWND (the
  * runtime already opens the present window). Returns 0 on success. Safe to
  * call when disabled (returns 0 and stays inert). `hwnd` is an HWND cast to
