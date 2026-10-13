@@ -1643,6 +1643,116 @@ static void gcm_ref_publish_one(void)
 static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
 static void gcm_rsx_process_fifo_unlocked(void);
 
+/* BEGIN GCM SLOW DRAIN DIAGNOSTIC */
+/* Slow-drain diagnostics are deliberately outside the per-method walker. The
+ * ring is only updated for calls whose total wall time exceeds 2 ms, and CSV
+ * I/O occurs only from the explicit shutdown dump. */
+#ifdef _WIN32
+#define GCM_SLOW_DRAIN_CAP 16384u
+typedef struct gcm_slow_drain_event {
+    u64 qpc_begin, qpc_lock_acquired, qpc_body_end;
+    u64 thread_cycles_begin, thread_cycles_end;
+    u64 drain_sequence;
+    u32 thread_cycles_valid, host_tid, renderer_frame, context_valid;
+    u32 get_before, put_before, get_after, put_after;
+} gcm_slow_drain_event;
+
+static INIT_ONCE s_gcm_slow_drain_once = INIT_ONCE_STATIC_INIT;
+static const char* s_gcm_slow_drain_path;
+static u64 s_gcm_slow_drain_frequency;
+static SRWLOCK s_gcm_slow_drain_lock = SRWLOCK_INIT;
+static gcm_slow_drain_event s_gcm_slow_drain_events[GCM_SLOW_DRAIN_CAP];
+static u64 s_gcm_slow_drain_next, s_gcm_slow_drain_count;
+static u64 s_gcm_slow_drain_overwritten;
+static u64 s_gcm_slow_drain_sequence;
+static int s_gcm_slow_drain_dumped;
+
+static BOOL CALLBACK gcm_slow_drain_init(PINIT_ONCE once, PVOID param, PVOID* context)
+{
+    (void)once; (void)param; (void)context;
+    s_gcm_slow_drain_path=getenv("GCM_SLOW_DRAIN_CSV");
+    if (s_gcm_slow_drain_path && *s_gcm_slow_drain_path) {
+        LARGE_INTEGER frequency;
+        if (QueryPerformanceFrequency(&frequency) && frequency.QuadPart>0)
+            s_gcm_slow_drain_frequency=(u64)frequency.QuadPart;
+        else {
+            fprintf(stderr,"[slow-fifo-drain] QPC frequency unavailable; diagnostic disabled\n");
+            s_gcm_slow_drain_path=NULL;
+        }
+    } else s_gcm_slow_drain_path=NULL;
+    return TRUE;
+}
+
+static u64 gcm_slow_drain_qpc(void)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (u64)now.QuadPart;
+}
+
+static u64 gcm_slow_drain_thread_cycles(u32* valid)
+{
+    ULONG64 cycles=0;
+    *valid=QueryThreadCycleTime(GetCurrentThread(),&cycles)!=0;
+    return *valid ? (u64)cycles : 0;
+}
+
+void cellGcm_fifo_slow_drain_dump(void)
+{
+    InitOnceExecuteOnce(&s_gcm_slow_drain_once,gcm_slow_drain_init,NULL,NULL);
+    if (!s_gcm_slow_drain_path || !s_gcm_slow_drain_frequency) return;
+    AcquireSRWLockExclusive(&s_gcm_slow_drain_lock);
+    if (s_gcm_slow_drain_dumped) {
+        ReleaseSRWLockExclusive(&s_gcm_slow_drain_lock);
+        return;
+    }
+    FILE* file=fopen(s_gcm_slow_drain_path,"wb");
+    if (!file) {
+        fprintf(stderr,"[slow-fifo-drain] cannot open %s\n",s_gcm_slow_drain_path);
+        ReleaseSRWLockExclusive(&s_gcm_slow_drain_lock);
+        return;
+    }
+    int io_error=0;
+    if (fprintf(file,"#qpc_frequency,%llu,recorded,%llu,overwritten,%llu\n",
+        (unsigned long long)s_gcm_slow_drain_frequency,
+        (unsigned long long)(s_gcm_slow_drain_count+s_gcm_slow_drain_overwritten),
+        (unsigned long long)s_gcm_slow_drain_overwritten)<0) io_error=1;
+    if (fprintf(file,"sequence,host_tid,renderer_frame,context_valid,qpc_begin,qpc_lock_acquired,qpc_body_end,total_ms,lock_wait_ms,body_ms,thread_cycles_valid,thread_cycles_delta,get_before,put_before,get_after,put_after\n")<0)
+        io_error=1;
+    const u64 retained=s_gcm_slow_drain_count<GCM_SLOW_DRAIN_CAP
+        ? s_gcm_slow_drain_count : GCM_SLOW_DRAIN_CAP;
+    const u64 first=s_gcm_slow_drain_count<GCM_SLOW_DRAIN_CAP
+        ? 0 : s_gcm_slow_drain_next;
+    const double scale=1000.0/(double)s_gcm_slow_drain_frequency;
+    for (u64 i=0;i<retained;++i) {
+        const gcm_slow_drain_event* e=
+            &s_gcm_slow_drain_events[(first+i)%GCM_SLOW_DRAIN_CAP];
+        const u64 total=e->qpc_body_end-e->qpc_begin;
+        const u64 lock=e->qpc_lock_acquired-e->qpc_begin;
+        const u64 body=e->qpc_body_end-e->qpc_lock_acquired;
+        if (fprintf(file,"%llu,%u,%u,%u,%llu,%llu,%llu,%.6f,%.6f,%.6f,%u,%llu,0x%08X,0x%08X,0x%08X,0x%08X\n",
+            (unsigned long long)e->drain_sequence,e->host_tid,e->renderer_frame,e->context_valid,
+            (unsigned long long)e->qpc_begin,
+            (unsigned long long)e->qpc_lock_acquired,
+            (unsigned long long)e->qpc_body_end,total*scale,lock*scale,body*scale,
+            e->thread_cycles_valid,
+            (unsigned long long)(e->thread_cycles_valid && e->thread_cycles_end>=e->thread_cycles_begin
+                ? e->thread_cycles_end-e->thread_cycles_begin : 0),
+            e->get_before,e->put_before,e->get_after,e->put_after)<0)
+            io_error=1;
+    }
+    if (ferror(file)) io_error=1;
+    if (fclose(file)!=0) io_error=1;
+    if (io_error)
+        fprintf(stderr,"[slow-fifo-drain] write failed for %s\n",s_gcm_slow_drain_path);
+    else s_gcm_slow_drain_dumped=1;
+    ReleaseSRWLockExclusive(&s_gcm_slow_drain_lock);
+}
+#else
+void cellGcm_fifo_slow_drain_dump(void) {}
+#endif
+/* END GCM SLOW DRAIN DIAGNOSTIC */
+
 /* Kick event: a game thread whose fence wait finds the queue DRY signals the
  * present thread to run the FIFO walker NOW instead of on its next 16 ms
  * tick. A movie frame issues ~46 one-ahead cellGcmFinish waits; paying a
@@ -1713,12 +1823,64 @@ void cellGcm_ref_on_poll(void)
         SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
 }
 
+/* BEGIN GCM SLOW DRAIN WRAPPER */
 void cellGcm_rsx_process_fifo(void)
 {
+#ifdef _WIN32
+    InitOnceExecuteOnce(&s_gcm_slow_drain_once,gcm_slow_drain_init,NULL,NULL);
+    if (s_gcm_slow_drain_path && s_gcm_slow_drain_frequency) {
+        u32 cycles_begin_valid=0, cycles_end_valid=0;
+        const u64 cycles_begin=gcm_slow_drain_thread_cycles(&cycles_begin_valid);
+        const u32 host_tid=GetCurrentThreadId();
+        /* Keep QPC immediately adjacent to AcquireSRWLock: lock_wait_ms should
+         * measure contention rather than diagnostic setup. Pointer/frame
+         * snapshots are intentionally included in body_ms below. */
+        const u64 begin=gcm_slow_drain_qpc();
+        AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+        const u64 acquired=gcm_slow_drain_qpc();
+        const u64 drain_sequence=++s_gcm_slow_drain_sequence;
+        const u32 context_valid=s_gcm_context_ea || s_gcm_syscall_mode;
+        const u32 get_before=s_fifo_getoff;
+        const u32 put_before=context_valid ? vm_read32(GCM_CONTROL_GUEST_ADDR) : 0;
+        const u32 renderer_frame=rsx_live_draw_get_frames();
+        gcm_rsx_process_fifo_unlocked();
+        const u32 get_after=s_fifo_getoff;
+        const u32 put_after=context_valid ? vm_read32(GCM_CONTROL_GUEST_ADDR) : 0;
+        /* Body duration intentionally includes these bounded state snapshots. */
+        const u64 body_end=gcm_slow_drain_qpc();
+        const u64 cycles_end=gcm_slow_drain_thread_cycles(&cycles_end_valid);
+        ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+        if (body_end>=begin && body_end-begin>s_gcm_slow_drain_frequency/500u) {
+            gcm_slow_drain_event event={0};
+            event.qpc_begin=begin;
+            event.qpc_lock_acquired=acquired;
+            event.qpc_body_end=body_end;
+            event.thread_cycles_begin=cycles_begin;
+            event.thread_cycles_end=cycles_end;
+            event.thread_cycles_valid=cycles_begin_valid && cycles_end_valid;
+            event.drain_sequence=drain_sequence;
+            event.host_tid=host_tid;
+            event.renderer_frame=renderer_frame;
+            event.context_valid=context_valid;
+            event.get_before=get_before;
+            event.put_before=put_before;
+            event.get_after=get_after;
+            event.put_after=put_after;
+            AcquireSRWLockExclusive(&s_gcm_slow_drain_lock);
+            s_gcm_slow_drain_events[s_gcm_slow_drain_next]=event;
+            s_gcm_slow_drain_next=(s_gcm_slow_drain_next+1u)%GCM_SLOW_DRAIN_CAP;
+            if (s_gcm_slow_drain_count<GCM_SLOW_DRAIN_CAP) ++s_gcm_slow_drain_count;
+            else ++s_gcm_slow_drain_overwritten;
+            ReleaseSRWLockExclusive(&s_gcm_slow_drain_lock);
+        }
+        return;
+    }
+#endif
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
     gcm_rsx_process_fifo_unlocked();
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
 }
+/* END GCM SLOW DRAIN WRAPPER */
 
 /* Diagnostic query for the FIFO consumer thread, before its idle wait. A
  * nonempty FIFO can also be blocked on a semaphore; it does not imply that
