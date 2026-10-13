@@ -530,6 +530,13 @@ static void resolution_tests(void)
     hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV; hd.NumDescriptors=1+MAX_SURFACES;
     OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.dsv_heap));
     g.dsv_step=g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev,hd.Type);
+    hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors=SRV_TABLE_SIZE*SRV_RING_TABLES;
+    hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.srv_heap));
+    hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER; hd.NumDescriptors=1;
+    OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.smp_heap));
+    assert(make_depth_snapshot_pipeline()==0);
     g.width=g.height=8; g.ready=1;
     const char* sizes[]={"8x8","12x12","16x16","11x13","12x12","native"};
     ID3D12Resource* rb=buffer(D3D12_HEAP_TYPE_READBACK);
@@ -540,6 +547,7 @@ static void resolution_tests(void)
         g_ld_resolution.shadow_host=mode==4 ? 3 : mode==5 ? 10 : 0;
         OK(g.alloc->lpVtbl->Reset(g.alloc)); OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
         g.n_surfaces=g.n_zdepths=0;
+        g.srv_ring_used=0;
         u32 source=surface_get(0,0x1000,8,8,DXGI_FORMAT_R8G8B8A8_UNORM);
         u32 dest=surface_get(0,0x2000,8,8,DXGI_FORMAT_R8G8B8A8_UNORM);
         assert(source<MAX_SURFACES && dest<MAX_SURFACES);
@@ -604,6 +612,7 @@ static void resolution_tests(void)
         rsx_dispatch_method(&g.rsx,0x020C,32);
         rsx_dispatch_method(&g.rsx,0x0210,0x1000);
         rsx_dispatch_method(&g.rsx,0x0214,0x3000);
+        rsx_dispatch_method(&g.rsx,0x022C,32); // ZETA_PITCH
         rsx_dispatch_method(&g.rsx,0x0208,8|(2u<<5));
         rsx_dispatch_method(&g.rsx,M_SCISSOR_HORIZONTAL,8u<<16);
         rsx_dispatch_method(&g.rsx,M_SCISSOR_VERTICAL,8u<<16);
@@ -614,6 +623,27 @@ static void resolution_tests(void)
         rsx_dispatch_method(&g.rsx,M_ZSTENCIL_CLEAR,0x400000A5);
         sink_clear(NULL,&g.rsx,RSX_CLEAR_DEPTH|RSX_CLEAR_STENCIL);
         const u32 scene_depth_pitch=read_depth(g.zdepths[zslot-1].tex,rb,262144);
+        assert(zdepth_pack(zslot-1,9,8)==0); // guest pitch bounds
+        assert(zdepth_pack(zslot-1,8,9)==0); // guest height bounds
+        assert(ld_blit_gpu(0,0x3000,32,0,0x7000,32,8,8)==1);
+        u32 px,py;
+        int packed_copy=surface_containing(0,0x7000,32,8,8,&px,&py);
+        assert(packed_copy>=0);
+        D3D12_RESOURCE_BARRIER packed_bar={0};
+        packed_bar.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        packed_bar.Transition.pResource=g.surfaces[packed_copy].tex;
+        packed_bar.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        packed_bar.Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET;
+        packed_bar.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g.list->lpVtbl->ResourceBarrier(g.list,1,&packed_bar);
+        read_subresource(g.surfaces[packed_copy].tex,0,rb,327680,DXGI_FORMAT_R8G8B8A8_UNORM,sf->w,sf->h);
+        const u64 packed_generation=g.zdepths[zslot-1].packed_generation;
+        rsx_dispatch_method(&g.rsx,M_ZSTENCIL_CLEAR,0x1234567C);
+        sink_clear(NULL,&g.rsx,RSX_CLEAR_STENCIL);
+        assert(zdepth_pack(zslot-1,8,8)==1);
+        assert(g.zdepths[zslot-1].packed_generation!=packed_generation);
+        copy_source(g.zdepths[zslot-1].packed);
+        read_subresource(g.zdepths[zslot-1].packed,0,rb,393216,DXGI_FORMAT_R8G8B8A8_UNORM,sf->w,sf->h);
         rsx_dispatch_method(&g.rsx,M_SCISSOR_HORIZONTAL,8u<<16);
         rsx_dispatch_method(&g.rsx,M_SCISSOR_VERTICAL,8u<<16);
         rsx_dispatch_method(&g.rsx,0x1D90,0xFF0000FF); // blue
@@ -653,12 +683,19 @@ static void resolution_tests(void)
             const int inside=x>=2*sf->w/8 && x<5*sf->w/8 && y>=sf->h/8 && y<5*sf->h/8;
             float depth; memcpy(&depth,bytes+262144+y*scene_depth_pitch+x*4,4);
             assert(fabsf(depth-(inside?4194304.0f/16777215.0f:1.0f))<1e-7f);
+            const u8* packed=bytes+327680+y*256+x*4;
+            assert(packed[0]==(inside?0:255) && packed[1]==(inside?0:255));
+            assert(packed[2]==(inside?0xA5:0x5A) && packed[3]==(inside?0x40:255));
+            const u8* refreshed=bytes+393216+y*256+x*4;
+            assert(refreshed[0]==packed[0] && refreshed[1]==packed[1] && refreshed[3]==packed[3]);
+            assert(refreshed[2]==(inside?0x7C:0x5A));
         }
         rb->lpVtbl->Unmap(rb,0,NULL);
         for(u32 i=0;i<g.n_surfaces;++i)g.surfaces[i].tex->lpVtbl->Release(g.surfaces[i].tex);
         for(u32 i=0;i<g.n_zdepths;++i) {
             g.zdepths[i].tex->lpVtbl->Release(g.zdepths[i].tex);
             g.zdepths[i].snapshot->lpVtbl->Release(g.zdepths[i].snapshot);
+            if(g.zdepths[i].packed)g.zdepths[i].packed->lpVtbl->Release(g.zdepths[i].packed);
         }
         memset(g.surfaces,0,sizeof(g.surfaces)); memset(g.zdepths,0,sizeof(g.zdepths));
         g.depth=NULL;
@@ -668,8 +705,15 @@ static void resolution_tests(void)
     rb->lpVtbl->Release(rb); g.rtv_heap->lpVtbl->Release(g.rtv_heap);
     g.srv_cpu_heap->lpVtbl->Release(g.srv_cpu_heap); g.dsv_heap->lpVtbl->Release(g.dsv_heap);
     g.rtv_heap=g.srv_cpu_heap=g.dsv_heap=NULL;
+    g.srv_heap->lpVtbl->Release(g.srv_heap); g.srv_heap=NULL;
+    g.smp_heap->lpVtbl->Release(g.smp_heap); g.smp_heap=NULL;
+    g.depth_pack_pso->lpVtbl->Release(g.depth_pack_pso); g.depth_pack_pso=NULL;
+    g.depth_pack_rootsig->lpVtbl->Release(g.depth_pack_rootsig); g.depth_pack_rootsig=NULL;
+    g.depth_snapshot_pso->lpVtbl->Release(g.depth_snapshot_pso); g.depth_snapshot_pso=NULL;
+    g.depth_snapshot_rootsig->lpVtbl->Release(g.depth_snapshot_rootsig); g.depth_snapshot_rootsig=NULL;
     puts("Custom resolution GPU readbacks: native, 1.5x, 2x, fractional asymmetric targets and independent shadow atlases; masked scissor clears, guest address bounds, depth dimensions and GPU blits passed.");
     puts("Z16/Z24S8 GPU clears: far depth, partial scissor, unused high Z16 bits, stencil-only depth preservation and legacy negative control passed at six resolutions.");
+    puts("Packed Z24S8: actual GPU depth/stencil bytes, live blit, cache refresh and guest bounds passed at six resolutions.");
 }
 static void graphics_sampler_tests(void)
 {
