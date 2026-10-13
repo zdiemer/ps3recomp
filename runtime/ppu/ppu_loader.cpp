@@ -36,6 +36,7 @@
 #include "../ps3_log.h"
 #include "ppu_recomp.h"
 #include "ppu_wait_profile.h"
+#include "ppu_native_memory.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../spu/spu_overlay_registry.h"
@@ -2016,6 +2017,10 @@ void vm_write64(uint64_t a, uint64_t v) {
     v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
 }
 
+extern "C" int ppu_native_memory_available(void)
+{
+    return vm_base && !vm_memory_probes() && !g_barrier_sync_watch;
+}
 /* ---- malloc allocation tracker (PS3_ALLOCTAG) -------------------------------
  * Records recent guest malloc results {ptr,size,lr,id} in a ring so we can ask,
  * for a garbage object, which allocation it belongs to and where it came from --
