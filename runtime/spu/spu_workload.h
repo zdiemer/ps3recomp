@@ -56,7 +56,8 @@ enum {
     SPU_ASYNC_TRACE_POST_EXECUTION = 5,
     SPU_ASYNC_TRACE_THREAD_CLEANUP = 6,
     SPU_ASYNC_TRACE_CREATE_THREAD_FAILED = 7,
-    SPU_ASYNC_TRACE_SETUP_FAILED = 8
+    SPU_ASYNC_TRACE_SETUP_FAILED = 8,
+    SPU_ASYNC_TRACE_REUSE_WORKER = 9
 };
 
 typedef void (*spu_async_trace_callback)(unsigned phase,
@@ -85,6 +86,12 @@ void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
  * resolves within the correct image when several share LS addresses. */
 void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
                                int image_id, const char* name);
+
+/* Startup-only opt-in for an exact registered image. The title must audit TLS
+ * isolation across sequential invocations. This caches idle host threads only:
+ * it does not queue jobs or limit active concurrency. Returns 0 on mismatch.
+ * Persistent/unknown images keep the dedicated-thread path by default. */
+int spu_workload_allow_worker_reuse(uint64_t fingerprint, int image_id);
 
 /* Look up a lifted entry by fingerprint; NULL if none registered. */
 spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint);

@@ -16,6 +16,8 @@
 #include <wchar.h>
 #ifdef _WIN32
 #include <windows.h>
+#include "spu_idle_workers.h"
+#include "spu_worker_reuse_config.h"
 #else
 #include <pthread.h>
 #include <errno.h>
@@ -48,6 +50,7 @@ typedef struct {
     spu_lifted_entry_fn fn;
     int                 image_id;
     const char*         name;
+    int                 reuse_worker;
 } spu_workload_entry;
 
 static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
@@ -62,6 +65,7 @@ void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
             s_registry[i].fn       = fn;
             s_registry[i].image_id = image_id;
             s_registry[i].name     = name;
+            s_registry[i].reuse_worker = 0; /* re-registration requires a new audit */
             return;
         }
     }
@@ -74,7 +78,18 @@ void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
     s_registry[s_registry_count].fn       = fn;
     s_registry[s_registry_count].image_id = image_id;
     s_registry[s_registry_count].name     = name;
+    s_registry[s_registry_count].reuse_worker = 0;
     s_registry_count++;
+}
+
+int spu_workload_allow_worker_reuse(uint64_t fingerprint, int image_id)
+{
+    for (unsigned i = 0; i < s_registry_count; ++i)
+        if (s_registry[i].fp == fingerprint && s_registry[i].image_id == image_id) {
+            s_registry[i].reuse_worker = 1;
+            return 1;
+        }
+    return 0;
 }
 
 void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
@@ -915,6 +930,12 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     }
     return 0;
 }
+static void spu_async_cached_call(void* p)
+{
+    /* Includes byte-op TLS selection, fresh job context/LS, taskset completion,
+     * MFC/coherency release and stack-reservation cleanup on EVERY job. */
+    (void)spu_async_thread(p);
+}
 #else
 static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
 #endif
@@ -1261,8 +1282,13 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
     uint64_t fp = spu_workload_fingerprint(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
+    int reuse_allowed = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
-        if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
+        if (s_registry[i].fp == fp) {
+            fn = s_registry[i].fn; image_id = s_registry[i].image_id;
+            reuse_allowed = s_registry[i].reuse_worker;
+            break;
+        }
     if (!fn) {
         /* SPU_DUMP_MISS also applies here. The sync path has written the
          * unrecognised image out for a while and the async path did not, so a
@@ -1382,19 +1408,32 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
     const uint64_t trace_create_begin_qpc = j->trace_snapshot.job_id
                                            ? spu_async_trace_qpc() : 0;
 #endif
-    HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
-                             STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    int reused = 0, launched;
+    if (reuse_allowed && spu_worker_reuse_enabled()) {
+        launched = spu_idle_worker_submit(spu_async_cached_call, j, &reused);
+        if (reused) {
+            static volatile LONG reported[SPU_WORKLOAD_MAX];
+            if ((unsigned)dispatch_image < SPU_WORKLOAD_MAX &&
+                InterlockedCompareExchange(&reported[dispatch_image], 1, 0) == 0)
+                fprintf(stderr, "[spu-worker-reuse] accepted image=%d fp=%016llX\n",
+                        dispatch_image, (unsigned long long)fp);
+        }
+    } else {
+        HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
+                                 STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+        launched = th != NULL;
+        if (th) CloseHandle(th);
+    }
 #if defined(YZ_PERF_PROFILE)
     const uint64_t trace_create_end_qpc = trace_snapshot.job_id ? spu_async_trace_qpc() : 0;
-    if (!th && trace_snapshot.job_id)
+    if (!launched && trace_snapshot.job_id)
         spu_async_trace_emit(SPU_ASYNC_TRACE_CREATE_THREAD_FAILED, &trace_snapshot,
                              trace_create_begin_qpc, trace_create_end_qpc);
     else if (trace_snapshot.job_id)
-        spu_async_trace_emit(SPU_ASYNC_TRACE_CREATE_THREAD, &trace_snapshot,
+        spu_async_trace_emit(reused ? SPU_ASYNC_TRACE_REUSE_WORKER : SPU_ASYNC_TRACE_CREATE_THREAD, &trace_snapshot,
                              trace_create_begin_qpc, trace_create_end_qpc);
 #endif
-    if (!th) { free(j); return 0; }
-    CloseHandle(th);   /* detached */
+    if (!launched) { free(j); return 0; }
     if (dispatch_timing) {
         const uint64_t end_cycles = spu_job_cycles(), end_qpc = spu_job_qpc();
         fprintf(stderr, "[spu-dispatch-time] image=%d begin_qpc=%llu end_qpc=%llu create_cycles=%llu\n",
