@@ -10636,8 +10636,8 @@ void rsx_live_draw_dump_present_samples(void)
     if (g.ready) ld_report_counters();
     ld_slow_flush_dump();
     ld_texture_content_summary();
-#if defined(YZ_PERF_PROFILE)
     ld_slow_draw_dump();
+#if defined(YZ_PERF_PROFILE)
     ld_profile_buffers_dump();
 #endif
     ld_pull_summary();
