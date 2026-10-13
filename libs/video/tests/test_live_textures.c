@@ -1406,8 +1406,8 @@ static void texture_content_cache_tests(ID3D12Resource* readback)
     ID3D12Fence* fence = NULL;
     OK(g.dev->lpVtbl->CreateFence(g.dev, 0, D3D12_FENCE_FLAG_NONE,
                                   &IID_ID3D12Fence, (void**)&fence));
-    OK(g.alloc->lpVtbl->Reset(g.alloc));
-    OK(g.list->lpVtbl->Reset(g.list, g.alloc, NULL));
+    /* main hands this first GPU fixture a newly created, open command list.
+     * Resetting an already recording list is invalid; record on it directly. */
     ld_texture_content_clear();
     g.upload_used = 0;
 
