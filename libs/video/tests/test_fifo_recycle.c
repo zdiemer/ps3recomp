@@ -2,6 +2,7 @@
 #include "../cellGcmSys.c"
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
+u32 rsx_live_draw_get_frames(void) { return 0; }
 int g_resv_store_active = 0;
 uint32_t g_ww_lo = 0, g_ww_hi = 0;
 void spu_lockline_lock(void) { }
