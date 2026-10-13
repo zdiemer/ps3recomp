@@ -1264,6 +1264,21 @@ typedef enum {
  * builds, but the absent-environment path does not query either clock. */
 #define LD_SLOW_DRAW_CAP 1024u
 #define LD_SLOW_DRAW_STAGE_COUNT 4u
+/* Nested, disjoint call buckets inside the resource-resolution draw phase. */
+#define LD_SLOW_DRAW_RESOURCE_KIND_COUNT 4u
+typedef enum {
+    LD_SLOW_RESOURCE_SURFACE = 0,
+    LD_SLOW_RESOURCE_DEPTH,
+    LD_SLOW_RESOURCE_TEXTURE,
+    LD_SLOW_RESOURCE_VERTEX_TEXTURE
+} ld_slow_draw_resource_kind;
+
+typedef struct {
+    u64 total_ticks, max_ticks;
+    u32 calls;
+    u32 max_location, max_offset, max_format, max_width, max_height, max_slot;
+} ld_slow_draw_resource_stat;
+
 typedef enum {
     LD_SLOW_DRAW_GEOMETRY_PREP = 0,
     LD_SLOW_DRAW_PIPELINE_CONSTANTS,
@@ -1276,6 +1291,7 @@ typedef struct {
     u64 qpc_begin, qpc_end;
     u64 cycle_begin, cycle_end;
     u64 stage_ticks[LD_SLOW_DRAW_STAGE_COUNT];
+    ld_slow_draw_resource_stat resource[LD_SLOW_DRAW_RESOURCE_KIND_COUNT];
     u64 get_pso_ticks;
     u64 build_pso_ticks, shader_disk_load_ticks, d3d_compile_ticks;
     u64 create_graphics_pso_ticks;
@@ -1354,10 +1370,47 @@ static void ld_slow_draw_begin(ld_slow_draw_scope* scope)
     scope->event.host_tid = GetCurrentThreadId();
     scope->event.target = UINT32_MAX;
     scope->event.zslot = UINT32_MAX;
+    for (u32 i = 0; i < LD_SLOW_DRAW_RESOURCE_KIND_COUNT; ++i)
+        scope->event.resource[i].max_slot = UINT32_MAX;
     scope->event.qpc_begin = ld_slow_draw_qpc();
     scope->stage_begin = scope->event.qpc_begin;
     scope->event.cycle_valid = (u32)QueryThreadCycleTime(
         GetCurrentThread(), &scope->event.cycle_begin);
+}
+
+static u64 ld_slow_resource_begin(ld_slow_draw_scope* scope)
+{
+    return scope && scope->active ? ld_slow_draw_qpc() : 0;
+}
+
+static void ld_slow_resource_finish_at(ld_slow_draw_scope* scope,
+    ld_slow_draw_resource_kind kind, u64 begin, u32 location, u32 offset,
+    u32 format, u32 width, u32 height, u32 slot, u64 end)
+{
+    if (!scope || !scope->active) return;
+    if (end < begin) return;
+    const u64 elapsed = end - begin;
+    ld_slow_draw_resource_stat* stat = &scope->event.resource[kind];
+    ++stat->calls;
+    stat->total_ticks += elapsed;
+    if (stat->calls == 1 || elapsed > stat->max_ticks) {
+        stat->max_ticks = elapsed;
+        stat->max_location = location;
+        stat->max_offset = offset;
+        stat->max_format = format;
+        stat->max_width = width;
+        stat->max_height = height;
+        stat->max_slot = slot;
+    }
+}
+
+static void ld_slow_resource_finish(ld_slow_draw_scope* scope,
+    ld_slow_draw_resource_kind kind, u64 begin, u32 location, u32 offset,
+    u32 format, u32 width, u32 height, u32 slot)
+{
+    if (!scope || !scope->active) return;
+    ld_slow_resource_finish_at(scope, kind, begin, location, offset, format,
+        width, height, slot, ld_slow_draw_qpc());
 }
 
 static void ld_slow_draw_advance(ld_slow_draw_scope* scope,
@@ -1413,7 +1466,12 @@ static void ld_slow_draw_dump(void)
         "primitive,packets,source_refs,vertices,topology_count,"
         "target,zslot,texture_mask,vertex_texture_mask,geometry_preparation_ms,pipeline_constants_ms,"
         "resource_resolution_ms,command_recording_ms,get_pso_ms,pso_lookup,"
-        "build_pso_ms,shader_disk_load_ms,d3d_compile_ms,create_graphics_pso_ms\n");
+        "build_pso_ms,shader_disk_load_ms,d3d_compile_ms,create_graphics_pso_ms,"
+        "surface_calls,surface_total_ms,surface_max_ms,surface_max_location,surface_max_offset,surface_max_format,surface_max_width,surface_max_height,surface_max_slot,"
+        "depth_calls,depth_total_ms,depth_max_ms,depth_max_location,depth_max_offset,depth_max_format,depth_max_width,depth_max_height,depth_max_slot,"
+        "texture_calls,texture_total_ms,texture_max_ms,texture_max_location,texture_max_offset,texture_max_format,texture_max_width,texture_max_height,texture_max_slot,"
+        "vertex_texture_calls,vertex_texture_total_ms,vertex_texture_max_ms,vertex_texture_max_location,vertex_texture_max_offset,vertex_texture_max_format,vertex_texture_max_width,vertex_texture_max_height,vertex_texture_max_slot,"
+        "resource_residual_ms\n");
     const u64 first = (g_ld_slow_draw.next + LD_SLOW_DRAW_CAP -
         g_ld_slow_draw.recorded) % LD_SLOW_DRAW_CAP;
     const double scale = g_ld_slow_draw.qpc_frequency
@@ -1427,7 +1485,7 @@ static void ld_slow_draw_dump(void)
         fprintf(csv,
             "%llu,%lu,%llu,%u,%u,%llu,%llu,%.6f,%u,%llu,%llu,%llu,%u,%u,%u,%u,%u,"
             "%u,%u,0x%08X,0x%08X,%.6f,%.6f,%.6f,%.6f,%.6f,%u,"
-            "%.6f,%.6f,%.6f,%.6f\n",
+            "%.6f,%.6f,%.6f,%.6f",
             (unsigned long long)g_ld_slow_draw.qpc_frequency, threshold_us,
             (unsigned long long)e->callback_id, e->frame, e->host_tid,
             (unsigned long long)e->qpc_begin,
@@ -1445,6 +1503,19 @@ static void ld_slow_draw_dump(void)
             e->get_pso_ticks * scale, e->pso_lookup,
             e->build_pso_ticks * scale, e->shader_disk_load_ticks * scale,
             e->d3d_compile_ticks * scale, e->create_graphics_pso_ticks * scale);
+        u64 nested_resource_ticks = 0;
+        for (u32 k = 0; k < LD_SLOW_DRAW_RESOURCE_KIND_COUNT; ++k) {
+            const ld_slow_draw_resource_stat* stat = &e->resource[k];
+            nested_resource_ticks += stat->total_ticks;
+            fprintf(csv, ",%u,%.6f,%.6f,%u,%u,%u,%u,%u,%u",
+                stat->calls, stat->total_ticks * scale, stat->max_ticks * scale,
+                stat->max_location, stat->max_offset, stat->max_format,
+                stat->max_width, stat->max_height, stat->max_slot);
+        }
+        const u64 resource_ticks = e->stage_ticks[LD_SLOW_DRAW_RESOURCE_RESOLUTION];
+        const u64 residual_ticks = resource_ticks > nested_resource_ticks
+            ? resource_ticks - nested_resource_ticks : 0;
+        fprintf(csv, ",%.6f\n", residual_ticks * scale);
     }
     fclose(csv);
     ReleaseSRWLockExclusive(&g_ld_slow_draw_lock);
@@ -4602,6 +4673,31 @@ static u32 current_surface(void)
                        sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
                            ? DXGI_FORMAT_R16G16B16A16_FLOAT
                            : DXGI_FORMAT_R8G8B8A8_UNORM);
+}
+
+static u32 surface_get_slow_draw(ld_slow_draw_scope* slow_draw,
+    u32 location, u32 offset, u32 width, u32 height, DXGI_FORMAT format)
+{
+    const u64 begin = ld_slow_resource_begin(slow_draw);
+    const u32 slot = surface_get(location, offset, width, height, format);
+    ld_slow_resource_finish(slow_draw, LD_SLOW_RESOURCE_SURFACE, begin,
+        location, offset, (u32)format, width, height, slot);
+    return slot;
+}
+
+static u32 current_surface_slow_draw(ld_slow_draw_scope* slow_draw)
+{
+    const u64 begin = ld_slow_resource_begin(slow_draw);
+    const u32 slot = current_surface();
+    const u64 end = ld_slow_draw_qpc();
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+    const DXGI_FORMAT format = sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+        ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+    ld_slow_resource_finish_at(slow_draw, LD_SLOW_RESOURCE_SURFACE, begin,
+        sf.color_location[0], sf.color_offset[0], (u32)format,
+        sf.clip_w, sf.clip_h, slot, end);
+    return slot;
 }
 
 /* On RSX each zeta (depth) address is distinct memory. The offline renderer's
@@ -9503,7 +9599,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
     }
 
     ld_slow_draw_advance(slow_draw, LD_SLOW_DRAW_RESOURCE_RESOLUTION);
-    const u32 target = current_surface();
+    const u32 target = slow_draw && slow_draw->active
+        ? current_surface_slow_draw(slow_draw) : current_surface();
     if (target == LD_INVALID_SURFACE) {
         live_draw_csv_emit(prim, n_tri, "drop_surface");
         g_ld_stats.group_drop_surface++;
@@ -9725,11 +9822,16 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
         rsx_dsp_get_surface(&g.rsx, &msf);
         const u32 want = ld_rt_count(msf.color_target);
         for (u32 r = 1; r < want; r++) {
-            const u32 s = surface_get(msf.color_location[r], msf.color_offset[r],
-                                      msf.clip_w, msf.clip_h,
-                                      msf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
-                                          ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                          : DXGI_FORMAT_R8G8B8A8_UNORM);
+            const DXGI_FORMAT mrt_format =
+                msf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+                    ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                    : DXGI_FORMAT_R8G8B8A8_UNORM;
+            const u32 s = slow_draw && slow_draw->active
+                ? surface_get_slow_draw(slow_draw,
+                    msf.color_location[r], msf.color_offset[r],
+                    msf.clip_w, msf.clip_h, mrt_format)
+                : surface_get(msf.color_location[r], msf.color_offset[r],
+                    msf.clip_w, msf.clip_h, mrt_format);
             if (s == LD_INVALID_SURFACE || s == target) break;
             mrt[n_mrt++] = s;
         }
@@ -9997,7 +10099,18 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
                     if (g.zdepths[i].location == t.location &&
                         g.zdepths[i].offset == t.offset &&
                         current_zslot != 1 + i) {
-                        if (zdepth_snapshot(1 + i))
+                        int snapshot_ok;
+                        if (slow_draw && slow_draw->active) {
+                            const u64 resource_begin = ld_slow_resource_begin(slow_draw);
+                            snapshot_ok = zdepth_snapshot(1 + i);
+                            ld_slow_resource_finish(slow_draw, LD_SLOW_RESOURCE_DEPTH,
+                                resource_begin, g.zdepths[i].location,
+                                g.zdepths[i].offset, 0, g.zdepths[i].snapshot_w,
+                                g.zdepths[i].snapshot_h, 1 + i);
+                        } else {
+                            snapshot_ok = zdepth_snapshot(1 + i);
+                        }
+                        if (snapshot_ok)
                             sampled_depth = (int)i;
                         else {
                             g_ld_zdepth_srv_reject_no_write++;
@@ -10065,7 +10178,15 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
                 if (!seen && n_zdepth_used < SRV_TABLE_SIZE)
                     zdepth_used[n_zdepth_used++] = (u32)sampled_depth;
             } else {
-                slots[u] = texture_srv_slot(&t);
+                if (slow_draw && slow_draw->active) {
+                    const u64 resource_begin = ld_slow_resource_begin(slow_draw);
+                    slots[u] = texture_srv_slot(&t);
+                    ld_slow_resource_finish(slow_draw, LD_SLOW_RESOURCE_TEXTURE,
+                        resource_begin, t.location, t.offset, t.format,
+                        t.width, t.height, u);
+                } else {
+                    slots[u] = texture_srv_slot(&t);
+                }
                 if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
             }
         }
@@ -10100,7 +10221,15 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
         if (!((vtex_mask >> u) & 1u)) continue;
         rsx_dsp_vertex_texture vt;
         rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
-        vtex_slots[u] = vertex_texture_srv_slot(&vt);
+        if (slow_draw && slow_draw->active) {
+            const u64 resource_begin = ld_slow_resource_begin(slow_draw);
+            vtex_slots[u] = vertex_texture_srv_slot(&vt);
+            ld_slow_resource_finish(slow_draw, LD_SLOW_RESOURCE_VERTEX_TEXTURE,
+                resource_begin, vt.location, vt.offset, vt.format,
+                vt.width, vt.height, u);
+        } else {
+            vtex_slots[u] = vertex_texture_srv_slot(&vt);
+        }
         if (vtex_slots[u] != SRV_WHITE)
             g_ld_vtex_binds++;
         else
