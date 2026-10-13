@@ -1275,11 +1275,20 @@ typedef struct {
     u64 qpc_begin, qpc_end;
     u64 cycle_begin, cycle_end;
     u64 stage_ticks[LD_SLOW_DRAW_STAGE_COUNT];
+    u64 get_pso_ticks;
+    u64 build_pso_ticks, shader_disk_load_ticks, d3d_compile_ticks;
+    u64 create_graphics_pso_ticks;
     u32 frame, host_tid;
     u32 primitive, packets, source_refs, vertices, topology_count;
     u32 target, zslot, texture_mask, vertex_texture_mask;
-    u32 stage, cycle_valid;
+    u32 stage, cycle_valid, pso_lookup;
 } ld_slow_draw_event;
+
+enum {
+    LD_SLOW_DRAW_PSO_UNCALLED = 0,
+    LD_SLOW_DRAW_PSO_HIT = 1,
+    LD_SLOW_DRAW_PSO_MISS = 2
+};
 
 typedef struct {
     int enabled, configured, dumped;
@@ -1402,7 +1411,8 @@ static void ld_slow_draw_dump(void)
         "thread_cycles_valid,thread_cycles_begin,thread_cycles_end,thread_cycles_delta_not_ms,"
         "primitive,packets,source_refs,vertices,topology_count,"
         "target,zslot,texture_mask,vertex_texture_mask,geometry_preparation_ms,pipeline_constants_ms,"
-        "resource_resolution_ms,command_recording_ms\n");
+        "resource_resolution_ms,command_recording_ms,get_pso_ms,pso_lookup,"
+        "build_pso_ms,shader_disk_load_ms,d3d_compile_ms,create_graphics_pso_ms\n");
     const u64 first = (g_ld_slow_draw.next + LD_SLOW_DRAW_CAP -
         g_ld_slow_draw.recorded) % LD_SLOW_DRAW_CAP;
     const double scale = g_ld_slow_draw.qpc_frequency
@@ -1415,7 +1425,8 @@ static void ld_slow_draw_dump(void)
             ? e->cycle_end - e->cycle_begin : 0;
         fprintf(csv,
             "%llu,%lu,%llu,%u,%u,%llu,%llu,%.6f,%u,%llu,%llu,%llu,%u,%u,%u,%u,%u,"
-            "%u,%u,0x%08X,0x%08X,%.6f,%.6f,%.6f,%.6f\n",
+            "%u,%u,0x%08X,0x%08X,%.6f,%.6f,%.6f,%.6f,%.6f,%u,"
+            "%.6f,%.6f,%.6f,%.6f\n",
             (unsigned long long)g_ld_slow_draw.qpc_frequency, threshold_us,
             (unsigned long long)e->callback_id, e->frame, e->host_tid,
             (unsigned long long)e->qpc_begin,
@@ -1429,7 +1440,10 @@ static void ld_slow_draw_dump(void)
             e->stage_ticks[LD_SLOW_DRAW_GEOMETRY_PREP] * scale,
             e->stage_ticks[LD_SLOW_DRAW_PIPELINE_CONSTANTS] * scale,
             e->stage_ticks[LD_SLOW_DRAW_RESOURCE_RESOLUTION] * scale,
-            e->stage_ticks[LD_SLOW_DRAW_COMMAND_RECORDING] * scale);
+            e->stage_ticks[LD_SLOW_DRAW_COMMAND_RECORDING] * scale,
+            e->get_pso_ticks * scale, e->pso_lookup,
+            e->build_pso_ticks * scale, e->shader_disk_load_ticks * scale,
+            e->d3d_compile_ticks * scale, e->create_graphics_pso_ticks * scale);
     }
     fclose(csv);
     ReleaseSRWLockExclusive(&g_ld_slow_draw_lock);
@@ -5119,13 +5133,21 @@ static ID3DBlob* shader_disk_cache_load_impl(
 }
 
 static ID3DBlob* shader_disk_cache_load(
-    u32 stage, const char* source, u32 source_length, u64 hash)
+    u32 stage, const char* source, u32 source_length, u64 hash,
+    ld_slow_draw_scope* slow_draw)
 {
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG begin = ld_profile_qpc();
     ++g_ld_profile.total.shader_disk_load_calls;
 #endif
+    const u64 slow_begin = slow_draw && slow_draw->active
+        ? ld_slow_draw_qpc() : 0;
     ID3DBlob* blob = shader_disk_cache_load_impl(stage, source, source_length, hash);
+    if (slow_draw && slow_draw->active) {
+        const u64 slow_end = ld_slow_draw_qpc();
+        if (slow_end >= slow_begin)
+            slow_draw->event.shader_disk_load_ticks += slow_end - slow_begin;
+    }
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.shader_disk_load_qpc += ld_profile_qpc() - begin;
 #endif
@@ -5594,7 +5616,8 @@ static void ld_pull_profile(u32 frame, LONGLONG qpc)
 
 static ID3D12PipelineState* build_pso(
     const char* vs_hlsl, const char* ps_hlsl, const render_state_t* rs,
-    const rsx_vertex_layout_plan* masked_layout, int packed_offsets)
+    const rsx_vertex_layout_plan* masked_layout, int packed_offsets,
+    ld_slow_draw_scope* slow_draw)
 {
     ID3DBlob *vs = NULL, *ps = NULL, *err = NULL;
     static u32 compile_fail_logs = 0;
@@ -5635,7 +5658,7 @@ static ID3D12PipelineState* build_pso(
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.vs_blob_misses++;
 #endif
-        vs = shader_disk_cache_load('V', vs_hlsl, vs_length, vs_hash);
+        vs = shader_disk_cache_load('V', vs_hlsl, vs_length, vs_hash, slow_draw);
         if (vs) {
             shader_blob_cache_insert_accounted(
                 &g.vs_blobs, vs_hlsl, vs_length, vs_hash, vs,
@@ -5645,9 +5668,17 @@ static ID3D12PipelineState* build_pso(
             g_ld_profile.total.vs_compile_calls++;
             const LONGLONG compile_begin = ld_profile_qpc();
 #endif
+            const u64 slow_compile_begin = slow_draw && slow_draw->active
+                ? ld_slow_draw_qpc() : 0;
             vs_hr = D3DCompile(
                 vs_hlsl, vs_length, "xvs", NULL, NULL, "main",
                 "vs_5_0", 0, 0, &vs, &err);
+            if (slow_draw && slow_draw->active) {
+                const u64 slow_compile_end = ld_slow_draw_qpc();
+                if (slow_compile_end >= slow_compile_begin)
+                    slow_draw->event.d3d_compile_ticks +=
+                        slow_compile_end - slow_compile_begin;
+            }
 #if defined(YZ_PERF_PROFILE)
             g_ld_profile.total.vs_compile_qpc +=
                 (u64)(ld_profile_qpc() - compile_begin);
@@ -5697,7 +5728,7 @@ static ID3D12PipelineState* build_pso(
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.ps_blob_misses++;
 #endif
-        ps = shader_disk_cache_load('P', ps_hlsl, ps_length, ps_hash);
+        ps = shader_disk_cache_load('P', ps_hlsl, ps_length, ps_hash, slow_draw);
         if (ps) {
             shader_blob_cache_insert_accounted(
                 &g.ps_blobs, ps_hlsl, ps_length, ps_hash, ps,
@@ -5707,9 +5738,17 @@ static ID3D12PipelineState* build_pso(
             g_ld_profile.total.ps_compile_calls++;
             const LONGLONG compile_begin = ld_profile_qpc();
 #endif
+            const u64 slow_compile_begin = slow_draw && slow_draw->active
+                ? ld_slow_draw_qpc() : 0;
             ps_hr = D3DCompile(
                 ps_hlsl, ps_length, "xps", NULL, NULL, "main",
                 "ps_5_0", 0, 0, &ps, &err);
+            if (slow_draw && slow_draw->active) {
+                const u64 slow_compile_end = ld_slow_draw_qpc();
+                if (slow_compile_end >= slow_compile_begin)
+                    slow_draw->event.d3d_compile_ticks +=
+                        slow_compile_end - slow_compile_begin;
+            }
 #if defined(YZ_PERF_PROFILE)
             g_ld_profile.total.ps_compile_qpc +=
                 (u64)(ld_profile_qpc() - compile_begin);
@@ -5770,8 +5809,16 @@ static ID3D12PipelineState* build_pso(
     g_ld_profile.total.create_pso_calls++;
     const LONGLONG create_begin = ld_profile_qpc();
 #endif
+    const u64 slow_create_begin = slow_draw && slow_draw->active
+        ? ld_slow_draw_qpc() : 0;
     HRESULT hr = g.dev->lpVtbl->CreateGraphicsPipelineState(
         g.dev, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    if (slow_draw && slow_draw->active) {
+        const u64 slow_create_end = ld_slow_draw_qpc();
+        if (slow_create_end >= slow_create_begin)
+            slow_draw->event.create_graphics_pso_ticks +=
+                slow_create_end - slow_create_begin;
+    }
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.create_pso_qpc +=
         (u64)(ld_profile_qpc() - create_begin);
@@ -5837,7 +5884,8 @@ static void ld_pso_bail(int* said, const char* reason)
     do { static int _said_ = 0; ld_pso_bail(&_said_, (reason)); } while (0)
 
 static ID3D12PipelineState* get_pso(
-    const rsx_vertex_layout_plan* masked_layout, int packed_payload)
+    const rsx_vertex_layout_plan* masked_layout, int packed_payload,
+    ld_slow_draw_scope* slow_draw)
 {
     memset(&g_ld_current_pso, 0, sizeof(g_ld_current_pso));
     const u32 start = rsx_dsp_vp_start(&g.rsx);
@@ -6104,6 +6152,8 @@ static ID3D12PipelineState* get_pso(
         g_ld_profile.total.pso_probes++;
 #endif
         if (g.psos[i].key == key) {
+            if (slow_draw && slow_draw->active)
+                slow_draw->event.pso_lookup = LD_SLOW_DRAW_PSO_HIT;
 #if defined(YZ_PERF_PROFILE)
             g_ld_profile.total.pso_hits++;
             g_ld_profile.total.pso_lookup_qpc += ld_profile_qpc() - lookup_begin;
@@ -6111,6 +6161,8 @@ static ID3D12PipelineState* get_pso(
             return g.psos[i].pso;
         }
     }
+    if (slow_draw && slow_draw->active)
+        slow_draw->event.pso_lookup = LD_SLOW_DRAW_PSO_MISS;
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.pso_lookup_qpc += ld_profile_qpc() - lookup_begin;
     g_ld_profile.total.pso_misses++;
@@ -6273,8 +6325,18 @@ static ID3D12PipelineState* get_pso(
         }
       } }
     if (vi > 0 && fi > 0)
+    {
+        const u64 slow_build_begin = slow_draw && slow_draw->active
+            ? ld_slow_draw_qpc() : 0;
         pso = build_pso(
-            vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload);
+            vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload, slow_draw);
+        if (slow_draw && slow_draw->active) {
+            const u64 slow_build_end = ld_slow_draw_qpc();
+            if (slow_build_end >= slow_build_begin)
+                slow_draw->event.build_pso_ticks +=
+                    slow_build_end - slow_build_begin;
+        }
+    }
 
     g.psos[g.n_psos].key = key;
     g.psos[g.n_psos].pso = pso;
@@ -8828,9 +8890,16 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG pso_begin=ld_profile_qpc();
 #endif
+    const u64 slow_pso_begin = slow_draw && slow_draw->active
+        ? ld_slow_draw_qpc() : 0;
     ID3D12PipelineState* pso = get_pso(
         ld_vertex_mask_signature() ? &used_layout : NULL,
-        ld_vertex_compact_payload());
+        ld_vertex_compact_payload(), slow_draw);
+    if (slow_draw && slow_draw->active) {
+        const u64 slow_pso_end = ld_slow_draw_qpc();
+        if (slow_pso_end >= slow_pso_begin)
+            slow_draw->event.get_pso_ticks = slow_pso_end - slow_pso_begin;
+    }
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.pso_prepare_qpc+=ld_profile_qpc()-pso_begin;
 #endif
