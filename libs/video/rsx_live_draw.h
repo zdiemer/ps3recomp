@@ -56,6 +56,11 @@ void rsx_live_draw_set_render_reference(u32 width, u32 height);
 /* Optional square shadow atlas size. Independent shadow scaling applies to
  * all raster attachments of this exact guest extent. Call before init. */
 void rsx_live_draw_set_shadow_reference(u32 size);
+/* Title-owned CPU preparation flags (0..16383). Call before init and before
+ * registering texture write-watch, which additionally enables bit 4096.
+ * Returns zero for unsupported bits. RSX_CPU_WORK_FILE remains an optional
+ * live diagnostic override; ordinary launches need no control file. */
+int rsx_live_draw_set_cpu_work(u32 flags);
 /* Experimental: explicitly register a MEM_WRITE_WATCH reservation before init.
  * The renderer is its sole reset/query owner. CPU-work bit 4096 selects reuse;
  * RSX_TEXTURE_WRITE_WATCH_VALIDATE=1 checks proposed skips against full hashes. */

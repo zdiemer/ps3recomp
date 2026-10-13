@@ -41,6 +41,7 @@ void rsx_live_draw_set_texture_override(rsx_live_texture_revision_fn revision,
 int  rsx_live_draw_enabled(void) { return 0; }
 void rsx_live_draw_set_render_reference(u32 w, u32 h) { (void)w; (void)h; }
 void rsx_live_draw_set_shadow_reference(u32 size) { (void)size; }
+int rsx_live_draw_set_cpu_work(u32 flags) { return flags <= 16383u; }
 int rsx_live_draw_set_texture_write_watch(void* base, size_t bytes)
 { (void)base; (void)bytes; return 0; }
 int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void* u)
@@ -130,6 +131,12 @@ static void ld_profile_buffers_dump(void)
 /* Bulk references, dense remapping, specialized vertex decoding and triangle
  * copies. Registering a native write tracker also enables regional reuse. */
 static unsigned g_ld_cpu_work=1283;
+int rsx_live_draw_set_cpu_work(u32 flags)
+{
+    if (flags > 16383u) return 0;
+    g_ld_cpu_work = flags;
+    return 1;
+}
 static rsx_texture_write_watch g_texture_watch;
 static u64 g_texture_watch_queries, g_texture_watch_dirty_pages;
 static u64 g_texture_watch_skips, g_texture_watch_skip_bytes;
