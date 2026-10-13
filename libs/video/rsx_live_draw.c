@@ -2208,7 +2208,20 @@ typedef struct { u32 w, h; const u8* data; u32 row_bytes, rows; } tex_level_t;
 
 static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t* lv, u32 n)
 {
-    if (n == 0) return NULL;
+    if (n == 0 || n > 14) return NULL;
+    /* Reject incomplete uploads before creating a resource or recording copy
+     * commands. Cached entries must represent every requested mip. */
+    if (g.upload_used > UPLOAD_SIZE) return NULL;
+    u64 upload_end = g.upload_used;
+    for (u32 m = 0; m < n; ++m) {
+        if (!lv[m].data || !lv[m].w || !lv[m].h || !lv[m].row_bytes || !lv[m].rows)
+            return NULL;
+        const u64 pitch = ((u64)lv[m].row_bytes + 255) & ~255ull;
+        upload_end = (upload_end + 511) & ~511ull;
+        if (upload_end > UPLOAD_SIZE || lv[m].rows > (UPLOAD_SIZE - upload_end) / pitch)
+            return NULL;
+        upload_end += pitch * lv[m].rows;
+    }
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -2222,7 +2235,6 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     for (u32 m = 0; m < n; m++) {
         const u32 pitch = (lv[m].row_bytes + 255) & ~255u;
         const u32 start = (g.upload_used + 511) & ~511u;
-        if ((u64)start + (u64)pitch * lv[m].rows > UPLOAD_SIZE) break;
         for (u32 y = 0; y < lv[m].rows; y++)
             memcpy(g.upload_mapped + start + (size_t)y * pitch,
                    lv[m].data + (size_t)y * lv[m].row_bytes, lv[m].row_bytes);
@@ -2252,6 +2264,8 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
     return tex;
 }
+
+#include "rsx_texture_content_cache.h"
 
 /* Cubemap faces are stored face-major in guest memory. D3D12 subresources use
  * that same order: face * mip_count + mip. */
@@ -2537,7 +2551,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
             mw = mw > 1 ? mw >> 1 : 1;
             mh = mh > 1 ? mh >> 1 : 1;
         }
-        return create_texture_mipped(dxgi, levels, n);
+        return create_texture_mipped_cached(dxgi, levels, n);
     }
 
     u32 texel_size;
@@ -10958,13 +10972,14 @@ void rsx_live_draw_present(u32 buffer_id)
 
 void rsx_live_draw_shutdown(void)
 {
-    if (!g.ready) return;
+    if (!g.ready) { ld_texture_content_clear(); return; }
     rsx_vertex_payload_cache_clear(&g_ld_vertex_cache);
     ld_vertex_diag_emit("shutdown", 1);
     ld_present_measure_dump();
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
+    ld_texture_content_clear();
     rsx_frame_limiter_destroy(&g_ld_frame_limiter);
 #if defined(YZ_PERF_PROFILE)
     fprintf(stderr,
