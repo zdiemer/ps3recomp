@@ -37,3 +37,19 @@ extern "C" int ppu_native_memory_begin(uint32_t source, uint32_t source_size,
 }
 extern "C" void ppu_native_memory_end(void) { spu_lockline_unlock(); }
 
+extern "C" int ppu_native_memory_begin_write(uint32_t destination, uint32_t size)
+{
+    if (!ppu_native_memory_available() || size > 0x100000u ||
+        !ppu_native_memory_range(destination, size)) return 0;
+    // A new reservation cannot appear between the scan and the owned write.
+    // Rejection returns with no held lock and leaves all notification to the
+    // original accessor path. The caller establishes ownership separately.
+    spu_lockline_lock();
+    const uint32_t last = (destination + size - 1u) & ~127u;
+    for (uint32_t line = destination & ~127u;; line += 128u) {
+        if (spu_coh_is_reserved(line)) { spu_lockline_unlock(); return 0; }
+        if (line == last) break;
+    }
+    return 1;
+}
+
