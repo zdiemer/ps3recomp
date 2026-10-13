@@ -107,12 +107,14 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #if defined(YZ_PERF_PROFILE)
 #include "rsx_profile_buffer.h"
 static rsx_profile_buffer g_ld_profile_csv, g_ld_geometry_csv, g_ld_texture_misses_csv;
+static rsx_profile_buffer g_ld_texture_content_csv;
 static void ld_profile_buffers_dump(void)
 {
     rsx_profile_buffer* buffers[] = {
-        &g_ld_profile_csv, &g_ld_geometry_csv, &g_ld_texture_misses_csv };
-    const char* names[] = { "renderer", "geometry", "texture-misses" };
-    for (unsigned i=0; i<3; ++i) {
+        &g_ld_profile_csv, &g_ld_geometry_csv, &g_ld_texture_misses_csv,
+        &g_ld_texture_content_csv };
+    const char* names[] = { "renderer", "geometry", "texture-misses", "texture-content" };
+    for (unsigned i=0; i<4; ++i) {
         const rsx_profile_buffer* b=buffers[i];
         if (!b->rows) continue;
         const int ok=rsx_profile_buffer_dump(b);
@@ -2373,7 +2375,17 @@ typedef struct { u32 w, h; const u8* data; u32 row_bytes, rows; } tex_level_t;
 
 static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t* lv, u32 n)
 {
-    if (n == 0) return NULL;
+    if (n == 0 || n > 14) return NULL;
+    /* A partially uploaded resource cannot be cached as complete. Preflight
+     * every level before creating resources or recording any GPU commands. */
+    u64 upload_end=g.upload_used;
+    for (u32 m=0;m<n;++m) {
+        if (!lv[m].data || !lv[m].w || !lv[m].h || !lv[m].row_bytes || !lv[m].rows)
+            return NULL;
+        const u64 pitch=((u64)lv[m].row_bytes+255)&~255ull;
+        upload_end=((upload_end+511)&~511ull)+pitch*lv[m].rows;
+        if (upload_end>UPLOAD_SIZE) return NULL;
+    }
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -2400,7 +2412,6 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     for (u32 m = 0; m < n; m++) {
         const u32 pitch = (lv[m].row_bytes + 255) & ~255u;
         const u32 start = (g.upload_used + 511) & ~511u;
-        if ((u64)start + (u64)pitch * lv[m].rows > UPLOAD_SIZE) break;
 #if defined(YZ_PERF_PROFILE)
         const LONGLONG memcpy_begin = g_ld_profile.texture_decode_active
             ? ld_profile_qpc() : 0;
@@ -2463,6 +2474,46 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
 #endif
     return tex;
 }
+
+#include "rsx_texture_content_cache.h"
+static void ld_texture_content_summary(void)
+{
+    fprintf(stderr,"[texture-content] requests=%llu hits=%llu misses=%llu bypasses=%llu "
+        "evictions=%llu entries=%u cpu_bytes=%llu scratch_bytes=%u gpu_bytes=%llu "
+        "compared_bytes=%llu snapshot_bytes=%llu\n",
+        g_ld_texture_content.requests,g_ld_texture_content.hits,
+        g_ld_texture_content.misses,g_ld_texture_content.bypasses,
+        g_ld_texture_content.evictions,g_ld_texture_content.count,
+        g_ld_texture_content.cpu_bytes,g_ld_texture_content.scratch_size,
+        g_ld_texture_content.gpu_bytes,g_ld_texture_content.compared_bytes,
+        g_ld_texture_content.snapshot_bytes);
+}
+#if defined(YZ_PERF_PROFILE)
+static void ld_texture_content_profile(u32 frame,LONGLONG qpc)
+{
+    rsx_profile_buffer* csv=&g_ld_texture_content_csv;
+    static int initialized;
+    if (!initialized) {
+        initialized=1;
+        const char* output=getenv("RSX_PROFILE_CSV");
+        if (output && *output) {
+            char path[4096];
+            const int n=snprintf(path,sizeof path,"%s.texture-content.csv",output);
+            if (n>0 && n<sizeof path && !rsx_profile_buffer_init(csv,path,
+                "frame,qpc,requests,hits,misses,bypasses,evictions,entries,cpu_bytes,scratch_bytes,gpu_bytes,compared_bytes,snapshot_bytes\n",32768,320))
+                fprintf(stderr,"[profile-buffer] texture-content allocation failed\n");
+        }
+    }
+    if (csv->rows) rsx_profile_buffer_printf(csv,
+        "%u,%lld,%llu,%llu,%llu,%llu,%llu,%u,%llu,%u,%llu,%llu,%llu\n",
+        frame,qpc,g_ld_texture_content.requests,g_ld_texture_content.hits,
+        g_ld_texture_content.misses,g_ld_texture_content.bypasses,
+        g_ld_texture_content.evictions,g_ld_texture_content.count,
+        g_ld_texture_content.cpu_bytes,g_ld_texture_content.scratch_size,
+        g_ld_texture_content.gpu_bytes,g_ld_texture_content.compared_bytes,
+        g_ld_texture_content.snapshot_bytes);
+}
+#endif
 
 /* Cubemap faces are stored face-major in guest memory. D3D12 subresources use
  * that same order: face * mip_count + mip. */
@@ -2820,7 +2871,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
             mw = mw > 1 ? mw >> 1 : 1;
             mh = mh > 1 ? mh >> 1 : 1;
         }
-        return create_texture_mipped(dxgi, levels, n);
+        return create_texture_mipped_cached(dxgi, levels, n);
     }
 
     u32 texel_size;
@@ -4948,6 +4999,7 @@ static void ld_pull_summary(void)
  * out of ordinary measurements; subtraction retains all frames in a window. */
 static void ld_pull_profile(u32 frame, LONGLONG qpc)
 {
+    ld_texture_content_profile(frame,qpc);
     rsx_profile_buffer* csv=&g_ld_geometry_csv;
     static int initialized;
     if (!initialized) {
@@ -10029,6 +10081,7 @@ double rsx_live_draw_get_present_fps(void)
 
 void rsx_live_draw_dump_present_samples(void)
 {
+    ld_texture_content_summary();
 #if defined(YZ_PERF_PROFILE)
     ld_profile_buffers_dump();
 #endif
@@ -11725,12 +11778,13 @@ void rsx_live_draw_present(u32 buffer_id)
 
 void rsx_live_draw_shutdown(void)
 {
-    if (!g.ready) return;
+    if (!g.ready) { ld_texture_content_clear(); return; }
 #if defined(YZ_PERF_PROFILE)
     ld_profile_buffers_dump();
     rsx_profile_buffer_destroy(&g_ld_profile_csv);
     rsx_profile_buffer_destroy(&g_ld_geometry_csv);
     rsx_profile_buffer_destroy(&g_ld_texture_misses_csv);
+    rsx_profile_buffer_destroy(&g_ld_texture_content_csv);
 #endif
     ld_vertex_worker_summary();
     ld_vertex_workers_clear();
@@ -11750,6 +11804,8 @@ void rsx_live_draw_shutdown(void)
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
+    ld_texture_content_summary();
+    ld_texture_content_clear();
     rsx_frame_limiter_destroy(&g_ld_frame_limiter);
 #if defined(YZ_PERF_PROFILE)
     fprintf(stderr,
