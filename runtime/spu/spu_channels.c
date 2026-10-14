@@ -70,6 +70,9 @@ static uint64_t spu_host_ns(void)
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+/* WAIT_SIGNAL uses a different condition variable from event flags and the
+ * readiness scheduler. Call only after releasing the coherence lock. */
+void spu_taskset_line_committed(uint32_t line);
 /* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
  * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
 #define SPU_WATCH_MAX 4
@@ -689,7 +692,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
-        if (ctx->atomic_stat == 0 && g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+        if (ctx->atomic_stat == 0) {
+            spu_taskset_line_committed(ea & ~127u);
+            if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+        }
         return 1;
 
     case MFC_PUTLLUC_CMD:
@@ -706,6 +712,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
         spu_lockline_unlock();
+        spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         return 1;
 
