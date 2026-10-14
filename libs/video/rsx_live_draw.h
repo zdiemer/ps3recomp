@@ -167,6 +167,11 @@ double rsx_live_draw_get_present_fps(void);
 void rsx_live_draw_dump_present_samples(void);
 /* End-only persistence hook: call after draws stop, before orderly exit. */
 void rsx_live_draw_dump_shader_cache(void);
+/* Stop optional background writes after draws stop, even when renderer ready
+ * is already cleared. Returns 1 when fully drained. Timeout drops pending
+ * writes; the active owned write may finish later. Do not unload the SDK while
+ * this returns 0. Renderer owner calls start/stop; repeated stops are safe. */
+int rsx_live_draw_stop_shader_cache(unsigned timeout_ms);
 
 /* Bounded live AUTH diagnostic. The null-backend window starts it from a
  * private WM_APP message immediately before New Game is confirmed. */

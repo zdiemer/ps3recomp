@@ -75,6 +75,7 @@ u32  rsx_live_draw_get_last_draws(void) { return 0; }
 double rsx_live_draw_get_present_fps(void) { return 0.0; }
 void rsx_live_draw_dump_present_samples(void) {}
 void rsx_live_draw_dump_shader_cache(void) {}
+int rsx_live_draw_stop_shader_cache(unsigned timeout_ms) { (void)timeout_ms; return 1; }
 void rsx_live_draw_a010_probe_begin(void) {}
 int  rsx_live_draw_a010_probe_active(void) { return 0; }
 int  rsx_live_draw_a010_world_ready(void) { return 1; }
@@ -106,6 +107,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "rsx_shader_store.h"
 #if defined(YZ_PERF_PROFILE)
 #include "rsx_profile_buffer.h"
 static rsx_profile_buffer g_ld_profile_csv, g_ld_geometry_csv, g_ld_texture_misses_csv;
@@ -468,15 +470,7 @@ typedef struct {
     u64 retained_source_bytes;
     u64 retained_blob_bytes;
 } shader_blob_cache_t;
-typedef struct {
-    u32 magic;
-    u32 version;
-    u32 stage;
-    u32 source_length;
-    u32 blob_length;
-    u32 reserved;
-    u64 source_hash;
-} shader_disk_cache_header;
+typedef rsx_shader_store_header shader_disk_cache_header;
 
 typedef struct {
     int              enabled;    /* RSX_DRAW resolved                     */
@@ -1258,6 +1252,8 @@ static u64 g_ld_vtex_missing_for_txl = 0;
 static u64 g_ld_divider_fetches = 0;
 static char g_ld_shader_disk_dir[MAX_PATH];
 static int g_ld_shader_disk_ready = -1;
+/* Process-lifetime coordinator: bounded stop can leave an owned write alive. */
+static rsx_shader_store g_shader_store;
 static u64 g_ld_shader_disk_hits[2] = {0, 0};
 static u64 g_ld_shader_disk_misses[2] = {0, 0};
 static u64 g_ld_shader_disk_writes[2] = {0, 0};
@@ -1333,6 +1329,7 @@ typedef struct {
     ld_slow_draw_resource_stat resource[LD_SLOW_DRAW_RESOURCE_KIND_COUNT];
     u64 get_pso_ticks;
     u64 build_pso_ticks, shader_disk_load_ticks, d3d_compile_ticks;
+    u64 shader_disk_enqueue_ticks;
     u64 create_graphics_pso_ticks;
     u32 frame, host_tid;
     u32 primitive, packets, source_refs, vertices, topology_count;
@@ -1597,7 +1594,7 @@ static void ld_slow_draw_dump(void)
         "texture_skip_hash_kind_match,texture_skip_validation,texture_skip_rejection_mask,"
         "texture_source_span,texture_mipmaps,texture_hash_kind,texture_hash_cycle_attempts,"
         "texture_hash_cycle_successes,texture_hash_cycle_failures,"
-        "texture_hash_cycle_valid,texture_hash_cycle_delta_not_ms\n");
+        "texture_hash_cycle_valid,texture_hash_cycle_delta_not_ms,shader_disk_enqueue_ms\n");
     const u64 first = (g_ld_slow_draw.next + LD_SLOW_DRAW_CAP -
         g_ld_slow_draw.recorded) % LD_SLOW_DRAW_CAP;
     const double scale = g_ld_slow_draw.qpc_frequency
@@ -1644,7 +1641,7 @@ static void ld_slow_draw_dump(void)
         const ld_slow_texture_detail* td =
             &e->resource[LD_SLOW_RESOURCE_TEXTURE].texture_detail;
         fprintf(csv, ",%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f"
-                     ",%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%llu\n",
+                     ",%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%llu,%.6f\n",
             td->outcome, td->decode_attempted, td->decode_succeeded,
             td->watch_skipped, td->cache_full,
             td->lookup_ticks * scale, td->watch_ticks * scale,
@@ -1659,7 +1656,8 @@ static void ld_slow_draw_dump(void)
             td->mipmaps, td->hash_kind, td->hash_cycle_attempts,
             td->hash_cycle_successes, td->hash_cycle_failures,
             td->hash_cycle_attempts != 0 && td->hash_cycle_failures == 0,
-            (unsigned long long)td->hash_cycle_delta);
+            (unsigned long long)td->hash_cycle_delta,
+            e->shader_disk_enqueue_ticks * scale);
     }
     fclose(csv);
     ReleaseSRWLockExclusive(&g_ld_slow_draw_lock);
@@ -1739,8 +1737,8 @@ typedef struct {
     u64 vp_prepare_qpc, fp_prepare_qpc;
     u64 vp_cache_hits, vp_cache_misses;
     u64 pso_lookup_qpc;
-    u64 shader_disk_load_qpc, shader_disk_store_qpc, shader_blob_create_qpc;
-    u64 shader_disk_load_calls, shader_disk_store_calls;
+    u64 shader_disk_load_qpc, shader_disk_enqueue_qpc, shader_blob_create_qpc;
+    u64 shader_disk_load_calls, shader_disk_enqueue_calls;
     u64 shader_disk_load_open_qpc, shader_disk_load_read_qpc;
     u64 shader_disk_load_close_qpc, shader_disk_load_progress_qpc;
     u64 shader_disk_load_open_calls, shader_disk_load_read_calls;
@@ -5581,6 +5579,9 @@ static int shader_disk_cache_progress(u64 value)
 {
     if (!shader_disk_cache_progress_due(value))
         return 0;
+    const rsx_shader_store_stats stats = rsx_shader_store_snapshot(&g_shader_store);
+    g_ld_shader_disk_writes[0] = stats.written[0];
+    g_ld_shader_disk_writes[1] = stats.written[1];
     fprintf(stderr,
             "[shader-disk-cache] hits{vs=%llu ps=%llu} "
             "misses{vs=%llu ps=%llu} writes{vs=%llu ps=%llu} "
@@ -5595,8 +5596,7 @@ static int shader_disk_cache_progress(u64 value)
     return 1;
 }
 
-/* Loads and stores share the progress message, but only load-side output is
- * included in the load subphase counters below. */
+/* Only the renderer prints progress. The worker owns no stdio streams. */
 static void shader_disk_cache_load_progress(u64 value)
 {
 #if defined(YZ_PERF_PROFILE)
@@ -6260,9 +6260,30 @@ static int shader_bundle_write_merged(void)
     return success;
 }
 
+int rsx_live_draw_stop_shader_cache(unsigned timeout_ms)
+{
+    const int complete = rsx_shader_store_stop(&g_shader_store, timeout_ms);
+    const rsx_shader_store_stats stats = rsx_shader_store_snapshot(&g_shader_store);
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    g_ld_shader_disk_writes[0] = stats.written[0];
+    g_ld_shader_disk_writes[1] = stats.written[1];
+    fprintf(stderr, "[shader-disk-store-async] drained=%d accepted=%llu "
+        "written{vs=%llu ps=%llu} failed=%llu dropped=%llu retained_jobs=%u "
+        "retained_bytes=%llu peak_jobs=%u peak_bytes=%llu write_wall_ms=%.3f\n",
+        complete, (unsigned long long)stats.accepted,
+        (unsigned long long)stats.written[0], (unsigned long long)stats.written[1],
+        (unsigned long long)stats.failed, (unsigned long long)stats.dropped,
+        stats.jobs, (unsigned long long)stats.bytes, stats.peak_jobs,
+        (unsigned long long)stats.peak_bytes, frequency.QuadPart > 0
+            ? 1000.0 * (double)stats.write_qpc / (double)frequency.QuadPart : 0.0);
+    return complete;
+}
+
 void rsx_live_draw_dump_shader_cache(void)
 {
     LARGE_INTEGER begin, end, frequency;
+    rsx_live_draw_stop_shader_cache(2000);
     if (!g.ready) return;
     if (InterlockedCompareExchange(&g_shader_bundle_dump_state, 1, 0) != 0)
         return;
@@ -6438,13 +6459,8 @@ static void shader_disk_cache_store_impl(
     if (!blob_length || blob_length > SHADER_DISK_CACHE_MAX_BLOB)
         return;
 
-    char path[MAX_PATH], temporary[MAX_PATH];
+    char path[MAX_PATH];
     if (!shader_disk_cache_path(path, stage, hash, source_length))
-        return;
-    const int temporary_length = snprintf(
-        temporary, sizeof(temporary), "%s.tmp.%lu", path,
-        (unsigned long)GetCurrentProcessId());
-    if (temporary_length <= 0 || temporary_length >= sizeof(temporary))
         return;
 
     shader_disk_cache_header header;
@@ -6456,37 +6472,27 @@ static void shader_disk_cache_store_impl(
     header.blob_length = (u32)blob_length;
     header.source_hash = hash;
 
-    FILE* file = fopen(temporary, "wb");
-    if (!file)
-        return;
-    const int wrote = fwrite(&header, sizeof(header), 1, file) == 1 &&
-        fwrite(source, 1, source_length, file) == source_length &&
-        fwrite(blob->lpVtbl->GetBufferPointer(blob), 1,
-               blob_length, file) == blob_length &&
-        fflush(file) == 0;
-    fclose(file);
-    if (!wrote || !MoveFileExA(
-            temporary, path,
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileA(temporary);
-        return;
-    }
-
-    const u32 stage_index = shader_disk_cache_stage_index(stage);
-    const u64 value = ++g_ld_shader_disk_writes[stage_index];
-    shader_disk_cache_progress(value);
+    rsx_shader_store_enqueue(&g_shader_store, path, &header, source,
+        blob->lpVtbl->GetBufferPointer(blob));
 }
 
 static void shader_disk_cache_store(
-    u32 stage, const char* source, u32 source_length, u64 hash, ID3DBlob* blob)
+    u32 stage, const char* source, u32 source_length, u64 hash, ID3DBlob* blob,
+    ld_slow_draw_scope* slow_draw)
 {
+    const u64 slow_begin = slow_draw && slow_draw->active ? ld_slow_draw_qpc() : 0;
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG begin = ld_profile_qpc();
-    ++g_ld_profile.total.shader_disk_store_calls;
+    ++g_ld_profile.total.shader_disk_enqueue_calls;
 #endif
     shader_disk_cache_store_impl(stage, source, source_length, hash, blob);
+    if (slow_draw && slow_draw->active) {
+        const u64 end = ld_slow_draw_qpc();
+        if (end >= slow_begin)
+            slow_draw->event.shader_disk_enqueue_ticks += end - slow_begin;
+    }
 #if defined(YZ_PERF_PROFILE)
-    g_ld_profile.total.shader_disk_store_qpc += ld_profile_qpc() - begin;
+    g_ld_profile.total.shader_disk_enqueue_qpc += ld_profile_qpc() - begin;
 #endif
 }
 
@@ -6959,7 +6965,7 @@ static ID3D12PipelineState* build_pso(
 #endif
             if (SUCCEEDED(vs_hr)) {
                 shader_disk_cache_store(
-                    'V', vs_hlsl, vs_length, vs_hash, vs);
+                    'V', vs_hlsl, vs_length, vs_hash, vs, slow_draw);
                 shader_blob_cache_insert_accounted(
                     &g.vs_blobs, vs_hlsl, vs_length, vs_hash, vs,
                     'V', vs_hash_seen);
@@ -7029,7 +7035,7 @@ static ID3D12PipelineState* build_pso(
 #endif
             if (SUCCEEDED(ps_hr)) {
                 shader_disk_cache_store(
-                    'P', ps_hlsl, ps_length, ps_hash, ps);
+                    'P', ps_hlsl, ps_length, ps_hash, ps, slow_draw);
                 shader_blob_cache_insert_accounted(
                     &g.ps_blobs, ps_hlsl, ps_length, ps_hash, ps,
                     'P', ps_hash_seen);
@@ -8366,7 +8372,7 @@ static void ld_profile_present(u32 frame)
                 "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
                 "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work,"
                 "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses,topology_index_ms,"
-                "texture_watch_ms,texture_watch_queries,texture_watch_dirty_pages,texture_watch_skip_bytes,texture_watch_skips,texture_watch_audits,texture_watch_races,texture_watch_failures,vertex_cache,vertex_cache_hits,vertex_cache_misses,vertex_cache_bypasses,vertex_cache_compared_bytes,vertex_cache_storage_bytes,geometry_cache,geometry_cache_hits,geometry_cache_misses,geometry_cache_bypasses,geometry_cache_queries,geometry_cache_dirty_pages,geometry_cache_storage_bytes,geometry_cache_audits,geometry_cache_races,geometry_cache_failures,geometry_cache_query_ms,geometry_cache_begin_ms,geometry_cache_store_ms,geometry_cache_copy_ms,geometry_cache_hit_vertices,geometry_cache_hit_refs,vertex_workers,vertex_worker_draws,vertex_worker_vertices,vertex_worker_large_draws,vertex_worker_large_vertices,vertex_worker_parallel_draws,vertex_worker_parallel_vertices,vertex_worker_jobs,vertex_worker_bypasses,vertex_worker_audits,vertex_worker_races,vertex_worker_failures,vertex_worker_wait_ms,shader_disk_load_ms,shader_disk_store_ms,shader_blob_create_ms,shader_disk_load_calls,shader_disk_store_calls,vs_blob_lookup_ms,ps_blob_lookup_ms,shader_disk_load_open_ms,shader_disk_load_read_ms,shader_disk_load_close_ms,shader_disk_load_progress_ms,shader_disk_load_other_ms,shader_disk_load_open_calls,shader_disk_load_read_calls,shader_disk_load_close_calls,shader_disk_load_progress_writes,texture_decode_calls,texture_decode_miss_calls,texture_decode_refresh_calls,texture_decode_retry_calls,texture_decode_create_ms,texture_decode_create_calls,texture_decode_create_max_ms,texture_decode_create_max_width,texture_decode_create_max_height,texture_decode_create_max_format,texture_decode_create_max_mips,texture_decode_create_max_array_size,texture_decode_create_max_kind,texture_decode_upload_memcpy_ms,texture_decode_upload_rows,texture_decode_copy_record_ms,texture_decode_copy_regions,texture_decode_barrier_record_ms,texture_decode_barriers,texture_decode_other_ms\n",32768,2048))
+                "texture_watch_ms,texture_watch_queries,texture_watch_dirty_pages,texture_watch_skip_bytes,texture_watch_skips,texture_watch_audits,texture_watch_races,texture_watch_failures,vertex_cache,vertex_cache_hits,vertex_cache_misses,vertex_cache_bypasses,vertex_cache_compared_bytes,vertex_cache_storage_bytes,geometry_cache,geometry_cache_hits,geometry_cache_misses,geometry_cache_bypasses,geometry_cache_queries,geometry_cache_dirty_pages,geometry_cache_storage_bytes,geometry_cache_audits,geometry_cache_races,geometry_cache_failures,geometry_cache_query_ms,geometry_cache_begin_ms,geometry_cache_store_ms,geometry_cache_copy_ms,geometry_cache_hit_vertices,geometry_cache_hit_refs,vertex_workers,vertex_worker_draws,vertex_worker_vertices,vertex_worker_large_draws,vertex_worker_large_vertices,vertex_worker_parallel_draws,vertex_worker_parallel_vertices,vertex_worker_jobs,vertex_worker_bypasses,vertex_worker_audits,vertex_worker_races,vertex_worker_failures,vertex_worker_wait_ms,shader_disk_load_ms,shader_disk_enqueue_ms,shader_blob_create_ms,shader_disk_load_calls,shader_disk_enqueue_calls,vs_blob_lookup_ms,ps_blob_lookup_ms,shader_disk_load_open_ms,shader_disk_load_read_ms,shader_disk_load_close_ms,shader_disk_load_progress_ms,shader_disk_load_other_ms,shader_disk_load_open_calls,shader_disk_load_read_calls,shader_disk_load_close_calls,shader_disk_load_progress_writes,texture_decode_calls,texture_decode_miss_calls,texture_decode_refresh_calls,texture_decode_retry_calls,texture_decode_create_ms,texture_decode_create_calls,texture_decode_create_max_ms,texture_decode_create_max_width,texture_decode_create_max_height,texture_decode_create_max_format,texture_decode_create_max_mips,texture_decode_create_max_array_size,texture_decode_create_max_kind,texture_decode_upload_memcpy_ms,texture_decode_upload_rows,texture_decode_copy_record_ms,texture_decode_copy_regions,texture_decode_barrier_record_ms,texture_decode_barriers,texture_decode_other_ms\n",32768,2048))
                 fprintf(stderr,"[profile-buffer] renderer allocation failed\n");
         }
     }
@@ -8486,10 +8492,10 @@ static void ld_profile_present(u32 frame)
             (unsigned long long)(g_vertex_worker_stats.failures-previous_workers.failures),
             ld_profile_ticks_ms(g_vertex_worker_wait_ticks-previous_worker_wait_ticks),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_disk_load_qpc)),
-            ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_disk_store_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_disk_enqueue_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_blob_create_qpc)),
             (unsigned long long)LD_PROFILE_DELTA(shader_disk_load_calls),
-            (unsigned long long)LD_PROFILE_DELTA(shader_disk_store_calls),
+            (unsigned long long)LD_PROFILE_DELTA(shader_disk_enqueue_calls),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vs_blob_lookup_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(ps_blob_lookup_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_disk_load_open_qpc)),
@@ -11814,6 +11820,8 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 
     ld_slow_draw_configure();
     shader_bundle_load_initial();
+    if (g_ld_shader_disk_ready > 0)
+        rsx_shader_store_start(&g_shader_store);
     g.ready = 1;
     g.enabled = 1;
     return 0;
@@ -13819,6 +13827,7 @@ void rsx_live_draw_present(u32 buffer_id)
 void rsx_live_draw_shutdown(void)
 {
     if (!g.ready) {
+        rsx_live_draw_stop_shader_cache(2000);
         ld_texture_diag_dump();
         ld_slow_flush_dump();
         ld_slow_draw_dump();
