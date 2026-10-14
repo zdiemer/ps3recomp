@@ -18,7 +18,7 @@ def main() -> int:
     binary = args.output_dir / "spu-interpreter-ri10.exe"
     source = ROOT / "runtime" / "spu"
     subprocess.run(
-        [str(args.compiler), "/nologo", "/std:c11", "/O1", "/UNDEBUG",
+        [str(args.compiler), "/nologo", "/std:c11", "/O1", "/UNDEBUG", "/D_CRT_SECURE_NO_WARNINGS",
          f"/I{ROOT / 'include'}", f"/I{source}",
          str(source / "tests" / "test_spu_interpreter_ri10.c"),
          str(source / "spu_interp.c"), f"/Fo:{args.output_dir.resolve()}\\", f"/Fe:{binary}"],

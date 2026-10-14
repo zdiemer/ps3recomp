@@ -20,7 +20,7 @@ def run(compiler: str, output_dir: Path) -> None:
         binary = output_dir / (name + (".exe" if os.name == "nt" else ""))
         sources = [str(source / "tests" / f"{name}.c"), str(source / "spu_interp.c")]
         if os.name == "nt":
-            command = [compiler, "/nologo", "/std:c11", "/O1", "/UNDEBUG",
+            command = [compiler, "/nologo", "/std:c11", "/O1", "/UNDEBUG", "/D_CRT_SECURE_NO_WARNINGS",
                        f"/I{ROOT / 'include'}", f"/I{source}", *sources, f"/Fe:{binary}"]
         else:
             command = [compiler, "-std=gnu17", "-O1", "-UNDEBUG",
