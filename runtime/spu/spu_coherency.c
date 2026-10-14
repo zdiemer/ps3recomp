@@ -75,8 +75,122 @@ static void queue_notify_publication(uint32_t ea)
         }
     }
 }
+
+/* BEGIN SPU TASKSET WAKE WATCH */
+/* SPURS readiness is published into the first taskset header line. Keep this
+ * exact-line watcher separate from the HLE task scan: notifications only set
+ * an auto-reset event, while spu_taskset_start_ready remains authoritative
+ * for validation and claiming. Registry and per-task timestamps are protected
+ * by the lock-line lock already held by every notify caller. */
+#define SPU_TASKSET_WAKE_WATCHES 64u
+#define SPU_TASKSET_READY_OFF 0x10u
+#define SPU_TASKSET_PENDING_READY_OFF 0x20u
+#define SPU_TASKSET_ENABLED_OFF 0x30u
+typedef struct {
+    uint32_t taskset_ea;
+    uint32_t spurs_ea;
+    uint8_t* host;
+    HANDLE event;
+    uint64_t (*qpc_callback)(void);
+    uint8_t eligible[16];
+    uint64_t ready_qpc[128];
+} spu_taskset_wake_watch;
+static spu_taskset_wake_watch s_taskset_watches[SPU_TASKSET_WAKE_WATCHES];
+static unsigned s_taskset_watch_count;
+static unsigned taskset_watch_index(uint32_t ea)
+{ return ((ea >> 7) ^ (ea >> 15) ^ (ea >> 23)) & (SPU_TASKSET_WAKE_WATCHES - 1u); }
+static void taskset_watch_prime(spu_taskset_wake_watch* w)
+{
+    for (unsigned b = 0; b < 16; ++b)
+        w->eligible[b] = w->host[SPU_TASKSET_ENABLED_OFF + b] &
+            (w->host[SPU_TASKSET_READY_OFF + b] | w->host[SPU_TASKSET_PENDING_READY_OFF + b]);
+}
+int spu_coh_watch_taskset(uint32_t taskset_ea, uint32_t spurs_ea,
+                          void* host_address, void* event,
+                          uint64_t (*qpc_callback)(void))
+{
+    if (!taskset_ea || (taskset_ea & 127u) || !spurs_ea || !host_address || !event) return 0;
+    unsigned slot = taskset_watch_index(taskset_ea);
+    spu_taskset_wake_watch* w = &s_taskset_watches[slot];
+    if (w->taskset_ea == taskset_ea) {
+        /* Reinitialization may reuse the guest EA with a new host mapping or
+         * SPURS instance. Reset edge history so a stale ready bit cannot wake
+         * the new owner. */
+        if (w->spurs_ea != spurs_ea || w->host != (uint8_t*)host_address ||
+            w->event != (HANDLE)event || w->qpc_callback != qpc_callback) {
+            memset(w, 0, sizeof(*w));
+            w->taskset_ea = taskset_ea; w->spurs_ea = spurs_ea;
+            w->host = (uint8_t*)host_address; w->event = (HANDLE)event;
+            w->qpc_callback = qpc_callback;
+            taskset_watch_prime(w);
+        }
+        return 1;
+    }
+    if (w->taskset_ea) return 0; /* exact-line collision: retain polling */
+    w->taskset_ea = taskset_ea; w->spurs_ea = spurs_ea;
+    w->host = (uint8_t*)host_address; w->event = (HANDLE)event;
+    w->qpc_callback = qpc_callback;
+    ++s_taskset_watch_count;
+    taskset_watch_prime(w);
+    return 1;
+}
+void spu_coh_unwatch_tasksets(uint32_t spurs_ea)
+{
+    if (!spurs_ea) return;
+    for (unsigned i = 0; i < SPU_TASKSET_WAKE_WATCHES; ++i)
+        if (s_taskset_watches[i].spurs_ea == spurs_ea) {
+            memset(&s_taskset_watches[i], 0, sizeof(s_taskset_watches[i]));
+            --s_taskset_watch_count;
+        }
+}
+uint64_t spu_coh_taskset_ready_qpc_locked(uint32_t taskset_ea, uint32_t taskid)
+{
+    if (taskid >= 128) return 0;
+    spu_taskset_wake_watch* w = &s_taskset_watches[taskset_watch_index(taskset_ea)];
+    return w->taskset_ea == taskset_ea ? w->ready_qpc[taskid] : 0;
+}
+static void taskset_notify_publication(uint32_t ea)
+{
+    if (!s_taskset_watch_count) return;
+    uint32_t line = ea & ~127u;
+    unsigned slot = taskset_watch_index(line);
+    {
+        uint8_t* host = s_taskset_watches[slot].host;
+        if (!host || (s_taskset_watches[slot].taskset_ea & ~127u) != line) return;
+        int rose = 0;
+        uint8_t next[16];
+        for (unsigned b = 0; b < 16; ++b) {
+            next[b] = host[SPU_TASKSET_ENABLED_OFF + b] &
+                      (host[SPU_TASKSET_READY_OFF + b] | host[SPU_TASKSET_PENDING_READY_OFF + b]);
+            if (next[b] & (uint8_t)~s_taskset_watches[slot].eligible[b]) rose = 1;
+        }
+        if (rose) {
+            uint64_t qpc = s_taskset_watches[slot].qpc_callback
+                         ? s_taskset_watches[slot].qpc_callback() : 0;
+            for (unsigned b = 0; b < 16; ++b) {
+                uint8_t rising = next[b] & (uint8_t)~s_taskset_watches[slot].eligible[b];
+                for (unsigned bit = 0; bit < 8; ++bit) {
+                    if (rising & (0x80u >> bit)) {
+                        s_taskset_watches[slot].ready_qpc[b * 8 + bit] = qpc;
+                    }
+                }
+            }
+            SetEvent(s_taskset_watches[slot].event);
+        }
+        /* Update on both rises and falls, so only a fresh eligibility edge
+         * can signal and stale ready timestamps do not survive deactivation. */
+        for (unsigned b = 0; b < 16; ++b) {
+            uint8_t fallen = s_taskset_watches[slot].eligible[b] & (uint8_t)~next[b];
+            for (unsigned bit = 0; bit < 8; ++bit)
+                if (fallen & (0x80u >> bit)) s_taskset_watches[slot].ready_qpc[b * 8 + bit] = 0;
+            s_taskset_watches[slot].eligible[b] = next[b];
+        }
+    }
+}
+/* END SPU TASKSET WAKE WATCH */
 #else
 #define queue_notify_publication(ea) ((void)0)
+#define taskset_notify_publication(ea) ((void)0)
 #endif
 
 /* ===========================================================================
@@ -238,6 +352,7 @@ int spu_coh_is_reserved(uint32_t addr)
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     queue_notify_publication(ea);
+    taskset_notify_publication(ea);
     uint32_t line = ea & ~127u;
     for (size_t i = 0; i < s_coh_count; i++) {
         spu_context* c = s_coh_ctxs[i];
@@ -254,6 +369,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 void spu_coh_notify_write(uint32_t ea)
 {
     queue_notify_publication(ea);
+    taskset_notify_publication(ea);
     uint32_t line = ea & ~127u;
     for (size_t i = 0; i < s_coh_count; i++) {
         spu_context* c = s_coh_ctxs[i];

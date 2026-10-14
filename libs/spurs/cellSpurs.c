@@ -437,7 +437,23 @@ static struct SpursInst {
     u32           nspus;
     char          prefix[16];
     volatile long kernel_live; /* poll thread started */
+    HANDLE        taskset_wake_event; /* process-lifetime auto-reset event */
+    int           taskset_wake_enabled; /* immutable after first Initialize */
+    int           taskset_wake_configured;
 } s_inst[MAX_SPURS_INST];
+static volatile LONG s_taskset_wake_mode = -1;
+
+static int spurs_taskset_wake_requested(void)
+{
+    LONG mode = InterlockedCompareExchange(&s_taskset_wake_mode, -1, -1);
+    if (mode < 0) {
+        const char* value = getenv("SPU_TASKSET_WAKE");
+        LONG parsed = value && value[0] == '1' && value[1] == '\0';
+        InterlockedCompareExchange(&s_taskset_wake_mode, parsed, -1);
+        mode = InterlockedCompareExchange(&s_taskset_wake_mode, -1, -1);
+    }
+    return (int)mode;
+}
 
 static struct SpursInst* spurs_inst_find(u32 ea)
 {
@@ -461,6 +477,18 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
     si->nspus = (nspus > 0 && nspus <= CELL_SPURS_MAX_SPU) ? nspus : 1;
     memset(si->prefix, 0, sizeof(si->prefix));
     if (prefix) memcpy(si->prefix, prefix, 15);
+
+    if (!si->taskset_wake_configured) {
+        if (spurs_taskset_wake_requested())
+            si->taskset_wake_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+        si->taskset_wake_enabled = si->taskset_wake_event != NULL;
+        si->taskset_wake_configured = 1;
+    }
+    if (si->taskset_wake_enabled)
+        spu_taskset_wake_register(spurs_ea, si->taskset_wake_event);
+    fprintf(stderr, "[spurs-taskset-wake] enabled=%d requested=%d event=%d spurs=0x%08X\n",
+            si->taskset_wake_enabled, spurs_taskset_wake_requested(),
+            si->taskset_wake_event != NULL, spurs_ea);
 
     /* Real BE instance: zero it, then the few live fields. (The global
      * workload table is NOT wiped here — the title may init several SPURS
@@ -523,7 +551,9 @@ s32 cellSpursFinalize(CellSpurs* spurs)
 
     printf("[cellSpurs] Finalize(ea=0x%08X)\n", si->ea);
     memset(s_workloads, 0, sizeof(s_workloads));
+    spu_taskset_wake_unregister(si->ea);
     si->ea = 0;   /* kernel thread sees a dead instance and idles */
+    if (si->taskset_wake_event) SetEvent(si->taskset_wake_event);
     return CELL_OK;
 }
 
@@ -1537,12 +1567,22 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
     int changes_logged = 0;
 
     for (;;) {
-        Sleep(1);
+        uint32_t poll_cause = SPU_TASKSET_DISPATCH_POLL;
+        if (si->taskset_wake_enabled && si->taskset_wake_event) {
+            DWORD wait_result = WaitForSingleObject(si->taskset_wake_event, 1);
+            if (wait_result == WAIT_OBJECT_0) {
+                poll_cause = SPU_TASKSET_DISPATCH_WAKE;
+            } else {
+                if (wait_result != WAIT_TIMEOUT) Sleep(1);
+            }
+        } else {
+            Sleep(1);
+        }
         u32 ea = si->ea;
         if (!ea || s_pm_off) continue;
 
         /* Persistent tasks can create siblings without ever exiting. */
-        spu_taskset_poll(ea);
+        spu_taskset_poll_cause(ea, poll_cause);
 
         if (watch) {
             const unsigned char* live = (const unsigned char*)vm_base + ea;

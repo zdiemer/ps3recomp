@@ -47,6 +47,14 @@ void spu_lockline_unlock(void);
 #ifdef _WIN32
 int spu_coh_watch_queue(uint32_t ea, void* host_address);
 void spu_coh_unwatch_queue(int cookie);
+/* Experimental SPURS task readiness watch. Caller holds the lock-line lock.
+ * `host_address` is the 128-byte taskset header and event is an auto-reset
+ * process-lifetime event. A collision/full table returns 0 (poll fallback). */
+int spu_coh_watch_taskset(uint32_t taskset_ea, uint32_t spurs_ea,
+                          void* host_address, void* event,
+                          uint64_t (*qpc_callback)(void));
+void spu_coh_unwatch_tasksets(uint32_t spurs_ea);
+uint64_t spu_coh_taskset_ready_qpc_locked(uint32_t taskset_ea, uint32_t taskid);
 #endif
 
 /* Mark `ea`'s 128-byte line as SPU-reserved and remember `ctx` as a possible

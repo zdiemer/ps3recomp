@@ -48,13 +48,15 @@ typedef struct {
     uint32_t have_r3;
     uint32_t dispatch_cause;
     uint64_t claim_qpc;
+    uint64_t ready_qpc;
 } spu_async_trace_snapshot;
 
 enum {
     SPU_TASKSET_DISPATCH_UNKNOWN = 0,
     SPU_TASKSET_DISPATCH_CREATE = 1,
     SPU_TASKSET_DISPATCH_TASK_EXIT = 2,
-    SPU_TASKSET_DISPATCH_POLL = 3
+    SPU_TASKSET_DISPATCH_POLL = 3,
+    SPU_TASKSET_DISPATCH_WAKE = 4
 };
 
 enum {
@@ -185,7 +187,7 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
 int spu_workload_dispatch_async_task_provenance(const uint8_t* image, uint32_t image_size,
                                                 uint32_t args_ea, uint32_t taskset_ea,
                                                 uint32_t taskid, uint32_t dispatch_cause,
-                                                uint64_t claim_qpc);
+                                                uint64_t claim_qpc, uint64_t ready_qpc);
 int spu_taskset_claim(uint32_t taskset_ea, uint32_t taskid);
 void spu_taskset_release(uint32_t taskset_ea, uint32_t taskid);
 void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t taskid);
@@ -193,6 +195,9 @@ void spu_taskset_start_ready(uint32_t taskset_ea);
 void spu_taskset_start_ready_cause(uint32_t taskset_ea, uint32_t dispatch_cause);
 void spu_taskset_capture_args(uint32_t taskset_ea, uint32_t taskid, uint32_t args[4]);
 void spu_taskset_poll(uint32_t spurs_ea);
+void spu_taskset_poll_cause(uint32_t spurs_ea, uint32_t dispatch_cause);
+void spu_taskset_wake_register(uint32_t spurs_ea, void* event);
+void spu_taskset_wake_unregister(uint32_t spurs_ea);
 
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);

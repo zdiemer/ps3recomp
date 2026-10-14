@@ -1288,11 +1288,12 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 int spu_workload_dispatch_async_task_provenance(const uint8_t* image, uint32_t image_size,
                                                 uint32_t args_ea, uint32_t taskset_ea,
                                                 uint32_t taskid, uint32_t dispatch_cause,
-                                                uint64_t claim_qpc)
+                                                uint64_t claim_qpc, uint64_t ready_qpc)
 {
 #if !defined(_WIN32) || !defined(YZ_PERF_PROFILE)
     (void)dispatch_cause;
     (void)claim_qpc;
+    (void)ready_qpc;
 #endif
     if (!image || image_size == 0) return 0;
 
@@ -1419,6 +1420,7 @@ int spu_workload_dispatch_async_task_provenance(const uint8_t* image, uint32_t i
         snapshot->have_r3 = (uint32_t)(j->have_r3 != 0);
         snapshot->dispatch_cause = dispatch_cause;
         snapshot->claim_qpc = claim_qpc;
+        snapshot->ready_qpc = ready_qpc;
         if (j->have_r3) memcpy(snapshot->r3, j->r3, sizeof(snapshot->r3));
         uint64_t submit_qpc = spu_async_trace_qpc();
         spu_async_trace_emit(SPU_ASYNC_TRACE_SUBMIT, snapshot, submit_qpc, submit_qpc);
@@ -1498,7 +1500,7 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
 {
     return spu_workload_dispatch_async_task_provenance(image, image_size, args_ea,
                                                        taskset_ea, taskid,
-                                                       SPU_TASKSET_DISPATCH_UNKNOWN, 0);
+                                                       SPU_TASKSET_DISPATCH_UNKNOWN, 0, 0);
 }
 
 /* Legacy PPU entry point: capture the caller's identity before spawning. The
