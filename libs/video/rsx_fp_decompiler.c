@@ -139,6 +139,59 @@ static int fp_instruction_has_constant(u32 w1, u32 w2, u32 w3)
             FP_REG_TYPE_CONST;
 }
 
+/* Build a conservative mask of texture units referenced by this program.
+ * The walk is deliberately linear: instructions inside either side of a
+ * branch still contribute to the type requirements of the generated HLSL.
+ * Inline CONST payloads are skipped exactly as in the decompiler so their
+ * words cannot be mistaken for instructions. If the stream is malformed or
+ * contains an opcode whose fields we cannot classify, callers retain the
+ * original binding masks. */
+static int fp_scan_texture_units(
+    const u8* ucode, u32 max_bytes, u32* out_texture_mask)
+{
+    enum { FP_MAX_SCAN_INSTRUCTIONS = 4096 };
+    if (!ucode || !out_texture_mask)
+        return 0;
+
+    u32 off = 0;
+    u32 texture_mask = 0;
+    for (u32 count = 0; count < FP_MAX_SCAN_INSTRUCTIONS &&
+                        off <= max_bytes && max_bytes - off >= 16; ++count) {
+        const u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        off += 16;
+
+        const u32 opcode = (w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT;
+        const int is_branch = (w2 & FP_BRANCH) != 0;
+        if (rsx_fp_opcode_name(opcode)[0] == '?')
+            return 0;
+
+        if (!is_branch) {
+            switch (opcode) {
+            case OP_TEX: case OP_TXP: case OP_TXD:
+            case OP_TXB: case OP_TXL:
+                texture_mask |= 1u << ((w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT);
+                break;
+            default:
+                break;
+            }
+        }
+
+        if (fp_instruction_has_constant(w1, w2, w3)) {
+            if (off > max_bytes || max_bytes - off < 16)
+                return 0;
+            off += 16;
+        }
+        if (w0 & FP_END) {
+            *out_texture_mask = texture_mask;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 unsigned long long g_rsx_fp_nonfinite_constants = 0;
 
 /* An inline fragment constant is never legitimately non-finite.  A NaN one
@@ -421,6 +474,12 @@ static int rsx_fp_decompile_internal(
 {
     if (!ucode || !out || out_size == 0) return -1;
     if (tex_cube_mask & tex_shadow_mask) return -1;
+    u32 used_texture_mask = 0;
+    if ((tex_cube_mask | tex_shadow_mask) != 0 &&
+        fp_scan_texture_units(ucode, max_bytes, &used_texture_mask)) {
+        tex_cube_mask &= used_texture_mask;
+        tex_shadow_mask &= used_texture_mask;
+    }
     const u32 typed_texture_mask = tex_cube_mask | tex_shadow_mask;
 
     u32 buffered_constant_count = 0;
