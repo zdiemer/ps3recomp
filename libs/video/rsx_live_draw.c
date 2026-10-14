@@ -431,7 +431,7 @@ typedef struct {
     u64 depth_write_draws;
     u64 depth_both_draws;
     int reject_logged;
-    u32 guest_w, guest_h, pitch, format;
+    u32 guest_w, guest_h, pitch, format, antialias;
     ID3D12Resource* packed;
     u32 packed_w, packed_h, packed_guest_w, packed_guest_h;
     u64 generation, packed_generation;
@@ -5202,6 +5202,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     if (!honor_zeta_track()) return 0;
     rsx_dsp_surface guest_surface;
     rsx_dsp_get_surface(&g.rsx, &guest_surface);
+    const u32 antialias = (rsx_dsp_reg(&g.rsx, 0x0208) >> 12) & 15u;
     /* The DSV must cover the complete live framebuffer/viewport it is bound
      * with.  Some early passes declare a smaller clip than the active canvas;
      * allocating only that clip causes the D3D device to reject later
@@ -5221,12 +5222,14 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
                 const u32 guest_w = rt_w ? rt_w : g.width;
                 const u32 guest_h = rt_h ? rt_h : g.height;
                 if (z->guest_w != guest_w || z->guest_h != guest_h ||
-                    z->pitch != guest_surface.zeta_pitch || z->format != guest_surface.depth_format)
+                    z->pitch != guest_surface.zeta_pitch || z->format != guest_surface.depth_format ||
+                    z->antialias != antialias)
                     ++z->generation;
                 z->guest_w = guest_w;
                 z->guest_h = guest_h;
                 z->pitch = guest_surface.zeta_pitch;
                 z->format = guest_surface.depth_format;
+                z->antialias = antialias;
             }
             if (z->w >= want_w && z->h >= want_h) {
                 zdepth_grow_snapshot(i, rt_w, rt_h);
@@ -5297,6 +5300,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->guest_h = rt_h ? rt_h : g.height;
     z->pitch = guest_surface.zeta_pitch;
     z->format = guest_surface.depth_format;
+    z->antialias = antialias;
     ++z->generation;
     z->w = want_w;
     z->h = want_h;
@@ -5445,11 +5449,20 @@ static int zdepth_snapshot(u32 slot)
 /* Z24S8 may be read through an A8R8G8B8 view. Its big-endian guest bytes
  * become A=depth[23:16], R=depth[15:8], G=depth[7:0], B=stencil.
  * Keep this snapshot separate from the scalar depth SRV used by shadows. */
+static u32 zdepth_samples_x(const zdepth_t* z)
+{
+    return z->antialias == 3u || z->antialias == 4u || z->antialias == 5u ? 2u : 1u;
+}
+static u32 zdepth_samples_y(const zdepth_t* z)
+{
+    return z->antialias == 4u || z->antialias == 5u ? 2u : 1u;
+}
 static int zdepth_pack(u32 index, u32 guest_w, u32 guest_h)
 {
     if (index >= g.n_zdepths || !g.depth_pack_pso || !guest_w || !guest_h) return 0;
     zdepth_t* z = &g.zdepths[index];
-    if (z->format != 2 || !z->tex || (u64)guest_w * 4 > z->pitch || guest_h > z->guest_h) return 0;
+    if (z->format != 2 || !z->tex || (u64)guest_w * 4 > z->pitch ||
+        guest_h > z->guest_h * zdepth_samples_y(z)) return 0;
     u32 w, h;
     rsx_render_surface_extent(&g_ld_resolution, guest_w, guest_h, &w, &h);
     if (w > 16384 || h > 16384 || g.srv_ring_used >= SRV_RING_TABLES) return 0;
@@ -5517,8 +5530,14 @@ static int zdepth_pack(u32 index, u32 guest_w, u32 guest_h)
     g.list->lpVtbl->SetComputeRootDescriptorTable(g.list, 1, gpu);
     u32 source_w, source_h;
     rsx_render_surface_extent(&g_ld_resolution, z->guest_w, z->guest_h, &source_w, &source_h);
-    float scale[2] = {(float)guest_w / w * source_w / z->guest_w,
-                      (float)guest_h / h * source_h / z->guest_h};
+    /* A raw color view addresses samples, not pixels. RSX 2x stores a 2x1
+     * sample grid; both 4x modes use 2x2. The host currently rasterizes one
+     * sample per pixel, so replicate it across that grid. Treating the extra
+     * samples as row padding squeezes depth silhouettes into the left half
+     * of the texture, misplacing fog and particle occlusion over the scene.
+     * Use the producer's saved AA mode: the sampling pass has its own mode. */
+    float scale[2] = {(float)guest_w / w * source_w / z->guest_w / zdepth_samples_x(z),
+                      (float)guest_h / h * source_h / z->guest_h / zdepth_samples_y(z)};
     g.list->lpVtbl->SetComputeRoot32BitConstants(g.list, 2, 2, scale, 0);
     g.list->lpVtbl->Dispatch(g.list, (w + 7) / 8, (h + 7) / 8, 1);
     for (u32 i = 0; i < 2; ++i) {
@@ -5536,8 +5555,9 @@ static int ld_blit_depth(u32 sl, u32 sa, u32 sp, u32 dl, u32 da, u32 dp, u32 w, 
     for (u32 zi = 0; zi < g.n_zdepths; ++zi) {
         zdepth_t* z = &g.zdepths[zi];
         if (z->location != sl || z->offset != sa || z->pitch != sp ||
-            w > sp / 4 || w > dp / 4 || h > z->guest_h || ((sa | da | sp | dp) & 3u)) continue;
-        if (!zdepth_pack(zi, sp / 4, z->guest_h)) return -1;
+            w > sp / 4 || w > dp / 4 || h > z->guest_h * zdepth_samples_y(z) ||
+            ((sa | da | sp | dp) & 3u)) continue;
+        if (!zdepth_pack(zi, sp / 4, z->guest_h * zdepth_samples_y(z))) return -1;
         u32 dx = 0, dy = 0;
         int di = surface_containing(dl, da, dp, w, h, &dx, &dy);
         if (di < 0) di = (int)surface_get(dl, da, dp / 4, h, DXGI_FORMAT_R8G8B8A8_UNORM);
