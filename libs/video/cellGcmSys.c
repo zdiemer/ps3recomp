@@ -1663,6 +1663,22 @@ enum {
     GCM_SLOW_PHASE_REF_LOCK_WAIT = 7,
     GCM_SLOW_PHASE_REF_PUBLISH = 8,
 };
+typedef struct gcm_fifo_recycle_ack {
+    u64 qpc_begin, qpc_end;
+    u32 expected_ea, initial_observed_ea, observed_ea, wait_calls, completed;
+} gcm_fifo_recycle_ack;
+typedef struct gcm_fifo_recycle_event {
+    u64 sequence, qpc_begin, qpc_end;
+    u32 host_tid, renderer_frame, context_ea, begin_ea, current_ea;
+    u32 begin_io, current_io, outcome;
+    gcm_fifo_recycle_ack ack_current, ack_begin;
+} gcm_fifo_recycle_event;
+enum {
+    GCM_FIFO_RECYCLE_COMPLETE = 0,
+    GCM_FIFO_RECYCLE_NULL_CONTEXT = 1,
+    GCM_FIFO_RECYCLE_EMPTY = 2,
+    GCM_FIFO_RECYCLE_UNMAPPED = 3,
+};
 static void gcm_rsx_process_fifo_unlocked(gcm_slow_drain_event* diagnostic);
 
 /* Slow-drain diagnostics are deliberately outside the per-method walker. The
@@ -1670,9 +1686,12 @@ static void gcm_rsx_process_fifo_unlocked(gcm_slow_drain_event* diagnostic);
  * I/O occurs only from the explicit shutdown dump. */
 #ifdef _WIN32
 #define GCM_SLOW_DRAIN_CAP 16384u
+#define GCM_FIFO_RECYCLE_TRACE_CAP 16384u
 
 static INIT_ONCE s_gcm_slow_drain_once = INIT_ONCE_STATIC_INIT;
 static const char* s_gcm_slow_drain_path;
+static char s_gcm_fifo_recycle_path[4096];
+static int s_gcm_fifo_recycle_path_valid;
 static u64 s_gcm_slow_drain_frequency;
 static SRWLOCK s_gcm_slow_drain_lock = SRWLOCK_INIT;
 static gcm_slow_drain_event s_gcm_slow_drain_events[GCM_SLOW_DRAIN_CAP];
@@ -1680,6 +1699,12 @@ static u64 s_gcm_slow_drain_next, s_gcm_slow_drain_count;
 static u64 s_gcm_slow_drain_overwritten;
 static u64 s_gcm_slow_drain_sequence;
 static int s_gcm_slow_drain_dumped;
+static gcm_fifo_recycle_event s_gcm_fifo_recycle_events[GCM_FIFO_RECYCLE_TRACE_CAP];
+static u64 s_gcm_fifo_recycle_next, s_gcm_fifo_recycle_count;
+static u64 s_gcm_fifo_recycle_overwritten, s_gcm_fifo_recycle_sequence;
+static u64 s_gcm_fifo_recycle_started, s_gcm_fifo_recycle_completed;
+static u64 s_gcm_fifo_recycle_inflight;
+static int s_gcm_fifo_recycle_dumped;
 
 static BOOL CALLBACK gcm_slow_drain_init(PINIT_ONCE once, PVOID param, PVOID* context)
 {
@@ -1693,6 +1718,17 @@ static BOOL CALLBACK gcm_slow_drain_init(PINIT_ONCE once, PVOID param, PVOID* co
             fprintf(stderr,"[slow-fifo-drain] QPC frequency unavailable; diagnostic disabled\n");
             s_gcm_slow_drain_path=NULL;
         }
+        if (s_gcm_slow_drain_path) {
+            static const char suffix[] = ".recycle.csv";
+            const size_t path_length = strlen(s_gcm_slow_drain_path);
+            if (path_length + sizeof(suffix) <= sizeof(s_gcm_fifo_recycle_path)) {
+                memcpy(s_gcm_fifo_recycle_path,s_gcm_slow_drain_path,path_length);
+                memcpy(s_gcm_fifo_recycle_path+path_length,suffix,sizeof(suffix));
+                s_gcm_fifo_recycle_path_valid=1;
+            } else {
+                fprintf(stderr,"[slow-fifo-recycle] output path too long for .recycle.csv; tracing disabled\n");
+            }
+        }
     } else s_gcm_slow_drain_path=NULL;
     return TRUE;
 }
@@ -1702,6 +1738,111 @@ static u64 gcm_slow_drain_qpc(void)
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     return (u64)now.QuadPart;
+}
+
+static int gcm_slow_drain_enabled(void)
+{
+    InitOnceExecuteOnce(&s_gcm_slow_drain_once,gcm_slow_drain_init,NULL,NULL);
+    return s_gcm_slow_drain_path && s_gcm_slow_drain_frequency;
+}
+
+static int gcm_fifo_recycle_trace_start(gcm_fifo_recycle_event* event)
+{
+    if (!gcm_slow_drain_enabled() || !s_gcm_fifo_recycle_path_valid || !event) return 0;
+    AcquireSRWLockExclusive(&s_gcm_slow_drain_lock);
+    if (s_gcm_fifo_recycle_dumped) {
+        ReleaseSRWLockExclusive(&s_gcm_slow_drain_lock);
+        return 0;
+    }
+    ++s_gcm_fifo_recycle_started;
+    ++s_gcm_fifo_recycle_inflight;
+    ReleaseSRWLockExclusive(&s_gcm_slow_drain_lock);
+    event->qpc_begin=gcm_slow_drain_qpc();
+    event->host_tid=GetCurrentThreadId();
+    event->renderer_frame=rsx_live_draw_get_frames();
+    return 1;
+}
+
+static void gcm_fifo_recycle_record(const gcm_fifo_recycle_event* event)
+{
+    if (!event) return;
+    AcquireSRWLockExclusive(&s_gcm_slow_drain_lock);
+    ++s_gcm_fifo_recycle_completed;
+    if (s_gcm_fifo_recycle_inflight) --s_gcm_fifo_recycle_inflight;
+    if (!s_gcm_fifo_recycle_dumped) {
+        gcm_fifo_recycle_event saved=*event;
+        saved.sequence=++s_gcm_fifo_recycle_sequence;
+        s_gcm_fifo_recycle_events[s_gcm_fifo_recycle_next]=saved;
+        s_gcm_fifo_recycle_next=(s_gcm_fifo_recycle_next+1u)%GCM_FIFO_RECYCLE_TRACE_CAP;
+        if (s_gcm_fifo_recycle_count<GCM_FIFO_RECYCLE_TRACE_CAP)
+            ++s_gcm_fifo_recycle_count;
+        else
+            ++s_gcm_fifo_recycle_overwritten;
+    }
+    ReleaseSRWLockExclusive(&s_gcm_slow_drain_lock);
+}
+
+static void gcm_fifo_recycle_dump(void)
+{
+    if (!s_gcm_fifo_recycle_path_valid || !s_gcm_slow_drain_frequency) return;
+    AcquireSRWLockExclusive(&s_gcm_slow_drain_lock);
+    if (s_gcm_fifo_recycle_dumped) {
+        ReleaseSRWLockExclusive(&s_gcm_slow_drain_lock);
+        return;
+    }
+    FILE* file=fopen(s_gcm_fifo_recycle_path,"wb");
+    if (!file) {
+        fprintf(stderr,"[slow-fifo-recycle] cannot open %s\n",s_gcm_fifo_recycle_path);
+        ReleaseSRWLockExclusive(&s_gcm_slow_drain_lock);
+        return;
+    }
+    int io_error=0;
+    const u64 started=s_gcm_fifo_recycle_started;
+    const u64 completed=s_gcm_fifo_recycle_completed;
+    const u64 inflight=s_gcm_fifo_recycle_inflight;
+    if (fprintf(file,"#qpc_frequency,%llu,recorded,%llu,overwritten,%llu,started,%llu,completed,%llu,inflight_at_dump,%llu\n",
+        (unsigned long long)s_gcm_slow_drain_frequency,
+        (unsigned long long)(s_gcm_fifo_recycle_count+s_gcm_fifo_recycle_overwritten),
+        (unsigned long long)s_gcm_fifo_recycle_overwritten,
+        (unsigned long long)started,(unsigned long long)completed,
+        (unsigned long long)inflight)<0) io_error=1;
+    if (fprintf(file,"sequence,host_tid,renderer_frame,qpc_begin,qpc_end,total_ms,context_ea,begin_ea,current_ea,begin_io,current_io,outcome,ack_current_expected_ea,ack_current_initial_observed_ea,ack_current_observed_ea,ack_current_begin,ack_current_end,ack_current_ms,ack_current_wait_calls,ack_current_completed,ack_begin_expected_ea,ack_begin_initial_observed_ea,ack_begin_observed_ea,ack_begin_begin,ack_begin_end,ack_begin_ms,ack_begin_wait_calls,ack_begin_completed\n")<0)
+        io_error=1;
+    const u64 retained=s_gcm_fifo_recycle_count<GCM_FIFO_RECYCLE_TRACE_CAP
+        ? s_gcm_fifo_recycle_count : GCM_FIFO_RECYCLE_TRACE_CAP;
+    const u64 first=s_gcm_fifo_recycle_count<GCM_FIFO_RECYCLE_TRACE_CAP
+        ? 0 : s_gcm_fifo_recycle_next;
+    const double scale=1000.0/(double)s_gcm_slow_drain_frequency;
+    for (u64 i=0;i<retained;++i) {
+        const gcm_fifo_recycle_event* e=
+            &s_gcm_fifo_recycle_events[(first+i)%GCM_FIFO_RECYCLE_TRACE_CAP];
+        const u64 total=e->qpc_end>=e->qpc_begin ? e->qpc_end-e->qpc_begin : 0;
+        const u64 current=e->ack_current.qpc_end>=e->ack_current.qpc_begin
+            ? e->ack_current.qpc_end-e->ack_current.qpc_begin : 0;
+        const u64 begin=e->ack_begin.qpc_end>=e->ack_begin.qpc_begin
+            ? e->ack_begin.qpc_end-e->ack_begin.qpc_begin : 0;
+        if (fprintf(file,"%llu,%u,%u,%llu,%llu,%.6f,0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,%u,0x%08X,0x%08X,0x%08X,%llu,%llu,%.6f,%u,%u,0x%08X,0x%08X,0x%08X,%llu,%llu,%.6f,%u,%u\n",
+            (unsigned long long)e->sequence,e->host_tid,e->renderer_frame,
+            (unsigned long long)e->qpc_begin,(unsigned long long)e->qpc_end,
+            total*scale,e->context_ea,e->begin_ea,e->current_ea,e->begin_io,
+            e->current_io,e->outcome,e->ack_current.expected_ea,
+            e->ack_current.initial_observed_ea,e->ack_current.observed_ea,
+            (unsigned long long)e->ack_current.qpc_begin,
+            (unsigned long long)e->ack_current.qpc_end,current*scale,
+            e->ack_current.wait_calls,e->ack_current.completed,
+            e->ack_begin.expected_ea,e->ack_begin.initial_observed_ea,
+            e->ack_begin.observed_ea,
+            (unsigned long long)e->ack_begin.qpc_begin,
+            (unsigned long long)e->ack_begin.qpc_end,begin*scale,
+            e->ack_begin.wait_calls,e->ack_begin.completed)<0)
+            io_error=1;
+    }
+    if (ferror(file)) io_error=1;
+    if (fclose(file)!=0) io_error=1;
+    if (io_error)
+        fprintf(stderr,"[slow-fifo-recycle] write failed for %s\n",s_gcm_fifo_recycle_path);
+    else s_gcm_fifo_recycle_dumped=1;
+    ReleaseSRWLockExclusive(&s_gcm_slow_drain_lock);
 }
 
 static void gcm_slow_drain_phase_begin(gcm_slow_drain_event* event)
@@ -1745,12 +1886,14 @@ void cellGcm_fifo_slow_drain_dump(void)
     AcquireSRWLockExclusive(&s_gcm_slow_drain_lock);
     if (s_gcm_slow_drain_dumped) {
         ReleaseSRWLockExclusive(&s_gcm_slow_drain_lock);
+        gcm_fifo_recycle_dump();
         return;
     }
     FILE* file=fopen(s_gcm_slow_drain_path,"wb");
     if (!file) {
         fprintf(stderr,"[slow-fifo-drain] cannot open %s\n",s_gcm_slow_drain_path);
         ReleaseSRWLockExclusive(&s_gcm_slow_drain_lock);
+        gcm_fifo_recycle_dump();
         return;
     }
     int io_error=0;
@@ -1798,11 +1941,16 @@ void cellGcm_fifo_slow_drain_dump(void)
         fprintf(stderr,"[slow-fifo-drain] write failed for %s\n",s_gcm_slow_drain_path);
     else s_gcm_slow_drain_dumped=1;
     ReleaseSRWLockExclusive(&s_gcm_slow_drain_lock);
+    gcm_fifo_recycle_dump();
 }
 #else
 #define gcm_slow_drain_phase_begin(event) ((void)0)
 #define gcm_slow_drain_phase_end(event,phase) ((void)0)
 #define gcm_slow_drain_set_reason(event,reason) ((void)0)
+#define gcm_slow_drain_enabled() 0
+#define gcm_slow_drain_qpc() ((u64)0)
+#define gcm_fifo_recycle_trace_start(event) 0
+#define gcm_fifo_recycle_record(event) ((void)0)
 void cellGcm_fifo_slow_drain_dump(void) {}
 #endif
 /* END GCM SLOW DRAIN DIAGNOSTIC */
@@ -2672,6 +2820,7 @@ static void gcm_rsx_process_fifo_unlocked(gcm_slow_drain_event* diagnostic)
  * pointer-shuffle here (the drain's own wrap-detect handles s_get). Without this
  * the ring never recycles and the whole pipeline wedges once the FIFO wraps
  * (~200 frames at the 256KB default), which looked like a GPU/driver hang. */
+/* BEGIN GCM FIFO RECYCLE CALLBACK */
 static u32 gcm_ea2io(u32 ea)
 {
     u32 page = ea >> 20;
@@ -2681,13 +2830,18 @@ static u32 gcm_ea2io(u32 ea)
     return ((u32)io_page << 20) | (ea & 0xFFFFFu);
 }
 
-static void gcm_fifo_wait_for_ea(u32 expected)
+static void gcm_fifo_wait_for_ea(u32 expected,gcm_fifo_recycle_ack* diagnostic)
 {
     unsigned spins = 0;
     const int native_wait = gcm_fifo_native_wait_enabled();
     u32 observed;
-    while ((observed = atomic_load_explicit(&g_gcm_fifo_drained_ea,
-                                             memory_order_acquire)) != expected) {
+    if (diagnostic) {
+        diagnostic->expected_ea=expected;
+        diagnostic->qpc_begin=gcm_slow_drain_qpc();
+    }
+    observed=atomic_load_explicit(&g_gcm_fifo_drained_ea,memory_order_acquire);
+    if (diagnostic) diagnostic->initial_observed_ea=observed;
+    while (observed != expected) {
         if (s_gcm_kick_ev && !(spins & 31u)) SetEvent(s_gcm_kick_ev);
         gcm_fifo_wait_for_publication(observed, native_wait);
         if (++spins == 2000) {
@@ -2697,15 +2851,43 @@ static void gcm_fifo_wait_for_ea(u32 expected)
                         "(drained=0x%08X expected=0x%08X); retaining pending commands\n",
                         g_gcm_fifo_drained_ea, expected);
         }
+        observed=atomic_load_explicit(&g_gcm_fifo_drained_ea,memory_order_acquire);
+    }
+    if (diagnostic) {
+        diagnostic->qpc_end=gcm_slow_drain_qpc();
+        diagnostic->observed_ea=observed;
+        diagnostic->wait_calls=spins;
+        diagnostic->completed=1;
     }
 }
 
 void cellGcm_fifo_recycle(u32 ctx_ea)
 {
-    if (!ctx_ea) return;
+    gcm_fifo_recycle_event diagnostic={0};
+    const int trace=gcm_fifo_recycle_trace_start(&diagnostic);
+    if (trace) diagnostic.context_ea=ctx_ea;
+    if (!ctx_ea) {
+        if (trace) {
+            diagnostic.outcome=GCM_FIFO_RECYCLE_NULL_CONTEXT;
+            diagnostic.qpc_end=gcm_slow_drain_qpc();
+            gcm_fifo_recycle_record(&diagnostic);
+        }
+        return;
+    }
     u32 begin   = vm_read32(ctx_ea + 0x0);
     u32 current = vm_read32(ctx_ea + 0x8);
-    if (current <= begin) return;                       /* nothing to recycle */
+    if (trace) {
+        diagnostic.begin_ea=begin;
+        diagnostic.current_ea=current;
+    }
+    if (current <= begin) {
+        if (trace) {
+            diagnostic.outcome=GCM_FIFO_RECYCLE_EMPTY;
+            diagnostic.qpc_end=gcm_slow_drain_qpc();
+            gcm_fifo_recycle_record(&diagnostic);
+        }
+        return;                       /* nothing to recycle */
+    }
     atomic_store_explicit(&s_fifo_recycle_active, ctx_ea, memory_order_release);
 
     if (getenv("CELLMARK_BLINKDBG"))
@@ -2726,6 +2908,10 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * for the guest to write from begin (that region was consumed long ago). */
     u32 io_begin = gcm_ea2io(begin);
     u32 io_current = gcm_ea2io(current);
+    if (trace) {
+        diagnostic.begin_io=io_begin;
+        diagnostic.current_io=io_current;
+    }
     if (io_begin != 0xFFFFFFFFu && io_current != 0xFFFFFFFFu) {
         vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin  */
         /* The jump has to be in guest memory before `put` moves behind the
@@ -2737,17 +2923,27 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
          * begin, immediately setting PUT=begin would look like an empty FIFO
          * and falsely acknowledge an entirely unconsumed ring. */
         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_current);
-        gcm_fifo_wait_for_ea(current);
+        gcm_fifo_wait_for_ea(current,trace ? &diagnostic.ack_current : NULL);
         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
-        gcm_fifo_wait_for_ea(begin);
+        gcm_fifo_wait_for_ea(begin,trace ? &diagnostic.ack_begin : NULL);
     } else {
         fprintf(stderr, "[cellGcmSys] cannot recycle unmapped command buffer\n");
         atomic_store_explicit(&s_fifo_recycle_active, 0, memory_order_release);
+        if (trace) {
+            diagnostic.outcome=GCM_FIFO_RECYCLE_UNMAPPED;
+            diagnostic.qpc_end=gcm_slow_drain_qpc();
+            gcm_fifo_recycle_record(&diagnostic);
+        }
         return;
     }
 
     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
     atomic_store_explicit(&s_fifo_recycle_active, 0, memory_order_release);
+    if (trace) {
+        diagnostic.outcome=GCM_FIFO_RECYCLE_COMPLETE;
+        diagnostic.qpc_end=gcm_slow_drain_qpc();
+        gcm_fifo_recycle_record(&diagnostic);
+    }
 
     if (s_recdbg)
         fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X\n",
@@ -2756,6 +2952,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
                 g_gcm_fifo_drained_ea);
 }
+/* END GCM FIFO RECYCLE CALLBACK */
 
 /* A host that brings its backend up on another thread -- a frame clock that
  * opens the window while the title boots -- can register the draw engine after
