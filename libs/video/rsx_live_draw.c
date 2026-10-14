@@ -3993,6 +3993,109 @@ static void texture_cache_unlink(u32 index)
     if (*link) *link = g.textures[index].hash_next;
 }
 
+/* BEGIN RSX_TEXTURE_DIAGNOSTIC_DEFERRED */
+#define LD_TEXTURE_DIAG_CAP 256u
+typedef enum {
+    LD_TEXTURE_DIAG_CACHE_FULL = 1,
+    LD_TEXTURE_DIAG_DECODE_FAILURE = 2,
+    LD_TEXTURE_DIAG_REFRESH = 3
+} ld_texture_diag_kind;
+typedef struct {
+    u64 count, evictions;
+    u32 kind, frame, slot, capacity;
+    u32 location, offset, format, width, height, pitch;
+} ld_texture_diag_event;
+typedef struct {
+    ld_texture_diag_event events[LD_TEXTURE_DIAG_CAP];
+    u64 records, overwritten;
+    u32 next, retained, dumped;
+} ld_texture_diag_ring;
+static ld_texture_diag_ring g_ld_texture_diag;
+static u32 g_ld_texture_refresh_count;
+
+/* One renderer/cache owner writes this fixed ring. No allocation, formatting,
+ * clock query, or I/O occurs here; records correspond to messages that the
+ * old throttled diagnostics would have printed. */
+static void ld_texture_diag_record(ld_texture_diag_kind kind, u64 count,
+    const rsx_dsp_texture* texture, u32 slot, u32 capacity, u64 evictions)
+{
+    ld_texture_diag_event* event = &g_ld_texture_diag.events[g_ld_texture_diag.next];
+    memset(event, 0, sizeof(*event));
+    event->kind = (u32)kind;
+    event->count = count;
+    event->evictions = evictions;
+    event->frame = g_ld_frames;
+    event->slot = slot;
+    event->capacity = capacity;
+    if (texture) {
+        event->location = texture->location;
+        event->offset = texture->offset;
+        event->format = texture->format;
+        event->width = texture->width;
+        event->height = texture->height;
+        event->pitch = texture->pitch;
+    }
+    g_ld_texture_diag.next = (g_ld_texture_diag.next + 1u) % LD_TEXTURE_DIAG_CAP;
+    if (g_ld_texture_diag.retained < LD_TEXTURE_DIAG_CAP)
+        ++g_ld_texture_diag.retained;
+    else
+        ++g_ld_texture_diag.overwritten;
+    ++g_ld_texture_diag.records;
+}
+
+static void ld_texture_diag_dump(void)
+{
+    if (g_ld_texture_diag.dumped) return;
+    g_ld_texture_diag.dumped = 1;
+    fprintf(stderr,
+        "[texture-diagnostic-summary] full=%llu decode_failures=%llu refreshes=%llu "
+        "records=%llu retained=%u overwritten=%llu capacity=%u\n",
+        (unsigned long long)g_ld_texture_cache_full,
+        (unsigned long long)g_ld_texture_decode_fail,
+        (unsigned long long)g_ld_texture_refresh_count,
+        (unsigned long long)g_ld_texture_diag.records,
+        g_ld_texture_diag.retained,
+        (unsigned long long)g_ld_texture_diag.overwritten,
+        LD_TEXTURE_DIAG_CAP);
+    const u32 first = (g_ld_texture_diag.next + LD_TEXTURE_DIAG_CAP -
+        g_ld_texture_diag.retained) % LD_TEXTURE_DIAG_CAP;
+    for (u32 i = 0; i < g_ld_texture_diag.retained; ++i) {
+        const ld_texture_diag_event* event =
+            &g_ld_texture_diag.events[(first + i) % LD_TEXTURE_DIAG_CAP];
+        switch ((ld_texture_diag_kind)event->kind) {
+        case LD_TEXTURE_DIAG_CACHE_FULL:
+            fprintf(stderr,
+                "[texture-cache] FULL cap=%u lru-evictions=%llu n=%llu frame=%u "
+                "src=%u:0x%08X fmt=0x%02X %ux%u pitch=%u slot=%u\n",
+                event->capacity, (unsigned long long)event->evictions,
+                (unsigned long long)event->count, event->frame,
+                event->location, event->offset, event->format, event->width,
+                event->height, event->pitch, event->slot);
+            break;
+        case LD_TEXTURE_DIAG_DECODE_FAILURE:
+            fprintf(stderr,
+                "[texture-cache] decode failed n=%llu src=%u:0x%08X "
+                "fmt=0x%02X %ux%u pitch=%u frame=%u slot=%u\n",
+                (unsigned long long)event->count, event->location, event->offset,
+                event->format, event->width, event->height, event->pitch,
+                event->frame, event->slot);
+            break;
+        case LD_TEXTURE_DIAG_REFRESH:
+            fprintf(stderr,
+                "[tex-refresh] n=%llu frame=%u unit-src=%u:0x%08X "
+                "fmt=0x%02X %ux%u pitch=%u slot=%u\n",
+                (unsigned long long)event->count, event->frame, event->location,
+                event->offset, event->format, event->width, event->height,
+                event->pitch, event->slot);
+            break;
+        default:
+            break;
+        }
+    }
+    fflush(stderr);
+}
+/* END RSX_TEXTURE_DIAGNOSTIC_DEFERRED */
+
 #if defined(YZ_PERF_PROFILE)
 /* Record descriptor identities only on misses. Bounded storage and shutdown
  * output avoid disk traffic in the render loop. The content hash is already
@@ -4238,18 +4341,11 @@ static u32 texture_srv_slot_scoped(const rsx_dsp_texture* t,
                     retire_texture(old);
                     ld_slow_texture_phase_end(slow_scope, slow_detail,
                         slow_detail ? &slow_detail->retire_ticks : NULL, phase_begin);
-                    static u32 refresh_count = 0;
-                    refresh_count++;
-                    if (refresh_count <= 64 || (refresh_count & 255) == 0) {
-                        phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
-                        fprintf(stderr,
-                                "[tex-refresh] n=%u frame=%u unit-src=%u:0x%08X "
-                                "fmt=0x%02X %ux%u\n",
-                                refresh_count, g_ld_frames, t->location, t->offset,
-                                t->format, t->width, t->height);
-                        ld_slow_texture_phase_end(slow_scope, slow_detail,
-                            slow_detail ? &slow_detail->log_ticks : NULL, phase_begin);
-                    }
+                    ++g_ld_texture_refresh_count;
+                    if (g_ld_texture_refresh_count <= 64 ||
+                        (g_ld_texture_refresh_count & 255) == 0)
+                        ld_texture_diag_record(LD_TEXTURE_DIAG_REFRESH,
+                            g_ld_texture_refresh_count, t, i, 0, 0);
                 }
             }
             if (readable && entry->content_hash == hash &&
@@ -4285,15 +4381,10 @@ static u32 texture_srv_slot_scoped(const rsx_dsp_texture* t,
                 index = i;
         evicted = g.textures[index].tex;
         if (g_ld_texture_cache_full <= 16 ||
-            (g_ld_texture_cache_full & (g_ld_texture_cache_full - 1)) == 0) {
-            phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
-            fprintf(stderr,
-                    "[texture-cache] FULL cap=%u lru-evictions=%llu\n",
-                    MAX_TEXTURES,
-                    (unsigned long long)g_ld_texture_cache_evictions);
-            ld_slow_texture_phase_end(slow_scope, slow_detail,
-                slow_detail ? &slow_detail->log_ticks : NULL, phase_begin);
-        }
+            (g_ld_texture_cache_full & (g_ld_texture_cache_full - 1)) == 0)
+            ld_texture_diag_record(LD_TEXTURE_DIAG_CACHE_FULL,
+                g_ld_texture_cache_full, t, index, MAX_TEXTURES,
+                g_ld_texture_cache_evictions);
     }
 
     texcache_t replacement;
@@ -4358,17 +4449,9 @@ static u32 texture_srv_slot_scoped(const rsx_dsp_texture* t,
     } else {
         g_ld_texture_decode_fail++;
         if (g_ld_texture_decode_fail <= 16 ||
-            (g_ld_texture_decode_fail & (g_ld_texture_decode_fail - 1)) == 0) {
-            phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
-            fprintf(stderr,
-                    "[texture-cache] decode failed n=%llu src=%u:0x%08X "
-                    "fmt=0x%02X %ux%u pitch=%u\n",
-                    (unsigned long long)g_ld_texture_decode_fail,
-                    t->location, t->offset, t->format, t->width, t->height,
-                    t->pitch);
-            ld_slow_texture_phase_end(slow_scope, slow_detail,
-                slow_detail ? &slow_detail->log_ticks : NULL, phase_begin);
-        }
+            (g_ld_texture_decode_fail & (g_ld_texture_decode_fail - 1)) == 0)
+            ld_texture_diag_record(LD_TEXTURE_DIAG_DECODE_FAILURE,
+                g_ld_texture_decode_fail, t, index, 0, 0);
     }
     return replacement.tex ? SRV_TEXTURE_BASE + index : SRV_WHITE;
 }
@@ -11806,6 +11889,7 @@ void rsx_live_draw_dump_present_samples(void)
 {
     /* Haze exits after this diagnostic dump without renderer teardown. */
     if (g.ready) ld_report_counters();
+    ld_texture_diag_dump();
     ld_slow_flush_dump();
     ld_texture_content_summary();
     ld_slow_draw_dump();
@@ -13513,6 +13597,7 @@ void rsx_live_draw_present(u32 buffer_id)
 void rsx_live_draw_shutdown(void)
 {
     if (!g.ready) {
+        ld_texture_diag_dump();
         ld_slow_flush_dump();
         ld_slow_draw_dump();
         free(g_ld_slow_draw.events);
@@ -13524,6 +13609,7 @@ void rsx_live_draw_shutdown(void)
         return;
     }
     ld_report_counters();
+    ld_texture_diag_dump();
     ld_slow_flush_dump();
     ld_slow_draw_dump();
 #if defined(YZ_PERF_PROFILE)
