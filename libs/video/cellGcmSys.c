@@ -3462,12 +3462,15 @@ u32 cellGcmResolveIO(u32 offset)
  * local allocations (gcm/cube: ioSize 16MB, FP ucode at local 0xB90000 --
  * table hit returned the empty command-buffer EA instead of VRAM). Callers
  * that KNOW the location (texture format bits, SET_SHADER_PROGRAM bits) must
- * use this. `local` != 0 -> local memory. */
+ * use this. `local` != 0 -> local memory. MAIN must consult the IO table
+ * before the ambiguous resolver's remembered local-page heuristic. Preserve
+ * that resolver's fallback only when MAIN has no IO mapping. */
 u32 cellGcmResolveLocated(int local, u32 offset)
 {
     if (local)
         return s_config.localAddress + offset;
-    return cellGcmResolveOffset(offset);
+    const u32 ea = cellGcmResolveIO(offset);
+    return ea ? ea : cellGcmResolveOffset(offset);
 }
 
 /* ---------------------------------------------------------------------------
