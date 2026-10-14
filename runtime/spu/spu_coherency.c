@@ -199,29 +199,18 @@ static void taskset_notify_publication(uint32_t ea)
  * Moved here from spu_channels.c, where it was a file-static and so could
  * serialize SPU against SPU but not SPU against PPU -- which left the PPU free
  * to write a line in the middle of a PUTLLC's compare-and-commit. Same
- * spinlock, same semantics, now shared. _InterlockedExchange is a clang-cl/MSVC
- * intrinsic (no runtime library symbol needed); elsewhere use the C11
- * equivalent, which lowers to the same LL/SC or lock-xchg on every target.
+ * mutual exclusion and acquire/release semantics, now shared.
  * ===========================================================================*/
-#if defined(_MSC_VER)
-#include <intrin.h>
-#include <windows.h>   /* SwitchToThread */
-static volatile long g_lockline = 0;
-/* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
- * pause, and yield after a long wait. The bare exchange loop let GH3's four
- * idle job-policy pollers saturate the line and delay every other SPU atomic
- * -- FMOD's mixer task among them, 25-40 ms at a time. */
-void spu_lockline_lock(void)
-{
-    unsigned spins = 0;
-    while (_InterlockedExchange(&g_lockline, 1)) {
-        do {
-            _mm_pause();
-            if (++spins >= 4096) { spins = 0; SwitchToThread(); }
-        } while (g_lockline);
-    }
-}
-void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
+#if defined(_WIN32)
+#include <windows.h>
+/* HLE jobs can outnumber host cores. Busy-waiting contenders can occupy every
+ * core while the lock holder or renderer is ready but unscheduled. Let Windows
+ * park contending threads instead of repeatedly spinning and SwitchToThread.
+ * This lock remains exclusive and non-recursive; the protected reservation
+ * checks, stores, and notifications are unchanged. */
+static SRWLOCK g_lockline = SRWLOCK_INIT;
+void spu_lockline_lock(void) { AcquireSRWLockExclusive(&g_lockline); }
+void spu_lockline_unlock(void) { ReleaseSRWLockExclusive(&g_lockline); }
 #else
 #include <stdatomic.h>
 static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
