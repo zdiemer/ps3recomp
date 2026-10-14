@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "libs" / "spurs" / "cellSpurs.c"
+HEADER = ROOT / "libs" / "spurs" / "cellSpurs.h"
 
 
 def extract_function(text: str, name: str) -> str:
@@ -25,6 +26,13 @@ def extract_function(text: str, name: str) -> str:
     return match.group(0)
 
 
+def extract_taskset_layout(text: str) -> str:
+    match = re.search(r"(?m)^struct CellSpursTaskset\s*\{.*?^\};", text, re.DOTALL)
+    if not match:
+        raise SystemExit(f"could not extract CellSpursTaskset from {HEADER}")
+    return match.group(0)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", required=True, type=Path)
@@ -32,6 +40,7 @@ def main() -> int:
     args = parser.parse_args()
 
     source = SOURCE.read_text(encoding="utf-8")
+    layout = extract_taskset_layout(HEADER.read_text(encoding="utf-8"))
     destroy = extract_function(source, "cellSpursDestroyTaskset")
     shutdown = extract_function(source, "cellSpursShutdownTaskset")
     print("cellSpursDestroyTaskset sha256=" + hashlib.sha256(destroy.encode()).hexdigest())
@@ -44,18 +53,17 @@ def main() -> int:
 #include <string.h>
 #include <assert.h>
 typedef int32_t s32;
+typedef uint8_t u8;
 typedef uint32_t u32;
-typedef struct CellSpursTaskset {
-    u32 initialized;
-    u32 taskCount;
-    u32 shutdownRequested;
-    unsigned char guest_layout[0x180 - 12];
-} CellSpursTaskset;
+typedef struct CellSpurs CellSpurs;
+typedef struct CellSpursTaskset CellSpursTaskset;
+"""
+    program = harness + "\n" + layout + r"""
 #define CELL_SPURS_TASK_ERROR_NULL_POINTER ((s32)0x80410901)
 #define CELL_OK ((s32)0)
 #define GUEST_PTR(ptr, type) ((type)(ptr))
 """
-    program = harness + "\n" + destroy + "\n" + shutdown + r"""
+    program += "\n" + destroy + "\n" + shutdown + r"""
 int main(void) {
     _Static_assert(offsetof(CellSpursTaskset, initialized) == 0, "guest offset 0");
     _Static_assert(offsetof(CellSpursTaskset, taskCount) == 4, "guest offset 4");
@@ -89,7 +97,7 @@ int main(void) {
         cfile.write_text(program, encoding="utf-8", newline="\n")
         subprocess.run(
             [str(args.compiler), "/nologo", "/std:c11", "/W4", "/WX", "/O2",
-             str(cfile), f"/Fe:{binary}"],
+             str(cfile), f"/Fo:{args.output_dir.resolve()}\\", f"/Fe:{binary}"],
             check=True,
         )
         subprocess.run([str(binary)], check=True, timeout=5)
