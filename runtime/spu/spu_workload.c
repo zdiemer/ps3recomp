@@ -1027,6 +1027,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
  * The bitset is guest state (SPU-visible); the host lock/condvar exist only
  * to block and wake the task's host thread. */
 #include "../../libs/spurs/spurs_taskset.h"
+#include <stdatomic.h>
 
 #ifdef _WIN32
 static SRWLOCK            s_sig_lock = SRWLOCK_INIT;
@@ -1045,29 +1046,85 @@ static pthread_cond_t  s_sig_cv   = PTHREAD_COND_INITIALIZER;
  * SPURS queues in Yakuza Dead Souls ("the HLE previously woke only its host
  * condvar, which lifted SPU consumer tasks never wait on").
  *
- * ponytail: deliberately lock-free and racy. A missed entry costs one 1s poll
- * timeout in the waiter; a stale entry costs one spurious signal, which is safe
- * because signals are LATCHED in guest state (CSTS_SIGNALLED) and every wait
- * loop re-checks its own predicate. Add a lock only if this ever needs to be
- * authoritative rather than a hint. */
+ * Keys and wait objects are protected by s_sig_lock, including lookup and
+ * delivery. Otherwise concurrent parkers can overwrite one slot, or a reused
+ * slot can receive a signal intended for its previous occupant. The bounded
+ * registry remains a hint: overflow retains the one-second predicate poll. */
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);  /* defined below */
 
 #define SPU_PARKED_MAX 64
-static volatile uint64_t s_parked[SPU_PARKED_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
-static volatile uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait object, 0 = unknown */
+static uint64_t s_parked[SPU_PARKED_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
+static uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait object, 0 = unknown */
+/* Only an empty-registry fast path; every table access still takes the lock.
+ * A commit overlapping the first registration may skip notification, but the
+ * waiter has not checked its latched guest signal yet, so cannot lose it. */
+static _Atomic unsigned s_parked_count;
+
+static void taskset_signal_lock(void)
+{
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&s_sig_lock);
+#else
+    pthread_mutex_lock(&s_sig_lock);
+#endif
+}
+static void taskset_signal_unlock(void)
+{
+#ifdef _WIN32
+    ReleaseSRWLockExclusive(&s_sig_lock);
+#else
+    pthread_mutex_unlock(&s_sig_lock);
+#endif
+}
+static void taskset_signal_broadcast(void)
+{
+#ifdef _WIN32
+    WakeAllConditionVariable(&s_sig_cv);
+#else
+    pthread_cond_broadcast(&s_sig_cv);
+#endif
+}
+
+static void taskset_parked_del_locked(uint32_t taskset_ea, uint32_t taskId)
+{
+    uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        if (s_parked[i] != key) continue;
+        s_parked[i] = 0;
+        s_parked_obj[i] = 0;
+        atomic_fetch_sub_explicit(&s_parked_count, 1, memory_order_release);
+        return;
+    }
+}
 
 void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_obj)
 {
+    if (!taskset_ea || taskId >= 128) return;
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
-    for (int i = 0; i < SPU_PARKED_MAX; i++)
-        if (s_parked[i] == 0) { s_parked_obj[i] = wait_obj; s_parked[i] = key; return; }
+    int free_slot = -1;
+    taskset_signal_lock();
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        if (s_parked[i] == key) {
+            s_parked_obj[i] = wait_obj;
+            taskset_signal_unlock();
+            return;
+        }
+        if (!s_parked[i] && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0) {
+        s_parked_obj[free_slot] = wait_obj;
+        s_parked[free_slot] = key;
+        atomic_fetch_add_explicit(&s_parked_count, 1, memory_order_release);
+    }
+    taskset_signal_unlock();
 }
 
 void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
 {
-    uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
-    for (int i = 0; i < SPU_PARKED_MAX; i++)
-        if (s_parked[i] == key) { s_parked[i] = 0; return; }
+    if (!taskset_ea || taskId >= 128) return;
+    taskset_signal_lock();
+    taskset_parked_del_locked(taskset_ea, taskId);
+    taskset_signal_unlock();
 }
 
 /* Event bits owed to a task, keyed by the OBJECT it waits on (flag - 0x80).
@@ -1138,14 +1195,36 @@ int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
 {
     if (!taskset_ea) return 0;
     int n = 0;
+    taskset_signal_lock();
     for (int i = 0; i < SPU_PARKED_MAX; i++) {
         uint64_t k = s_parked[i];
         if (!k || (uint32_t)(k >> 32) != taskset_ea) continue;
         if (wait_obj && s_parked_obj[i] && s_parked_obj[i] != wait_obj) continue;
-        spu_taskset_signal_task(taskset_ea, (uint32_t)(k & 0xFFFFFFFFu) - 1u);
+        spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, (uint32_t)k - 1u);
         n++;
     }
+    if (n) taskset_signal_broadcast();
+    taskset_signal_unlock();
     return n;
+}
+
+/* An SPU committed a line containing a parked taskset's signalled bitset.
+ * The guest predicate remains authoritative: a commit to another field or
+ * another task's bit may wake the host thread but cannot release its wait.
+ * Never enter here holding the coherence lock (signal delivery takes the
+ * signal lock before guest stores can take the coherence lock). */
+void spu_taskset_line_committed(uint32_t line)
+{
+    if (!atomic_load_explicit(&s_parked_count, memory_order_acquire)) return;
+    taskset_signal_lock();
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        uint64_t k = s_parked[i];
+        if (k && (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) == line) {
+            taskset_signal_broadcast();
+            break;
+        }
+    }
+    taskset_signal_unlock();
 }
 
 /* Deliver a signal to a task (callable from any PPU/host thread). */
@@ -1290,6 +1369,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
         }
     }
     if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    taskset_parked_del_locked(taskset_ea, taskId);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
@@ -1304,6 +1384,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
         }
     }
     if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    taskset_parked_del_locked(taskset_ea, taskId);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
     if (drained) { static int _d = 0; if (_d++ < 24)

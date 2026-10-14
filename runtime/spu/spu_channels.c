@@ -70,7 +70,8 @@ static uint64_t spu_host_ns(void)
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
-/* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
+/* WAIT_SIGNAL uses a different condition variable from event flags and the
+ * readiness scheduler. Call only after releasing the coherence lock. */
 void spu_taskset_line_committed(uint32_t line);
 /* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
  * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
