@@ -445,6 +445,8 @@ struct SpursPmSlot {
 static struct SpursInst {
     u32 ea, nspus;
     char prefix[16];
+    HANDLE taskset_wake_event; /* process-lifetime auto-reset event */
+    int taskset_wake_enabled, taskset_wake_configured;
     int kernel_live, stopping, starting;
     SRWLOCK lock;
     CONDITION_VARIABLE wake;
@@ -460,6 +462,19 @@ static s32 spurs_scheduler_start(struct SpursInst* si);
 static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea);
 static void spurs_scheduler_retire(u32 ea);
 static void spurs_scheduler_forget(u32 wid);
+static volatile LONG s_taskset_wake_mode = -1;
+
+static int spurs_taskset_wake_requested(void)
+{
+    LONG mode = InterlockedCompareExchange(&s_taskset_wake_mode, -1, -1);
+    if (mode < 0) {
+        const char* value = getenv("SPU_TASKSET_WAKE");
+        LONG parsed = value && value[0] == '1' && value[1] == '\0';
+        InterlockedCompareExchange(&s_taskset_wake_mode, parsed, -1);
+        mode = InterlockedCompareExchange(&s_taskset_wake_mode, -1, -1);
+    }
+    return (int)mode;
+}
 
 static struct SpursInst* spurs_inst_find(u32 ea)
 {
@@ -518,6 +533,18 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
     memset(si->prefix, 0, sizeof(si->prefix));
     if (prefix) memcpy(si->prefix, prefix, 15);
 
+    if (!si->taskset_wake_configured) {
+        if (spurs_taskset_wake_requested())
+            si->taskset_wake_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+        si->taskset_wake_enabled = si->taskset_wake_event != NULL;
+        si->taskset_wake_configured = 1;
+    }
+    if (si->taskset_wake_enabled)
+        spu_taskset_wake_register(spurs_ea, si->taskset_wake_event);
+    fprintf(stderr, "[spurs-taskset-wake] enabled=%d requested=%d event=%d spurs=0x%08X\n",
+            si->taskset_wake_enabled, spurs_taskset_wake_requested(),
+            si->taskset_wake_event != NULL, spurs_ea);
+
     /* Real BE instance: zero it, then the few live fields. (The global
      * workload table is NOT wiped here — the title may init several SPURS
      * instances before adding workloads to any of them.) */
@@ -567,6 +594,7 @@ s32 cellSpursFinalize(CellSpurs* spurs)
     s32 rc = spurs_scheduler_stop(si, (u32)(uintptr_t)spurs);
     if (rc) return rc; /* BUSY changes neither admission nor attached queues. */
     u32 ea = si->ea;
+    spu_taskset_wake_unregister(ea);
     spurs_policy_release_instance(ea);
     spurs_scheduler_retire(ea);
     spurs_cancel_attached_queues(ea);
@@ -1674,17 +1702,60 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     struct SpursInst* si = (struct SpursInst*)p;
     int disabled = getenv("PS3_NO_SPURS_PM") != NULL;
+    /* Instance change detector (SPURS_KERN_WATCH=1).
+     *
+     * We assumed the title kicks a workload by poking wklReadyCount/wklSignal
+     * with inlined atomics -- but this thread watches exactly those bytes every
+     * 1 ms and has never once seen them nonzero, across whole runs. Rather than
+     * guess again, shadow the head of the instance and report EVERY byte the
+     * title changes. Whatever the real kick is, it has to land in here. */
+    static const u32 WATCH_LEN = 0xC0;
+    unsigned char shadow[0xC0];
+    int shadow_primed = 0;
+    int watch = getenv("SPURS_KERN_WATCH") ? 1 : 0;
+    int changes_logged = 0;
+
     AcquireSRWLockExclusive(&si->lock);
     while (!si->stopping) {
-        SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0);
+        uint32_t poll_cause = SPU_TASKSET_DISPATCH_POLL;
+        if (si->taskset_wake_enabled && si->taskset_wake_event) {
+            ReleaseSRWLockExclusive(&si->lock);
+            DWORD wait_result = WaitForSingleObject(si->taskset_wake_event, 1);
+            if (wait_result == WAIT_OBJECT_0) poll_cause = SPU_TASKSET_DISPATCH_WAKE;
+            else if (wait_result != WAIT_TIMEOUT) Sleep(1);
+            AcquireSRWLockExclusive(&si->lock);
+        } else {
+            SleepConditionVariableSRW(&si->wake, &si->lock, 1, 0);
+        }
         if (si->stopping) break;
         if (disabled) continue;
         u32 ea = si->ea;
         /* Guest-created siblings may become ready while a task stays alive. */
         ReleaseSRWLockExclusive(&si->lock);
-        spu_taskset_poll(ea);
+        spu_taskset_poll_cause(ea, poll_cause);
         AcquireSRWLockExclusive(&si->lock);
         if (si->stopping) break;
+        if (watch) {
+            const unsigned char* live = (const unsigned char*)vm_base + ea;
+            if (!shadow_primed) { memcpy(shadow, live, WATCH_LEN); shadow_primed = 1; }
+            else if (memcmp(shadow, live, WATCH_LEN) != 0) {
+                for (u32 o = 0; o < WATCH_LEN; o++) {
+                    if (shadow[o] == live[o]) continue;
+                    if (changes_logged < 200) {
+                        changes_logged++;
+                        fprintf(stderr, "[spurs-kern] \"%s\" INSTANCE +0x%02X: %02X -> %02X%s\n",
+                                si->prefix, o, shadow[o], live[o],
+                                o < 16                    ? "  (wklReadyCount1)" :
+                                o >= 0x70 && o < 0x76     ? "  (wklSignal1)"     :
+                                o >= 0x80 && o < 0x90     ? "  (wklState1)"      :
+                                o >= 0xB0 && o < 0xB4     ? "  (wklEnabled)"     : "");
+                    }
+                }
+                memcpy(shadow, live, WATCH_LEN);
+                fflush(stderr);
+            }
+        }
+
         AcquireSRWLockExclusive(&s_workload_registry_lock);
         si->pass_no++;
         u32 enabled = vm_read32(ea + SPURS_WKL_ENABLED);

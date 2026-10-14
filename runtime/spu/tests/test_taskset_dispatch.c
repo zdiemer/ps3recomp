@@ -12,17 +12,23 @@ static uint64_t mark_counter;
 void spu_lockline_lock(void) { assert(!locked); locked = 1; }
 void spu_lockline_unlock(void) { assert(locked); locked = 0; }
 void spu_coh_notify_write(uint32_t ea) { assert(locked && ea == 0x100); ++notifications; }
+int spu_coh_watch_taskset(uint32_t ea, uint32_t owner, void* host, void* event,
+                          uint64_t (*qpc)(void))
+{ assert(locked); (void)ea; (void)owner; (void)host; (void)event; (void)qpc; return 0; }
+void spu_coh_unwatch_tasksets(uint32_t owner) { assert(locked); (void)owner; }
+uint64_t spu_coh_taskset_ready_qpc_locked(uint32_t ea, uint32_t task)
+{ assert(locked); (void)ea; (void)task; return 0; }
 size_t spu_elf_image_size(const uint8_t* p, size_t max)
 { assert(!locked && p == memory + 0x4000 && max > 16); return 16; }
 uint64_t spu_workload_async_trace_mark(void) { return ++mark_counter + 1000; }
 int spu_workload_dispatch_async_task_provenance(const uint8_t* p, uint32_t size,
                                                 uint32_t context, uint32_t ts,
                                                 uint32_t task, uint32_t cause,
-                                                uint64_t claim_qpc)
+                                                uint64_t claim_qpc, uint64_t ready_qpc)
 {
     assert(!locked && p == memory + 0x4000 && size == 16);
     ++dispatches; last_task = task; last_ts = ts; last_context = context;
-    last_cause = cause; last_claim_qpc = claim_qpc;
+    last_cause = cause; last_claim_qpc = claim_qpc; (void)ready_qpc;
     return !fail_dispatch;
 }
 static void write_be32(uint32_t ea, uint32_t v)
@@ -81,6 +87,10 @@ int main(void)
     spu_taskset_start_ready_cause(0x100, SPU_TASKSET_DISPATCH_CREATE);
     assert(dispatches == 6 && last_task == 6 &&
            last_cause == SPU_TASKSET_DISPATCH_CREATE && last_claim_qpc == 1006);
+    ready(7);
+    spu_taskset_poll_cause(0x2000, SPU_TASKSET_DISPATCH_WAKE);
+    assert(dispatches == 7 && last_task == 7 &&
+           last_cause == SPU_TASKSET_DISPATCH_WAKE && last_claim_qpc == 1007);
     uint32_t ti = 0x100 + CSTS_TASKINFO + TI_SIZE;
     const uint32_t expected[4] = {0x12000, 0, 0x34000, 0x56000};
     for (unsigned i = 0; i < 4; ++i) write_be32(ti + TI_ARGS + 4*i, expected[i]);
