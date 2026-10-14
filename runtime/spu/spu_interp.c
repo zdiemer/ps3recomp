@@ -116,7 +116,8 @@ static int spu_step(spu_context* ctx) {
 
     switch (d.op) {
     /* immediates / loads */
-    case SPU_il: case SPU_ilh: DST = spu_splat_u32((uint32_t)(int32_t)I); break;
+    case SPU_il: DST = spu_splat_u32((uint32_t)(int32_t)I); break;
+    case SPU_ilh: DST = spu_ilh((uint16_t)I); break;
     case SPU_ilhu: DST = spu_splat_u32((uint32_t)I << 16); break;
     case SPU_ila:  DST = spu_splat_u32((uint32_t)I & 0x3FFFF); break;
     case SPU_iohl: DST = spu_ori(DST, (int32_t)((uint32_t)I & 0xFFFF)); break;
