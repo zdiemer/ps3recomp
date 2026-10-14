@@ -17,6 +17,8 @@ static inline int spu_float_native_active(void) { return 0; }
 #endif
 int spu_float_native_available(void);
 int spu_float_native_set_mode(int requested);
+void spu_float_native_update(void);
+void spu_float_native_summary(void);
 #ifdef SPU_FLOAT_NATIVE_HOST
 #include <xmmintrin.h>
 /* Keep the four lanes in vector registers across the Windows ABI boundary.

@@ -13,6 +13,8 @@
 int g_spu_float_native;
 static INIT_ONCE once=INIT_ONCE_STATIC_INIT;
 static int supported,validate,failed,reported=-1;
+static const char* control;
+static ULONGLONG next_check;
 static unsigned long long audits,failures;
 __attribute__((target("xsave"))) static unsigned long long os_vector_state(void) { return _xgetbv(0); }
 static BOOL CALLBACK initialize(PINIT_ONCE unused,PVOID param,PVOID* context) {
@@ -21,6 +23,7 @@ static BOOL CALLBACK initialize(PINIT_ONCE unused,PVOID param,PVOID* context) {
     if ((info[2]&(1<<27)) && (os_vector_state()&0xe6)==0xe6) {
         __cpuidex(info,7,0); supported=(info[1]&(1<<16))!=0;
     }
+    control=getenv("SPU_FLOAT_NATIVE_FILE");
     const char* option=getenv("SPU_FLOAT_NATIVE_VALIDATE");
     validate=option && *option=='1';
     return TRUE;
@@ -39,6 +42,35 @@ int spu_float_native_set_mode(int requested) {
         reported=enabled;
     }
     return enabled;
+}
+void spu_float_native_update(void) {
+    static int initialized;
+    if (!initialized) {
+        initialized=1;
+        const char* option=getenv("SPU_FLOAT_NATIVE");
+        if (control || option) spu_float_native_set_mode(option && *option=='1');
+        else spu_float_native_available();
+        /* available() initializes the control path, even without a mode env. */
+        if (control && reported<0) spu_float_native_set_mode(0);
+    }
+    ULONGLONG now=GetTickCount64();
+    if (control && now>=next_check) {
+        next_check=now+100;
+        FILE* file=fopen(control,"r");
+        unsigned enabled;
+        if (file) {
+            if (fscanf(file,"%u",&enabled)==1 && enabled<=1)
+                spu_float_native_set_mode((int)enabled);
+            fclose(file);
+        }
+    }
+}
+void spu_float_native_summary(void) {
+    fprintf(stderr,"[spu-float-native-summary] supported=%d enabled=%d validate=%d audits=%llu failures=%llu failed=%d\n",
+        supported,spu_float_native_active(),validate,
+        __atomic_load_n(&audits,__ATOMIC_RELAXED),
+        __atomic_load_n(&failures,__ATOMIC_RELAXED),
+        __atomic_load_n(&failed,__ATOMIC_RELAXED));
 }
 static u128 validate_result(u128 result,u128 a,u128 b,u128 c,unsigned op) {
     if (!validate) return result;
@@ -116,6 +148,8 @@ NATIVE __m128 __vectorcall spu_float_native_madd_ps(__m128 av,__m128 bv,__m128 c
 #else
 int spu_float_native_available(void) { return 0; }
 int spu_float_native_set_mode(int requested) { (void)requested; return 0; }
+void spu_float_native_update(void) {}
+void spu_float_native_summary(void) {}
 u128 spu_float_native_add(u128 a,u128 b) { u128 r; for(int i=0;i<4;++i) r._u32[i]=spu_float_add(a._u32[i],b._u32[i]); return r; }
 u128 spu_float_native_mul(u128 a,u128 b) { u128 r; for(int i=0;i<4;++i) r._u32[i]=spu_float_mul(a._u32[i],b._u32[i]); return r; }
 u128 spu_float_native_madd(u128 a,u128 b,u128 c) { u128 r; for(int i=0;i<4;++i) r._u32[i]=spu_float_madd(a._u32[i],b._u32[i],c._u32[i]); return r; }

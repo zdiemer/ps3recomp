@@ -1,13 +1,14 @@
 /*
  * ps3recomp - PPU <-> SPU lock-line coherence
  *
- * See spu_coherency.h for what this is for. The state here is deliberately
- * plain: a bit per 128-byte line, a small table of the SPU contexts that have
+ * See spu_coherency.h for what this is for. The state here is a bit per
+ * 128-byte line, a small table of the SPU contexts that have
  * ever reserved one, and the lock-line spinlock. Everything that WRITES it runs
  * with the lock-line lock held (the SPU's GETLLAR, the PPU's coherent store),
- * so the read-modify-write on a shared bitmap byte is serialized. Only
- * spu_coh_is_reserved reads without the lock, which is the entire point: it is
- * on every PPU store.
+ * so context bookkeeping is serialized. The reservation bitmap is updated
+ * atomically because spu_coh_is_reserved reads it without the lock: it is on
+ * every PPU store, and must observe fresh publications without taking the
+ * lock on the unreserved path.
  */
 
 #include <stdlib.h>
@@ -74,8 +75,122 @@ static void queue_notify_publication(uint32_t ea)
         }
     }
 }
+
+/* BEGIN SPU TASKSET WAKE WATCH */
+/* SPURS readiness is published into the first taskset header line. Keep this
+ * exact-line watcher separate from the HLE task scan: notifications only set
+ * an auto-reset event, while spu_taskset_start_ready remains authoritative
+ * for validation and claiming. Registry and per-task timestamps are protected
+ * by the lock-line lock already held by every notify caller. */
+#define SPU_TASKSET_WAKE_WATCHES 64u
+#define SPU_TASKSET_READY_OFF 0x10u
+#define SPU_TASKSET_PENDING_READY_OFF 0x20u
+#define SPU_TASKSET_ENABLED_OFF 0x30u
+typedef struct {
+    uint32_t taskset_ea;
+    uint32_t spurs_ea;
+    uint8_t* host;
+    HANDLE event;
+    uint64_t (*qpc_callback)(void);
+    uint8_t eligible[16];
+    uint64_t ready_qpc[128];
+} spu_taskset_wake_watch;
+static spu_taskset_wake_watch s_taskset_watches[SPU_TASKSET_WAKE_WATCHES];
+static unsigned s_taskset_watch_count;
+static unsigned taskset_watch_index(uint32_t ea)
+{ return ((ea >> 7) ^ (ea >> 15) ^ (ea >> 23)) & (SPU_TASKSET_WAKE_WATCHES - 1u); }
+static void taskset_watch_prime(spu_taskset_wake_watch* w)
+{
+    for (unsigned b = 0; b < 16; ++b)
+        w->eligible[b] = w->host[SPU_TASKSET_ENABLED_OFF + b] &
+            (w->host[SPU_TASKSET_READY_OFF + b] | w->host[SPU_TASKSET_PENDING_READY_OFF + b]);
+}
+int spu_coh_watch_taskset(uint32_t taskset_ea, uint32_t spurs_ea,
+                          void* host_address, void* event,
+                          uint64_t (*qpc_callback)(void))
+{
+    if (!taskset_ea || (taskset_ea & 127u) || !spurs_ea || !host_address || !event) return 0;
+    unsigned slot = taskset_watch_index(taskset_ea);
+    spu_taskset_wake_watch* w = &s_taskset_watches[slot];
+    if (w->taskset_ea == taskset_ea) {
+        /* Reinitialization may reuse the guest EA with a new host mapping or
+         * SPURS instance. Reset edge history so a stale ready bit cannot wake
+         * the new owner. */
+        if (w->spurs_ea != spurs_ea || w->host != (uint8_t*)host_address ||
+            w->event != (HANDLE)event || w->qpc_callback != qpc_callback) {
+            memset(w, 0, sizeof(*w));
+            w->taskset_ea = taskset_ea; w->spurs_ea = spurs_ea;
+            w->host = (uint8_t*)host_address; w->event = (HANDLE)event;
+            w->qpc_callback = qpc_callback;
+            taskset_watch_prime(w);
+        }
+        return 1;
+    }
+    if (w->taskset_ea) return 0; /* exact-line collision: retain polling */
+    w->taskset_ea = taskset_ea; w->spurs_ea = spurs_ea;
+    w->host = (uint8_t*)host_address; w->event = (HANDLE)event;
+    w->qpc_callback = qpc_callback;
+    ++s_taskset_watch_count;
+    taskset_watch_prime(w);
+    return 1;
+}
+void spu_coh_unwatch_tasksets(uint32_t spurs_ea)
+{
+    if (!spurs_ea) return;
+    for (unsigned i = 0; i < SPU_TASKSET_WAKE_WATCHES; ++i)
+        if (s_taskset_watches[i].spurs_ea == spurs_ea) {
+            memset(&s_taskset_watches[i], 0, sizeof(s_taskset_watches[i]));
+            --s_taskset_watch_count;
+        }
+}
+uint64_t spu_coh_taskset_ready_qpc_locked(uint32_t taskset_ea, uint32_t taskid)
+{
+    if (taskid >= 128) return 0;
+    spu_taskset_wake_watch* w = &s_taskset_watches[taskset_watch_index(taskset_ea)];
+    return w->taskset_ea == taskset_ea ? w->ready_qpc[taskid] : 0;
+}
+static void taskset_notify_publication(uint32_t ea)
+{
+    if (!s_taskset_watch_count) return;
+    uint32_t line = ea & ~127u;
+    unsigned slot = taskset_watch_index(line);
+    {
+        uint8_t* host = s_taskset_watches[slot].host;
+        if (!host || (s_taskset_watches[slot].taskset_ea & ~127u) != line) return;
+        int rose = 0;
+        uint8_t next[16];
+        for (unsigned b = 0; b < 16; ++b) {
+            next[b] = host[SPU_TASKSET_ENABLED_OFF + b] &
+                      (host[SPU_TASKSET_READY_OFF + b] | host[SPU_TASKSET_PENDING_READY_OFF + b]);
+            if (next[b] & (uint8_t)~s_taskset_watches[slot].eligible[b]) rose = 1;
+        }
+        if (rose) {
+            uint64_t qpc = s_taskset_watches[slot].qpc_callback
+                         ? s_taskset_watches[slot].qpc_callback() : 0;
+            for (unsigned b = 0; b < 16; ++b) {
+                uint8_t rising = next[b] & (uint8_t)~s_taskset_watches[slot].eligible[b];
+                for (unsigned bit = 0; bit < 8; ++bit) {
+                    if (rising & (0x80u >> bit)) {
+                        s_taskset_watches[slot].ready_qpc[b * 8 + bit] = qpc;
+                    }
+                }
+            }
+            SetEvent(s_taskset_watches[slot].event);
+        }
+        /* Update on both rises and falls, so only a fresh eligibility edge
+         * can signal and stale ready timestamps do not survive deactivation. */
+        for (unsigned b = 0; b < 16; ++b) {
+            uint8_t fallen = s_taskset_watches[slot].eligible[b] & (uint8_t)~next[b];
+            for (unsigned bit = 0; bit < 8; ++bit)
+                if (fallen & (0x80u >> bit)) s_taskset_watches[slot].ready_qpc[b * 8 + bit] = 0;
+            s_taskset_watches[slot].eligible[b] = next[b];
+        }
+    }
+}
+/* END SPU TASKSET WAKE WATCH */
 #else
 #define queue_notify_publication(ea) ((void)0)
+#define taskset_notify_publication(ea) ((void)0)
 #endif
 
 /* ===========================================================================
@@ -126,18 +241,15 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
  * line outside a hardcoded window would be silently non-coherent, which is the
  * failure this whole file exists to remove.
  * ===========================================================================*/
-#define SPU_COH_LINE_SHIFT  7                                  /* 128-byte lines */
-#define SPU_COH_LINES       (1u << (32 - SPU_COH_LINE_SHIFT))   /* 2^25 lines */
-#define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
-
-static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
+unsigned char spu_coh_reservation_bitmap[SPU_COH_BITMAP_SIZE];
 
 /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
- * bitmap entirely for a title that runs no SPU code, and keeps every existing
- * test that stores through vm_write* paying one compare against a hot global.
- * Written once, under the lock; read unlocked, where a stale zero costs at most
- * one missed event on the very first reservation of the run. */
-static int s_coh_armed;
+ * bitmap entirely for a title that runs no SPU code. Published atomically after
+ * the first line bit so an acquire-in-program-order first observation sees the
+ * mark. A check that overlaps that first publication may still linearize just
+ * before it and miss that one reservation; the existing protocol does not
+ * serialize an unreserved PPU store against a concurrent first reservation. */
+uint32_t spu_coh_reservations_armed;
 
 /* Compact live set, always accessed under the lock-line lock. Async jobs may
  * outnumber physical SPUs, so an eight-entry ceiling can lose real holders. */
@@ -149,8 +261,14 @@ unsigned long g_spu_lr_raise = 0;
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
-    s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
-    s_coh_armed = 1;
+    /* Reservation publishers hold the lock-line lock, so they can preserve
+     * neighboring bits with an ordinary read followed by an atomic release
+     * store. The PPU predicate reads this byte concurrently without that lock. */
+    unsigned char* byte = &spu_coh_reservation_bitmap[line >> 3];
+    unsigned char bits = spu_coh_atomic_load_u8_relaxed(byte);
+    bits |= (unsigned char)(1u << (line & 7));
+    spu_coh_atomic_store_u8(byte, bits);
+    spu_coh_atomic_store_u32(&spu_coh_reservations_armed, 1u);
 
     if (!ctx) return;
     /* Search the whole live set before inserting. Filling an early hole
@@ -218,9 +336,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 
 int spu_coh_is_reserved(uint32_t addr)
 {
-    if (!s_coh_armed) return 0;
-    uint32_t line = addr >> SPU_COH_LINE_SHIFT;
-    return (s_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+    return spu_coh_is_reserved_inline(addr);
 }
 
 /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own
@@ -236,6 +352,7 @@ int spu_coh_is_reserved(uint32_t addr)
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     queue_notify_publication(ea);
+    taskset_notify_publication(ea);
     uint32_t line = ea & ~127u;
     for (size_t i = 0; i < s_coh_count; i++) {
         spu_context* c = s_coh_ctxs[i];
@@ -252,6 +369,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 void spu_coh_notify_write(uint32_t ea)
 {
     queue_notify_publication(ea);
+    taskset_notify_publication(ea);
     uint32_t line = ea & ~127u;
     for (size_t i = 0; i < s_coh_count; i++) {
         spu_context* c = s_coh_ctxs[i];

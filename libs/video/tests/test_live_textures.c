@@ -1,8 +1,49 @@
 /* Exercise the live uploader with synthetic guest bytes and a real WARP GPU. */
 #include <assert.h>
+#include <io.h>
 #include "../rsx_live_draw.c"
 #define OK(x) do { HRESULT hr_ = (x); assert(SUCCEEDED(hr_)); } while (0)
 static u8 guest[2048];
+static u8* watch_guest;
+static int watch_fail_after = -1;
+static u32 geometry_source_shift;
+static int geometry_late_index_write;
+static DWORD resolver_owner_tid;
+static volatile LONG resolver_worker_calls;
+static FILE* texture_diag_capture;
+static int texture_diag_saved_stderr = -1;
+static void texture_diag_capture_begin(void)
+{
+    texture_diag_capture = tmpfile();
+    assert(texture_diag_capture);
+    fflush(stderr);
+    texture_diag_saved_stderr = _dup(_fileno(stderr));
+    assert(texture_diag_saved_stderr >= 0);
+    assert(_dup2(_fileno(texture_diag_capture), _fileno(stderr)) == 0);
+}
+static char* texture_diag_capture_read(void)
+{
+    assert(texture_diag_capture);
+    fflush(stderr);
+    assert(fseek(texture_diag_capture, 0, SEEK_END) == 0);
+    long length = ftell(texture_diag_capture);
+    assert(length >= 0 && length < 4 * 1024 * 1024);
+    assert(fseek(texture_diag_capture, 0, SEEK_SET) == 0);
+    char* contents = (char*)malloc((size_t)length + 1);
+    assert(contents);
+    assert(fread(contents, 1, (size_t)length, texture_diag_capture) == (size_t)length);
+    contents[length] = 0;
+    return contents;
+}
+static void texture_diag_capture_end(void)
+{
+    fflush(stderr);
+    assert(_dup2(texture_diag_saved_stderr, _fileno(stderr)) == 0);
+    _close(texture_diag_saved_stderr);
+    texture_diag_saved_stderr = -1;
+    fclose(texture_diag_capture);
+    texture_diag_capture = NULL;
+}
 uint8_t* vm_base = guest;
 uint32_t vm_read32(uint64_t address)
 {
@@ -12,7 +53,17 @@ uint32_t vm_read32(uint64_t address)
 }
 static const u8* resolve(void* user, u32 location, u32 offset, u32 size)
 {
+    if (resolver_owner_tid && GetCurrentThreadId()!=resolver_owner_tid)
+        InterlockedIncrement(&resolver_worker_calls);
     (void)user; (void)location;
+    if (watch_guest) {
+        if (watch_fail_after == 0) return NULL;
+        if (watch_fail_after > 0) --watch_fail_after;
+        if (geometry_late_index_write && offset==4096) {
+            watch_guest[5121]=7; geometry_late_index_write=0;
+        }
+        return (u64)offset + size + geometry_source_shift <= 65536 ? watch_guest + offset + geometry_source_shift : NULL;
+    }
     return (u64)offset + size <= sizeof(guest) ? guest + offset : NULL;
 }
 static ID3D12Resource* buffer(D3D12_HEAP_TYPE type)
@@ -227,6 +278,10 @@ static void fetch_tests(void)
                 assert(rsx_vertex_decode_element(RSX_VTX_TYPE_SINT16,size,guest,expected));
                 assert(rsx_vertex_fetch_many(&exact,&ref,1,(u8*)actual));
                 assert(memcmp(actual,expected,sizeof(actual))==0);
+                for (unsigned modes=1;modes<=3;++modes) {
+                    assert(rsx_vertex_fetch_many_mode(&exact,&ref,1,(u8*)actual,modes));
+                    assert(!memcmp(actual,expected,sizeof(actual)));
+                }
             }
         }
         u8* page=VirtualAlloc(NULL,8192,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
@@ -237,7 +292,8 @@ static void fetch_tests(void)
             exact.attr[0].stable_base=page+4096-size*2;
             memset((void*)exact.attr[0].stable_base,0xA5,size*2);
             float actual[4];
-            assert(rsx_vertex_fetch_many(&exact,&ref,1,(u8*)actual));
+            for (unsigned modes=0;modes<=3;++modes)
+                assert(rsx_vertex_fetch_many_mode(&exact,&ref,1,(u8*)actual,modes));
         }
         VirtualFree(page,0,MEM_RELEASE);
         puts("SINT16 batch: every signed value/lane matches; protected tails do not overread");
@@ -530,6 +586,13 @@ static void resolution_tests(void)
     hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV; hd.NumDescriptors=1+MAX_SURFACES;
     OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.dsv_heap));
     g.dsv_step=g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev,hd.Type);
+    hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors=SRV_TABLE_SIZE*SRV_RING_TABLES;
+    hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.srv_heap));
+    hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER; hd.NumDescriptors=1;
+    OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.smp_heap));
+    assert(make_depth_snapshot_pipeline()==0);
     g.width=g.height=8; g.ready=1;
     const char* sizes[]={"8x8","12x12","16x16","11x13","12x12","native"};
     ID3D12Resource* rb=buffer(D3D12_HEAP_TYPE_READBACK);
@@ -540,6 +603,7 @@ static void resolution_tests(void)
         g_ld_resolution.shadow_host=mode==4 ? 3 : mode==5 ? 10 : 0;
         OK(g.alloc->lpVtbl->Reset(g.alloc)); OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
         g.n_surfaces=g.n_zdepths=0;
+        g.srv_ring_used=0;
         u32 source=surface_get(0,0x1000,8,8,DXGI_FORMAT_R8G8B8A8_UNORM);
         u32 dest=surface_get(0,0x2000,8,8,DXGI_FORMAT_R8G8B8A8_UNORM);
         assert(source<MAX_SURFACES && dest<MAX_SURFACES);
@@ -604,6 +668,7 @@ static void resolution_tests(void)
         rsx_dispatch_method(&g.rsx,0x020C,32);
         rsx_dispatch_method(&g.rsx,0x0210,0x1000);
         rsx_dispatch_method(&g.rsx,0x0214,0x3000);
+        rsx_dispatch_method(&g.rsx,0x022C,32); // ZETA_PITCH
         rsx_dispatch_method(&g.rsx,0x0208,8|(2u<<5));
         rsx_dispatch_method(&g.rsx,M_SCISSOR_HORIZONTAL,8u<<16);
         rsx_dispatch_method(&g.rsx,M_SCISSOR_VERTICAL,8u<<16);
@@ -614,6 +679,27 @@ static void resolution_tests(void)
         rsx_dispatch_method(&g.rsx,M_ZSTENCIL_CLEAR,0x400000A5);
         sink_clear(NULL,&g.rsx,RSX_CLEAR_DEPTH|RSX_CLEAR_STENCIL);
         const u32 scene_depth_pitch=read_depth(g.zdepths[zslot-1].tex,rb,262144);
+        assert(zdepth_pack(zslot-1,9,8)==0); // guest pitch bounds
+        assert(zdepth_pack(zslot-1,8,9)==0); // guest height bounds
+        assert(ld_blit_gpu(0,0x3000,32,0,0x7000,32,8,8)==1);
+        u32 px,py;
+        int packed_copy=surface_containing(0,0x7000,32,8,8,&px,&py);
+        assert(packed_copy>=0);
+        D3D12_RESOURCE_BARRIER packed_bar={0};
+        packed_bar.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        packed_bar.Transition.pResource=g.surfaces[packed_copy].tex;
+        packed_bar.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        packed_bar.Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET;
+        packed_bar.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g.list->lpVtbl->ResourceBarrier(g.list,1,&packed_bar);
+        read_subresource(g.surfaces[packed_copy].tex,0,rb,327680,DXGI_FORMAT_R8G8B8A8_UNORM,sf->w,sf->h);
+        const u64 packed_generation=g.zdepths[zslot-1].packed_generation;
+        rsx_dispatch_method(&g.rsx,M_ZSTENCIL_CLEAR,0x1234567C);
+        sink_clear(NULL,&g.rsx,RSX_CLEAR_STENCIL);
+        assert(zdepth_pack(zslot-1,8,8)==1);
+        assert(g.zdepths[zslot-1].packed_generation!=packed_generation);
+        copy_source(g.zdepths[zslot-1].packed);
+        read_subresource(g.zdepths[zslot-1].packed,0,rb,393216,DXGI_FORMAT_R8G8B8A8_UNORM,sf->w,sf->h);
         rsx_dispatch_method(&g.rsx,M_SCISSOR_HORIZONTAL,8u<<16);
         rsx_dispatch_method(&g.rsx,M_SCISSOR_VERTICAL,8u<<16);
         rsx_dispatch_method(&g.rsx,0x1D90,0xFF0000FF); // blue
@@ -653,12 +739,19 @@ static void resolution_tests(void)
             const int inside=x>=2*sf->w/8 && x<5*sf->w/8 && y>=sf->h/8 && y<5*sf->h/8;
             float depth; memcpy(&depth,bytes+262144+y*scene_depth_pitch+x*4,4);
             assert(fabsf(depth-(inside?4194304.0f/16777215.0f:1.0f))<1e-7f);
+            const u8* packed=bytes+327680+y*256+x*4;
+            assert(packed[0]==(inside?0:255) && packed[1]==(inside?0:255));
+            assert(packed[2]==(inside?0xA5:0x5A) && packed[3]==(inside?0x40:255));
+            const u8* refreshed=bytes+393216+y*256+x*4;
+            assert(refreshed[0]==packed[0] && refreshed[1]==packed[1] && refreshed[3]==packed[3]);
+            assert(refreshed[2]==(inside?0x7C:0x5A));
         }
         rb->lpVtbl->Unmap(rb,0,NULL);
         for(u32 i=0;i<g.n_surfaces;++i)g.surfaces[i].tex->lpVtbl->Release(g.surfaces[i].tex);
         for(u32 i=0;i<g.n_zdepths;++i) {
             g.zdepths[i].tex->lpVtbl->Release(g.zdepths[i].tex);
             g.zdepths[i].snapshot->lpVtbl->Release(g.zdepths[i].snapshot);
+            if(g.zdepths[i].packed)g.zdepths[i].packed->lpVtbl->Release(g.zdepths[i].packed);
         }
         memset(g.surfaces,0,sizeof(g.surfaces)); memset(g.zdepths,0,sizeof(g.zdepths));
         g.depth=NULL;
@@ -668,8 +761,15 @@ static void resolution_tests(void)
     rb->lpVtbl->Release(rb); g.rtv_heap->lpVtbl->Release(g.rtv_heap);
     g.srv_cpu_heap->lpVtbl->Release(g.srv_cpu_heap); g.dsv_heap->lpVtbl->Release(g.dsv_heap);
     g.rtv_heap=g.srv_cpu_heap=g.dsv_heap=NULL;
+    g.srv_heap->lpVtbl->Release(g.srv_heap); g.srv_heap=NULL;
+    g.smp_heap->lpVtbl->Release(g.smp_heap); g.smp_heap=NULL;
+    g.depth_pack_pso->lpVtbl->Release(g.depth_pack_pso); g.depth_pack_pso=NULL;
+    g.depth_pack_rootsig->lpVtbl->Release(g.depth_pack_rootsig); g.depth_pack_rootsig=NULL;
+    g.depth_snapshot_pso->lpVtbl->Release(g.depth_snapshot_pso); g.depth_snapshot_pso=NULL;
+    g.depth_snapshot_rootsig->lpVtbl->Release(g.depth_snapshot_rootsig); g.depth_snapshot_rootsig=NULL;
     puts("Custom resolution GPU readbacks: native, 1.5x, 2x, fractional asymmetric targets and independent shadow atlases; masked scissor clears, guest address bounds, depth dimensions and GPU blits passed.");
     puts("Z16/Z24S8 GPU clears: far depth, partial scissor, unused high Z16 bits, stencil-only depth preservation and legacy negative control passed at six resolutions.");
+    puts("Packed Z24S8: actual GPU depth/stencil bytes, live blit, cache refresh and guest bounds passed at six resolutions.");
 }
 static void graphics_sampler_tests(void)
 {
@@ -860,10 +960,420 @@ static void topology_copy_benchmark(void)
     dc.ref_remap=saved_remap; dc_reset(); g_ld_cpu_work=saved_flags;
     free(output); free(map);
 }
+static void native_texture_watch_cache_tests(void)
+{
+    watch_guest = VirtualAlloc(NULL,65536,MEM_RESERVE|MEM_COMMIT|MEM_WRITE_WATCH,PAGE_READWRITE);
+    assert(watch_guest);
+    assert(rsx_live_draw_set_texture_write_watch(watch_guest,65536));
+    _putenv_s("RSX_TEXTURE_WRITE_WATCH_VALIDATE","1");
+    const unsigned saved_flags=g_ld_cpu_work, saved_frame=g_ld_frames;
+    memset(g.textures,0,sizeof(g.textures)); memset(g.texture_buckets,0,sizeof(g.texture_buckets));
+    g.n_textures=2; g.guest_ptr=resolve; g_ld_cpu_work=4096;
+    rsx_dsp_texture textures[2]={{0},{0}};
+    for(unsigned i=0;i<2;++i) {
+        rsx_dsp_texture* t=&textures[i];
+        t->dimension=2; t->width=t->height=t->mipmaps=1;
+        t->format=0xBE; t->pitch=4; t->offset=i*64;
+        texcache_t* e=&g.textures[i];
+        e->dimension=2; e->width=e->height=e->mipmaps=1;
+        e->format=t->format; e->pitch=4; e->offset=t->offset;
+        // A sentinel must never be used by the unchanged/failed-decode paths.
+        e->tex=(ID3D12Resource*)(uintptr_t)1;
+        int readable=0; e->content_hash=texture_content_hash(t,&readable); assert(readable);
+        texture_cache_link(i,texture_cache_bucket(t));
+    }
+    ++g_ld_frames;
+    texture_srv_slot(&textures[0]); texture_srv_slot(&textures[1]);
+    assert(g.textures[0].write_watch_valid && g.textures[1].write_watch_valid);
+    u64 skipped=g_texture_watch_skips;
+    ++g_ld_frames;
+    texture_srv_slot(&textures[0]); texture_srv_slot(&textures[1]);
+    assert(g_texture_watch_skips==skipped+2 && g_texture_watch_audits>=2);
+    // A write outside both spans shares their page. Neither query may hide it.
+    skipped=g_texture_watch_skips; watch_guest[512]^=1; ++g_ld_frames;
+    texture_srv_slot(&textures[0]); texture_srv_slot(&textures[1]);
+    assert(g_texture_watch_skips==skipped);
+    ++g_ld_frames; texture_srv_slot(&textures[0]); texture_srv_slot(&textures[1]);
+    assert(g_texture_watch_skips==skipped+2);
+    // Algorithm transitions must use the old identity before adopting the new.
+    for(unsigned kind=0;kind<2;++kind) {
+        g_ld_cpu_work=4096|(kind*4); ++g_ld_frames;
+        texture_srv_slot(&textures[0]);
+        assert(g.textures[0].content_hash_kind==kind && g.textures[0].write_watch_valid);
+    }
+    g_ld_cpu_work=4096; ++g_ld_frames; texture_srv_slot(&textures[0]);
+    const u64 old_hash=g.textures[0].content_hash;
+    watch_guest[0]^=1;
+    for(unsigned retry=0;retry<2;++retry) {
+        // Query/hash readable, decode unreadable. A later frame must retry.
+        watch_fail_after=2; ++g_ld_frames; texture_srv_slot(&textures[0]);
+        assert(watch_fail_after==0 && !g.textures[0].write_watch_valid && g.textures[0].content_hash==old_hash);
+    }
+    watch_fail_after=-1; watch_guest[0]^=1; ++g_ld_frames;
+    texture_srv_slot(&textures[0]); assert(g.textures[0].write_watch_valid);
+    g_ld_cpu_work=0; ++g_ld_frames; texture_srv_slot(&textures[0]);
+    assert(!g.textures[0].write_watch_valid);
+    g_texture_watch.healthy=0; g_ld_cpu_work=4096; ++g_ld_frames;
+    texture_srv_slot(&textures[0]); assert(!g.textures[0].write_watch_valid);
+    assert(!g_texture_watch_failures);
+    rsx_texture_write_watch_destroy(&g_texture_watch);
+    VirtualFree(watch_guest,0,MEM_RELEASE); watch_guest=NULL;
+    memset(g.textures,0,sizeof(g.textures)); memset(g.texture_buckets,0,sizeof(g.texture_buckets));
+    g.n_textures=0; g_ld_cpu_work=saved_flags; g_ld_frames=saved_frame;
+    puts("Native texture tracking: audited skips, shared-page writes, hash switches, failed refresh retry and disabled-mode fallback passed");
+}
+typedef struct {
+    u32 n_refs,n_verts,n_source_refs,n_cuts,remapped;
+    rsx_vertex_ref refs[128]; u32 map[128],cuts[128]; u8 vertices[128*32];
+} geometry_snapshot;
+static void geometry_read(const rsx_vertex_layout_plan* layout, int enabled, geometry_snapshot* out)
+{
+    static batch_t indices={0,64};
+    dc_reset(); dc.idx=&indices; dc.n_idx=1;
+    g_ld_geometry_cache_enabled=enabled;
+    fetch_batches_hoisted(layout,1); assert(dc.fetch_ok);
+    memset(out,0,sizeof(*out));
+    out->n_refs=dc.n_refs; out->n_verts=dc.n_verts; out->n_source_refs=dc.n_source_refs;
+    out->n_cuts=dc.n_cuts; out->remapped=(u32)dc.refs_remapped;
+    assert(dc.n_refs<=128 && dc.n_source_refs<=128 && dc.n_cuts<=128 && (u64)dc.n_verts*layout->stride<=sizeof(out->vertices));
+    memcpy(out->refs,dc.refs,dc.n_refs*sizeof(*dc.refs));
+    if (dc.refs_remapped) memcpy(out->map,dc.ref_remap.occurrence_to_unique,dc.n_source_refs*sizeof(u32));
+    if (dc.n_cuts) memcpy(out->cuts,dc.cuts,dc.n_cuts*sizeof(u32));
+    memcpy(out->vertices,dc.compact_verts,(size_t)dc.n_verts*layout->stride);
+}
+static void native_geometry_cache_tests(void)
+{
+    watch_guest=VirtualAlloc(NULL,65536,MEM_RESERVE|MEM_COMMIT|MEM_WRITE_WATCH,PAGE_READWRITE);
+    assert(watch_guest && rsx_live_draw_set_texture_write_watch(watch_guest,65536));
+    g.guest_ptr=resolve; g.guest_user=NULL;
+    memset(&g.rsx,0,sizeof(g.rsx)); g.rsx.current_primitive=PRIM_TRIANGLE_STRIP;
+    g.rsx.regs[0x1740/4]=RSX_VTX_TYPE_FLOAT|(4u<<4)|(16u<<8);
+    g.rsx.regs[0x1680/4]=4096; g.rsx.regs[0x181C/4]=8192; g.rsx.regs[0x1820/4]=0x10;
+    for (u32 i=0;i<512;++i) watch_guest[4096+i]=(u8)(i*37+19);
+    for (u32 i=0;i<64;++i) watch_guest[8192+i*2+1]=(u8)(i%16);
+    rsx_vertex_layout_plan layout; rsx_vertex_layout_plan_init(&layout,3);
+    geometry_snapshot original,cached;
+    g_ld_cpu_work=1283; g_ld_vertex_cache_enabled=0; g_geom_validate=0;
+    geometry_read(&layout,0,&original); geometry_read(&layout,1,&cached);
+    assert(!memcmp(&original,&cached,sizeof(original)));
+    u64 hits=g_geom_stats.hits;
+    geometry_read(&layout,1,&cached); assert(g_geom_stats.hits==hits+1);
+    assert(!memcmp(&original,&cached,sizeof(original)));
+    u32 random=0x9e3779b9;
+    for (u32 trial=0;trial<512;++trial) {
+        random=random*1664525u+1013904223u;
+        watch_guest[4096+random%512]^=(u8)(random>>24);
+        watch_guest[8192+(trial%64)*2+1]=(u8)(random%16);
+        const u32 type=1+trial%7, size=1+trial%4, frequency=trial%5;
+        g.rsx.regs[0x1740/4]=type|(size<<4)|(16u<<8)|(frequency<<16);
+        g.rsx.regs[0x173C/4]=(trial%2)?0x100001:0;
+        g.rsx.regs[0x1FC0/4]=trial%2;
+        g.rsx.regs[(0x1C00+16)/4]=random; // disabled ATTR1 default identity
+        g.rsx.regs[0x1DAC/4]=trial%3==0; g.rsx.regs[0x1DB0/4]=15;
+        g_ld_cpu_work=(trial%2)?1283:1281;
+        geometry_read(&layout,0,&original);
+        geometry_read(&layout,1,&cached); assert(!memcmp(&original,&cached,sizeof(original)));
+        geometry_read(&layout,1,&cached); assert(!memcmp(&original,&cached,sizeof(original)));
+        if (trial%8==0) {
+            watch_guest[4096]^=0x20;
+            u64 stamp; assert(rsx_texture_write_watch_stamp(&g_texture_watch,watch_guest+4096,1,&stamp,NULL));
+            geometry_read(&layout,0,&original); geometry_read(&layout,1,&cached);
+            assert(!memcmp(&original,&cached,sizeof(original)));
+        }
+    }
+    // The same page can hold indices and attributes. A write after index
+    // gathering but before attribute decode must invalidate the next draw.
+    ld_geometry_cache_clear();
+    memset(&g.rsx,0,sizeof(g.rsx)); g.rsx.current_primitive=PRIM_TRIANGLES;
+    g.rsx.regs[0x1740/4]=RSX_VTX_TYPE_FLOAT|(4u<<4)|(16u<<8);
+    g.rsx.regs[0x1680/4]=4096; g.rsx.regs[0x181C/4]=5120; g.rsx.regs[0x1820/4]=0x10;
+    for (u32 i=0;i<64;++i) { watch_guest[5120+i*2]=0; watch_guest[5121+i*2]=(u8)(i%16); }
+    geometry_late_index_write=1;
+    geometry_read(&layout,1,&cached); assert(!geometry_late_index_write);
+    const u64 misses=g_geom_stats.misses;
+    geometry_read(&layout,1,&cached); assert(g_geom_stats.misses==misses+1 && cached.refs[0].vertex_id==7);
+    geometry_read(&layout,0,&original); assert(!memcmp(&original,&cached,sizeof(original)));
+    // A resolver remap is a new source even if both native page epochs match.
+    memcpy(watch_guest+16384,watch_guest,16384); watch_guest[16384+4096]^=0x40;
+    u64 stamp; assert(rsx_texture_write_watch_stamp(&g_texture_watch,watch_guest,65536,&stamp,NULL));
+    geometry_read(&layout,1,&cached);
+    geometry_source_shift=16384;
+    geometry_read(&layout,0,&original); geometry_read(&layout,1,&cached);
+    assert(!memcmp(&original,&cached,sizeof(original)));
+    geometry_source_shift=0;
+    // Allocation/source failures and mode switches retain ordinary fallback.
+    watch_fail_after=0; dc_reset(); static batch_t bad={0,64}; dc.idx=&bad; dc.n_idx=1;
+    fetch_batches_hoisted(&layout,1); assert(!dc.fetch_ok); watch_fail_after=-1;
+    geometry_read(&layout,0,&original); geometry_read(&layout,1,&cached);
+    assert(!memcmp(&original,&cached,sizeof(original)));
+    // Validate real production hits, then deliberately corrupt only cached
+    // output: the independent full path must detect it and disable reuse.
+    g_geom_validate=1;
+    geometry_read(&layout,1,&cached); assert(g_geom_stats.audits && !g_geom_stats.failures);
+    ld_geom_entry* entry=g_geom_draw.entry; assert(entry && entry->storage);
+    ((u8*)ld_geom_payload(entry))[0]^=1;
+    geometry_read(&layout,1,&cached); assert(g_geom_cache_failed && g_geom_stats.failures==1);
+    assert(!memcmp(&original,&cached,sizeof(original)));
+    geometry_read(&layout,1,&cached); assert(!memcmp(&original,&cached,sizeof(original)));
+    ld_geometry_cache_clear(); memset(&g_geom_stats,0,sizeof(g_geom_stats));
+    g_geom_cache_failed=0; g_geom_validate=-1; g_ld_geometry_cache_enabled=-1; g_ld_vertex_cache_enabled=-1;
+    dc.idx=NULL; dc_reset(); g_ld_cpu_work=1283;
+    rsx_texture_write_watch_destroy(&g_texture_watch);
+    VirtualFree(watch_guest,0,MEM_RELEASE); watch_guest=NULL;
+    puts("Native geometry cache: 512 mutation/layout/divisor/restart cases, shared epochs, late index writes, remaps, fallback and independent hit auditing passed");
+}
+static void native_vertex_worker_tests(void)
+{
+    watch_guest=VirtualAlloc(NULL,65536,MEM_RESERVE|MEM_COMMIT|MEM_WRITE_WATCH,PAGE_READWRITE);
+    assert(watch_guest && rsx_live_draw_set_texture_write_watch(watch_guest,65536));
+    g.guest_ptr=resolve; g.guest_user=NULL;
+    resolver_owner_tid=GetCurrentThreadId(); resolver_worker_calls=0;
+    for (u32 i=0;i<65536;++i) watch_guest[i]=(u8)(i*71+3);
+    rsx_vertex_ref refs[1024];
+    u8 serial[1024*32+64],parallel[1024*32+64];
+    const u32 saved_mxcsr=_mm_getcsr();
+    _mm_setcsr((saved_mxcsr&~(3u<<13))|(1u<<13)|(1u<<15)|(1u<<6));
+    g_vertex_worker_min=64; g_vertex_worker_validate=1;
+    rsx_vertex_layout_plan layout; rsx_vertex_layout_plan_init(&layout,3);
+    rsx_vertex_fetch_plan plan;
+    u32 random=0x1c4567;
+    for (u32 trial=0;trial<84;++trial) {
+        memset(&g.rsx,0,sizeof(g.rsx));
+        const u32 type=1+trial%7,size=1+(trial/7)%4;
+        g.rsx.regs[0x1740/4]=type|(size<<4)|(16u<<8);
+        g.rsx.regs[0x1744/4]=trial%5?RSX_VTX_TYPE_SINT16|(4u<<4)|(16u<<8):0;
+        g.rsx.regs[0x1680/4]=4096; g.rsx.regs[0x1684/4]=32768;
+        g.rsx.regs[(0x1C00+16)/4]=trial*17;
+        const u32 count=64+(trial*37)%961;
+        for (u32 i=0;i<1024;++i) {
+            random=random*1664525u+1013904223u;
+            refs[i].vertex_id=random%1024+0x100000;
+            refs[i].base_index=0;
+        }
+        watch_guest[4096+trial]^=0x31;
+        rsx_vertex_fetch_plan_init(&plan,&g.rsx,&layout,resolve,NULL);
+        rsx_vertex_fetch_plan_prepare(&plan,refs,count);
+        const unsigned modes=trial%4;
+        memset(serial,0xA5,sizeof(serial));
+        const int ok=rsx_vertex_fetch_many_mode(&plan,refs,count,serial,modes);
+        for (int workers=1;workers<=3;++workers) {
+            g_ld_vertex_workers=workers;
+            memset(parallel,0xA5,sizeof(parallel));
+            assert(ld_vertex_fetch_parallel(&plan,refs,count,parallel,modes)==ok);
+            assert(!memcmp(serial,parallel,sizeof(serial)));
+            assert(!g_vertex_worker_failed && !g_vertex_worker_stats.failures);
+        }
+        // Live mode switches and small work retain the serial path.
+        g_ld_vertex_workers=0;
+        memset(parallel,0xA5,sizeof(parallel));
+        assert(ld_vertex_fetch_parallel(&plan,refs,count,parallel,modes)==ok);
+        assert(!memcmp(serial,parallel,sizeof(serial)));
+    }
+    assert(g_vertex_worker_stats.audits==84*3 && !g_vertex_worker_stats.races);
+    assert(!resolver_worker_calls && g_vertex_workers_created==3);
+    // Resolver-dependent and divider paths must remain on the renderer.
+    g_ld_vertex_workers=3;
+    plan.attr[0].stable_base=NULL;
+    u64 parallel_draws=g_vertex_worker_stats.parallel_draws;
+    const int ok=rsx_vertex_fetch_many_mode(&plan,refs,1024,serial,1);
+    assert(ld_vertex_fetch_parallel(&plan,refs,1024,parallel,1)==ok);
+    assert(!memcmp(serial,parallel,1024*32));
+    assert(g_vertex_worker_stats.parallel_draws==parallel_draws && !resolver_worker_calls);
+    plan.attr[0].desc.frequency=2;
+    assert(!ld_vertex_worker_eligible(&plan,refs,1024));
+    // An intervening source write is an unstable audit, not a cache bug.
+    rsx_vertex_fetch_plan_prepare(&plan,refs,1024);
+    plan.attr[0].desc.frequency=0;
+    rsx_vertex_fetch_plan_prepare(&plan,refs,1024);
+    ld_geom_source sources[16]; u32 n_sources; u64 before;
+    assert(ld_vertex_worker_sources(&plan,sources,&n_sources));
+    assert(ld_geom_stamp(sources,n_sources,&before));
+    assert(rsx_vertex_fetch_many_mode(&plan,refs,1024,serial,1));
+    memcpy(parallel,serial,1024*32);
+    // The final audit may be larger than the earlier variable-sized calls.
+    g_vertex_worker_audit_buffer=realloc(g_vertex_worker_audit_buffer,1024*32);
+    assert(g_vertex_worker_audit_buffer); g_vertex_worker_audit_capacity=1024*32;
+    watch_guest[4096]^=0x40;
+    assert(ld_vertex_worker_validate_output(&plan,refs,1024,parallel,1,1,sources,n_sources,before));
+    assert(g_vertex_worker_stats.races==1 && !g_vertex_worker_stats.failures);
+    assert(rsx_vertex_fetch_many_mode(&plan,refs,1024,serial,1));
+    assert(!memcmp(serial,parallel,1024*32));
+    // Audit corruption is detected and full serial output replaces it.
+    assert(ld_geom_stamp(sources,n_sources,&before));
+    parallel[0]^=1;
+    assert(ld_vertex_worker_validate_output(&plan,refs,1024,parallel,1,1,sources,n_sources,before));
+    assert(g_vertex_worker_failed && g_vertex_worker_stats.failures==1);
+    assert(!memcmp(serial,parallel,1024*32));
+    // Cleanup joins persistent threads; the pool can subsequently be recreated.
+    ld_vertex_workers_clear(); assert(!g_vertex_workers_created);
+    g_vertex_worker_failed=0; assert(ld_vertex_workers_reserve(1));
+    ld_vertex_workers_clear(); assert(!g_vertex_workers_created);
+    _mm_setcsr(saved_mxcsr);
+    resolver_owner_tid=0;
+    memset(&g_vertex_worker_stats,0,sizeof(g_vertex_worker_stats));
+    g_vertex_worker_validate=-1; g_ld_vertex_workers=-1; g_vertex_worker_min=0;
+    rsx_texture_write_watch_destroy(&g_texture_watch);
+    VirtualFree(watch_guest,0,MEM_RELEASE); watch_guest=NULL;
+    puts("Native vertex workers: 252 parallel format/size/mode comparisons, FP state, guards, resolver isolation, mutation audits, fault fallback and join/recreation passed");
+}
+static void texture_content_cache_gpu_tests(ID3D12Resource* rb)
+{
+    const u32 saved_upload_used=g.upload_used;
+    ID3D12Fence* content_fence=NULL;
+    OK(g.dev->lpVtbl->CreateFence(g.dev,0,D3D12_FENCE_FLAG_NONE,
+                                  &IID_ID3D12Fence,(void**)&content_fence));
+    OK(g.alloc->lpVtbl->Reset(g.alloc));
+    OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
+    ld_texture_content_clear();
+    g.upload_used=0;
+
+    u8 bc1_a[8]={0x31,0x42,0x53,0x64,0x75,0x86,0x97,0xA8};
+    u8 bc1_relocated[8]; memcpy(bc1_relocated,bc1_a,sizeof(bc1_a));
+    u8 bc1_changed[8]; memcpy(bc1_changed,bc1_a,sizeof(bc1_a)); bc1_changed[0]^=0x80;
+    tex_level_t level_a={4,4,bc1_a,8,1};
+    tex_level_t level_relocated={4,4,bc1_relocated,8,1};
+    tex_level_t level_changed={4,4,bc1_changed,8,1};
+    ID3D12Resource* held_first=create_texture_mipped_cached(
+        DXGI_FORMAT_BC1_UNORM,&level_a,1);
+    assert(held_first);
+    const u32 after_first=g.upload_used;
+    ID3D12Resource* same=create_texture_mipped_cached(
+        DXGI_FORMAT_BC1_UNORM,&level_relocated,1);
+    assert(same==held_first && g.upload_used==after_first);
+    same->lpVtbl->Release(same);
+    ID3D12Resource* changed=create_texture_mipped_cached(
+        DXGI_FORMAT_BC1_UNORM,&level_changed,1);
+    assert(changed && changed!=held_first && g.upload_used>after_first);
+
+    /* Exact level metadata and format participate in identity. */
+    u8 mip_bytes[16]; memset(mip_bytes,0xC3,sizeof(mip_bytes));
+    tex_level_t mip_levels[2]={{4,4,mip_bytes,8,1},{2,2,mip_bytes+8,8,1}};
+    ID3D12Resource* mip_texture=create_texture_mipped_cached(
+        DXGI_FORMAT_BC1_UNORM,mip_levels,2);
+    assert(mip_texture && mip_texture!=held_first && mip_texture!=changed);
+    u8 bc4_bytes[8]; memcpy(bc4_bytes,bc1_a,sizeof(bc4_bytes));
+    tex_level_t level_bc4={4,4,bc4_bytes,8,1};
+    ID3D12Resource* format_texture=create_texture_mipped_cached(
+        DXGI_FORMAT_BC4_UNORM,&level_bc4,1);
+    assert(format_texture && format_texture!=held_first && format_texture!=changed &&
+           format_texture!=mip_texture);
+
+    /* Force a hash collision against the first entry; exact bytes must reject it. */
+    u8 collision_bytes[8]; memcpy(collision_bytes,bc1_a,sizeof(collision_bytes));
+    collision_bytes[7]^=0x01;
+    tex_level_t collision_level={4,4,collision_bytes,8,1};
+    u64 first_hash=0; int first_found=0;
+    for (u32 i=0;i<LD_TEXTURE_CONTENT_ENTRIES;++i)
+        if (g_ld_texture_content.entries[i].resource==held_first) {
+            first_hash=g_ld_texture_content.entries[i].hash;
+            first_found=1;
+        }
+    assert(first_found);
+    const u64 compared_before=g_ld_texture_content.compared_bytes;
+    assert(!ld_texture_content_find(DXGI_FORMAT_BC1_UNORM,&collision_level,1,
+                                    collision_bytes,sizeof(collision_bytes),first_hash));
+    assert(g_ld_texture_content.compared_bytes==compared_before+sizeof(collision_bytes));
+    tex_level_t different_layout={4,4,bc1_a,4,2};
+    assert(!ld_texture_content_find(DXGI_FORMAT_BC1_UNORM,&different_layout,1,
+                                    bc1_a,sizeof(bc1_a),first_hash));
+    assert(!ld_texture_content_find(DXGI_FORMAT_BC1_UNORM,mip_levels,2,
+                                    bc1_a,sizeof(bc1_a),first_hash));
+    ID3D12Resource* format_hit=ld_texture_content_find(
+        DXGI_FORMAT_BC4_UNORM,&level_a,1,bc1_a,sizeof(bc1_a),first_hash);
+    assert(format_hit==format_texture && format_hit!=held_first);
+    format_hit->lpVtbl->Release(format_hit);
+    assert(!ld_texture_content_find(DXGI_FORMAT_BC1_UNORM_SRGB,&level_a,1,
+                                    bc1_a,sizeof(bc1_a),first_hash));
+
+    ID3D12Resource* retained_refs[]={held_first,changed,mip_texture,format_texture};
+    ld_texture_content_clear();
+    assert(g_ld_texture_content.count==0 && !g_ld_texture_content.scratch);
+    /* The caller reference keeps a cache-owned resource alive after clear. */
+    D3D12_RESOURCE_DESC desc; held_first->lpVtbl->GetDesc(held_first,&desc);
+    assert(desc.Format==DXGI_FORMAT_BC1_UNORM && desc.Width==4 && desc.MipLevels==1);
+    copy_source(held_first);
+    read_subresource(held_first,0,rb,8192,DXGI_FORMAT_BC1_UNORM,4,4);
+    OK(g.list->lpVtbl->Close(g.list));
+    ID3D12CommandList* lists[]={(ID3D12CommandList*)g.list};
+    g.queue->lpVtbl->ExecuteCommandLists(g.queue,1,lists);
+    OK(g.queue->lpVtbl->Signal(g.queue,content_fence,1));
+    OK(content_fence->lpVtbl->SetEventOnCompletion(content_fence,1,g.fence_event));
+    assert(WaitForSingleObject(g.fence_event,10000)==WAIT_OBJECT_0);
+    u8* readback_bytes; OK(rb->lpVtbl->Map(rb,0,NULL,(void**)&readback_bytes));
+    assert(!memcmp(readback_bytes+8192,bc1_a,sizeof(bc1_a)));
+    rb->lpVtbl->Unmap(rb,0,NULL);
+    for (u32 i=0;i<sizeof(retained_refs)/sizeof(retained_refs[0]);++i)
+        retained_refs[i]->lpVtbl->Release(retained_refs[i]);
+
+    /* Fill all entries and evict the oldest while keeping its caller ref. */
+    OK(g.alloc->lpVtbl->Reset(g.alloc));
+    OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
+    ld_texture_content_clear();
+    g.upload_used=0;
+    ID3D12Resource* eviction_refs[LD_TEXTURE_CONTENT_ENTRIES+1]={0};
+    u8 eviction_data[LD_TEXTURE_CONTENT_ENTRIES+1][8];
+    for (u32 i=0;i<LD_TEXTURE_CONTENT_ENTRIES+1;++i) {
+        for (u32 b=0;b<8;++b)
+            eviction_data[i][b]=(u8)((i>>(8u*(b&3u))) ^ (b*17u));
+        tex_level_t level={4,4,eviction_data[i],8,1};
+        eviction_refs[i]=create_texture_mipped_cached(DXGI_FORMAT_BC1_UNORM,&level,1);
+        assert(eviction_refs[i]);
+    }
+    assert(g_ld_texture_content.count==LD_TEXTURE_CONTENT_ENTRIES);
+    assert(g_ld_texture_content.evictions==1);
+    eviction_refs[0]->lpVtbl->GetDesc(eviction_refs[0],&desc);
+    assert(desc.Format==DXGI_FORMAT_BC1_UNORM && desc.Width==4);
+    copy_source(eviction_refs[0]);
+    read_subresource(eviction_refs[0],0,rb,12288,DXGI_FORMAT_BC1_UNORM,4,4);
+    ld_texture_content_clear();
+    assert(g_ld_texture_content.count==0);
+    OK(g.list->lpVtbl->Close(g.list));
+    g.queue->lpVtbl->ExecuteCommandLists(g.queue,1,lists);
+    OK(g.queue->lpVtbl->Signal(g.queue,content_fence,2));
+    OK(content_fence->lpVtbl->SetEventOnCompletion(content_fence,2,g.fence_event));
+    assert(WaitForSingleObject(g.fence_event,10000)==WAIT_OBJECT_0);
+    OK(rb->lpVtbl->Map(rb,0,NULL,(void**)&readback_bytes));
+    assert(!memcmp(readback_bytes+12288,eviction_data[0],sizeof(eviction_data[0])));
+    rb->lpVtbl->Unmap(rb,0,NULL);
+    for (u32 i=0;i<LD_TEXTURE_CONTENT_ENTRIES+1;++i)
+        eviction_refs[i]->lpVtbl->Release(eviction_refs[i]);
+
+    /* A full-ring preflight failure must leave the cursor/cache untouched. */
+    OK(g.alloc->lpVtbl->Reset(g.alloc));
+    OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
+    ld_texture_content_clear();
+    g.upload_used=UPLOAD_SIZE-100;
+    ID3D12Resource* failed=create_texture_mipped_cached(
+        DXGI_FORMAT_BC1_UNORM,&level_a,1);
+    assert(!failed && g.upload_used==UPLOAD_SIZE-100);
+    assert(g_ld_texture_content.count==0 && g_ld_texture_content.misses==1);
+    g.upload_used=0;
+    ID3D12Resource* retried=create_texture_mipped_cached(
+        DXGI_FORMAT_BC1_UNORM,&level_a,1);
+    assert(retried && g.upload_used>0 && g_ld_texture_content.count==1 &&
+           g_ld_texture_content.misses==2);
+    copy_source(retried);
+    read_subresource(retried,0,rb,16384,DXGI_FORMAT_BC1_UNORM,4,4);
+    ld_texture_content_clear();
+    OK(g.list->lpVtbl->Close(g.list));
+    g.queue->lpVtbl->ExecuteCommandLists(g.queue,1,lists);
+    OK(g.queue->lpVtbl->Signal(g.queue,content_fence,3));
+    OK(content_fence->lpVtbl->SetEventOnCompletion(content_fence,3,g.fence_event));
+    assert(WaitForSingleObject(g.fence_event,10000)==WAIT_OBJECT_0);
+    OK(rb->lpVtbl->Map(rb,0,NULL,(void**)&readback_bytes));
+    assert(!memcmp(readback_bytes+16384,bc1_a,sizeof(bc1_a)));
+    rb->lpVtbl->Unmap(rb,0,NULL);
+    retried->lpVtbl->Release(retried);
+    content_fence->lpVtbl->Release(content_fence);
+    g.upload_used=saved_upload_used;
+    puts("Texture content cache: relocation hit, changed bytes, format/mip identity, collision rejection, clear/eviction ref lifetime, upload-capacity retry and GPU readback passed");
+}
+
 static u64 override_epoch=1;
 static u8 override_pixels[4*4*4];
 static unsigned override_calls;
 static int override_present=1;
+static int override_watch;
 static u64 test_override_revision(u32 format,u32 width,u32 height,void* user)
 {
     assert(user==&override_epoch);
@@ -872,22 +1382,42 @@ static u64 test_override_revision(u32 format,u32 width,u32 height,void* user)
 static const u8* test_override_pixels(u32 format,u32 w,u32 h,const u8* src,size_t size,void* user)
 {
     assert(user==&override_epoch && (format&0x9F)==0x88 && w==4 && h==4);
-    assert(src==guest+1536 && size==16 && !memcmp(src,guest+1536,16));
+    const u8* expected=override_watch?watch_guest+1536:guest+1536;
+    assert(src==expected && size==16 && !memcmp(src,expected,16));
     ++override_calls;
     return override_present ? override_pixels : NULL;
 }
-static void override_tests(ID3D12Resource* rb)
+static void override_tests(ID3D12Resource* rb,int use_watch)
 {
+    const u32 saved_frame=g_ld_frames, saved_cpu_work=g_ld_cpu_work;
+    /* Previous fallback readback leaves its cached BC resource in COPY_SOURCE. */
+    ld_texture_content_clear();
     OK(g.alloc->lpVtbl->Reset(g.alloc));
     OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
     g.upload_used=0;
+    g_ld_frames=100;
+    override_epoch=1; override_calls=0; override_present=1;
+    memset(override_pixels,0,sizeof(override_pixels));
+    watch_fail_after=-1;
+    override_watch=use_watch;
+    if (use_watch) {
+        watch_guest=VirtualAlloc(NULL,65536,MEM_RESERVE|MEM_COMMIT|MEM_WRITE_WATCH,PAGE_READWRITE);
+        assert(watch_guest);
+        memset(watch_guest,0,65536);
+        memset(watch_guest+1536,0x73,16);
+        assert(rsx_live_draw_set_texture_write_watch(watch_guest,65536));
+        g_ld_cpu_work=1283|4096u;
+    } else {
+        assert(!g_texture_watch.base);
+        memset(guest+1536,0x73,16);
+        g_ld_cpu_work=1283;
+    }
     D3D12_DESCRIPTOR_HEAP_DESC hd={0};
     hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors=SRV_HEAP_SLOTS;
     OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.srv_cpu_heap));
     g.srv_step=g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev,hd.Type);
     rsx_dsp_texture t={0};
     t.dimension=2; t.width=t.height=4; t.mipmaps=1; t.format=0x88; t.offset=1536; t.remap=0xAAE4;
-    memset(guest+1536,0x73,16);
     rsx_live_draw_set_texture_override(test_override_revision,test_override_pixels,&override_epoch);
     // Multi-level and cubemap descriptors are ineligible for this bounded API.
     t.cubemap=1; assert(!texture_override_revision(&t)); t.cubemap=0;
@@ -898,12 +1428,24 @@ static void override_tests(ID3D12Resource* rb)
     assert(entry->override_rgba && override_calls==1);
     ID3D12Resource* first=entry->tex;
     assert(texture_srv_slot(&t)==SRV_TEXTURE_BASE+slot && entry->tex==first && override_calls==1);
+    if (use_watch) {
+        /* Establish an unchanged source stamp, then prove an ordinary cached
+         * bind takes the native write-watch skip before changing the prompt. */
+        ++g_ld_frames;
+        assert(texture_srv_slot(&t)==SRV_TEXTURE_BASE+slot);
+        const u64 skips=g_texture_watch_skips;
+        ++g_ld_frames;
+        assert(texture_srv_slot(&t)==SRV_TEXTURE_BASE+slot);
+        assert(g_texture_watch_skips==skips+1 && entry->tex==first && override_calls==1);
+    }
     copy_source(first); read_subresource(first,0,rb,8192,DXGI_FORMAT_R8G8B8A8_UNORM,4,4);
     // Revision changes refresh within the same frame without guest mutation.
     ++override_epoch;
     for (u32 p=0;p<16;p++) { override_pixels[p*4]=0; override_pixels[p*4+1]=255; }
+    const u64 skips_before_revision=g_texture_watch_skips;
     texture_srv_slot(&t);
     assert(entry->tex!=first && entry->override_revision==2 && override_calls==2);
+    if (use_watch) assert(g_texture_watch_skips==skips_before_revision);
     copy_source(entry->tex); read_subresource(entry->tex,0,rb,12288,DXGI_FORMAT_R8G8B8A8_UNORM,4,4);
     // A missing pack reverts to the original BC3 resource and descriptor format.
     ++override_epoch; override_present=0;
@@ -922,7 +1464,7 @@ static void override_tests(ID3D12Resource* rb)
     u8* bytes; OK(rb->lpVtbl->Map(rb,0,NULL,(void**)&bytes));
     assert(bytes[8192]==255 && bytes[8193]==0 && bytes[8195]==123);
     assert(bytes[12288]==0 && bytes[12289]==255 && bytes[12291]==123);
-    assert(!memcmp(bytes+16384,guest+1536,16));
+    assert(!memcmp(bytes+16384,use_watch?watch_guest+1536:guest+1536,16));
     rb->lpVtbl->Unmap(rb,0,NULL);
     override_fence->lpVtbl->Release(override_fence);
     rsx_live_draw_set_texture_override(NULL,NULL,NULL);
@@ -931,7 +1473,13 @@ static void override_tests(ID3D12Resource* rb)
     g.n_retired_textures=0;
     memset(g.textures,0,sizeof(g.textures)); memset(g.texture_buckets,0,sizeof(g.texture_buckets)); g.n_textures=0;
     g.srv_cpu_heap->lpVtbl->Release(g.srv_cpu_heap); g.srv_cpu_heap=NULL;
-    puts("Texture overrides: RGBA GPU pixels/alpha, cached reuse, same-frame revision, original fallback and eligibility passed.");
+    if (use_watch) {
+        rsx_texture_write_watch_destroy(&g_texture_watch);
+        VirtualFree(watch_guest,0,MEM_RELEASE); watch_guest=NULL;
+    }
+    g_ld_frames=saved_frame; g_ld_cpu_work=saved_cpu_work; override_watch=0;
+    printf("Texture overrides (%s): RGBA GPU pixels/alpha, cached reuse, same-frame revision, original fallback and eligibility passed.\n",
+           use_watch?"write-watch":"full-hash");
 }
 static void texture_content_cache_tests(ID3D12Resource* readback)
 {
@@ -1067,11 +1615,15 @@ static void texture_content_cache_tests(ID3D12Resource* readback)
 
 int main(void)
 {
+    texture_diag_capture_begin();
     shadow_sampler_tests();
     graphics_sampler_tests();
     cache_tests();
     fetch_tests();
     reference_batch_tests();
+    native_texture_watch_cache_tests();
+    native_geometry_cache_tests();
+    native_vertex_worker_tests();
     topology_copy_tests();
     topology_copy_benchmark();
     IDXGIFactory4* factory; IDXGIAdapter* warp;
@@ -1123,7 +1675,41 @@ int main(void)
         for (u32 b = 0; b < 16; ++b) assert(bytes[face*512+b] == 0x11 + face);
     assert(bytes[4096] == 0x35 && bytes[4097] == 0x79 && bytes[4098] == 0xB2 && bytes[4099] == 255);
     readback->lpVtbl->Unmap(readback,0,NULL);
-    override_tests(readback);
+    texture_content_cache_gpu_tests(readback);
+    override_tests(readback,0);
+    override_tests(readback,1);
+    assert(g_ld_texture_diag.records > 0 && g_ld_texture_diag.overwritten == 0);
+    assert(g_ld_texture_diag.dumped == 0);
+    char* before_diag_dump = texture_diag_capture_read();
+    assert(!strstr(before_diag_dump, "[texture-cache] FULL"));
+    assert(!strstr(before_diag_dump, "[texture-cache] decode failed"));
+    assert(!strstr(before_diag_dump, "[tex-refresh]"));
+    free(before_diag_dump);
+    ld_texture_diag_dump();
+    assert(g_ld_texture_diag.dumped == 1);
+    char* after_diag_dump = texture_diag_capture_read();
+    const char* full_line = strstr(after_diag_dump, "[texture-cache] FULL");
+    const char* failure_line = strstr(after_diag_dump, "[texture-cache] decode failed");
+    const char* refresh_line = strstr(after_diag_dump, "[tex-refresh]");
+    assert(strstr(after_diag_dump, "[texture-diagnostic-summary]"));
+    assert(full_line && failure_line && refresh_line);
+    assert(full_line < failure_line && failure_line < refresh_line);
+    assert(strstr(full_line, "frame=") && strstr(failure_line, "pitch=") &&
+           strstr(refresh_line, "n="));
+    char expected_diag_summary[256];
+    snprintf(expected_diag_summary, sizeof(expected_diag_summary),
+        "[texture-diagnostic-summary] full=%llu decode_failures=%llu refreshes=%llu "
+        "records=%llu retained=%u overwritten=%llu capacity=%u",
+        (unsigned long long)g_ld_texture_cache_full,
+        (unsigned long long)g_ld_texture_decode_fail,
+        (unsigned long long)g_ld_texture_refresh_count,
+        (unsigned long long)g_ld_texture_diag.records,
+        g_ld_texture_diag.retained,
+        (unsigned long long)g_ld_texture_diag.overwritten,
+        LD_TEXTURE_DIAG_CAP);
+    assert(strstr(after_diag_dump, expected_diag_summary));
+    free(after_diag_dump);
+    texture_diag_capture_end();
     bias_tests();
     resolution_tests();
     postprocess_tests();

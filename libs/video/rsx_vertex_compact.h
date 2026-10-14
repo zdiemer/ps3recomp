@@ -132,6 +132,10 @@ int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,
 /* Diagnostic comparison of specialized SIMD loops and the previous batch path. */
 int rsx_vertex_fetch_many_ex(const rsx_vertex_fetch_plan* plan,
     const rsx_vertex_ref* refs, u32 count, u8* out, int specialized);
+/* Independent diagnostic selection; existing _ex retains its boolean API. */
+enum { RSX_VERTEX_BATCH_FLOAT_BYTE=1u, RSX_VERTEX_BATCH_SINT16=2u };
+int rsx_vertex_fetch_many_mode(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out, unsigned modes);
 
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map

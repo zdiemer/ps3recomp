@@ -418,15 +418,35 @@ static inline __m128 rsx_compact_byte_lanes(const u8* source, u32 size, int norm
     if (size < 4) value = _mm_blend_ps(value, _mm_set1_ps(1.0f), 8);
     return value;
 }
+
+static inline __m128 rsx_compact_sint16_lanes(const u8* source, u32 size)
+{
+    u64 packed = 0;
+    if (size == 4) memcpy(&packed, source, 8);
+    else if (size == 3) {
+        u32 low; u16 high;
+        memcpy(&low, source, 4); memcpy(&high, source + 4, 2);
+        packed = (u64)low | ((u64)high << 32);
+    } else if (size == 2) {
+        u32 low; memcpy(&low, source, 4); packed = low;
+    } else {
+        u16 low; memcpy(&low, source, 2); packed = low;
+    }
+    const __m128i words = _mm_shuffle_epi8(_mm_cvtsi64_si128((long long)packed),
+        _mm_setr_epi8(1,0,3,2,5,4,7,6,-1,-1,-1,-1,-1,-1,-1,-1));
+    __m128 value = _mm_cvtepi32_ps(_mm_cvtepi16_epi32(words));
+    if (size < 4) value = _mm_blend_ps(value, _mm_set1_ps(1.0f), 8);
+    return value;
+}
 #endif
 
-int rsx_vertex_fetch_many_ex(const rsx_vertex_fetch_plan* plan,
-    const rsx_vertex_ref* refs, u32 count, u8* out, int specialized)
+int rsx_vertex_fetch_many_mode(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out, unsigned modes)
 {
 #ifndef RSX_COMPACT_SIMD
-    (void)specialized;
+    (void)modes;
 #else
-    if (specialized && plan && refs && out && count && !plan->inline_data) {
+    if (modes && plan && refs && out && count && !plan->inline_data) {
         /* Validate the whole batch once before writing anything. Callers can
          * reuse a prepared plan with different references; those still retain
          * the original resolver/failure behavior rather than overreading. */
@@ -468,12 +488,20 @@ int rsx_vertex_fetch_many_ex(const rsx_vertex_fetch_plan* plan,
                 RSX_DECODE_BATCH(rsx_compact_float_lanes(source, n)); break
 #define RSX_BYTE_CASE(t,n) case (t * 8 + n): \
                 RSX_DECODE_BATCH(rsx_compact_byte_lanes(source, n, t == RSX_VTX_TYPE_UNORM8)); break
-            switch (size <= 4 && type <= RSX_VTX_TYPE_UINT8 ? type * 8 + size : 0) {
+#define RSX_SHORT_CASE(n) case (RSX_VTX_TYPE_SINT16 * 8 + n): \
+                RSX_DECODE_BATCH(rsx_compact_sint16_lanes(source, n)); break
+            const unsigned selected = type == RSX_VTX_TYPE_SINT16
+                ? RSX_VERTEX_BATCH_SINT16 : RSX_VERTEX_BATCH_FLOAT_BYTE;
+            switch ((modes & selected) && size <= 4 && type <= RSX_VTX_TYPE_UINT8
+                    ? type * 8 + size : 0) {
             RSX_FLOAT_CASE(1); RSX_FLOAT_CASE(2); RSX_FLOAT_CASE(3); RSX_FLOAT_CASE(4);
             RSX_BYTE_CASE(RSX_VTX_TYPE_UNORM8,1); RSX_BYTE_CASE(RSX_VTX_TYPE_UNORM8,2);
             RSX_BYTE_CASE(RSX_VTX_TYPE_UNORM8,3); RSX_BYTE_CASE(RSX_VTX_TYPE_UNORM8,4);
             RSX_BYTE_CASE(RSX_VTX_TYPE_UINT8,1); RSX_BYTE_CASE(RSX_VTX_TYPE_UINT8,2);
             RSX_BYTE_CASE(RSX_VTX_TYPE_UINT8,3); RSX_BYTE_CASE(RSX_VTX_TYPE_UINT8,4);
+            /* The existing four-component SINT16 loop is already as fast or
+             * faster in paired measurements; retain it in the default case. */
+            RSX_SHORT_CASE(1); RSX_SHORT_CASE(2); RSX_SHORT_CASE(3);
             default:
                 for (u32 i = 0; i < count; ++i, destination += output_stride) {
                     const u32 element = (refs[i].vertex_id + refs[i].base_index) & 0xFFFFFu;
@@ -486,6 +514,7 @@ int rsx_vertex_fetch_many_ex(const rsx_vertex_fetch_plan* plan,
                 break;
             }
 #undef RSX_BYTE_CASE
+#undef RSX_SHORT_CASE
 #undef RSX_FLOAT_CASE
 #undef RSX_DECODE_BATCH
         }
@@ -493,6 +522,13 @@ int rsx_vertex_fetch_many_ex(const rsx_vertex_fetch_plan* plan,
     }
 #endif
     return rsx_vertex_fetch_many_reference(plan, refs, count, out);
+}
+
+int rsx_vertex_fetch_many_ex(const rsx_vertex_fetch_plan* plan,
+    const rsx_vertex_ref* refs, u32 count, u8* out, int specialized)
+{
+    return rsx_vertex_fetch_many_mode(plan,refs,count,out,specialized
+        ? RSX_VERTEX_BATCH_FLOAT_BYTE | RSX_VERTEX_BATCH_SINT16 : 0);
 }
 
 int rsx_vertex_fetch_many(const rsx_vertex_fetch_plan* plan,

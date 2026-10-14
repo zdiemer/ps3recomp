@@ -6,16 +6,29 @@ static uint8_t memory[0x10000];
 uint8_t* vm_base = memory;
 static int locked, notifications, dispatches, fail_dispatch;
 static uint32_t last_task, last_ts, last_context;
+static uint32_t last_cause;
+static uint64_t last_claim_qpc;
+static uint64_t mark_counter;
 void spu_lockline_lock(void) { assert(!locked); locked = 1; }
 void spu_lockline_unlock(void) { assert(locked); locked = 0; }
 void spu_coh_notify_write(uint32_t ea) { assert(locked && ea == 0x100); ++notifications; }
+int spu_coh_watch_taskset(uint32_t ea, uint32_t owner, void* host, void* event,
+                          uint64_t (*qpc)(void))
+{ assert(locked); (void)ea; (void)owner; (void)host; (void)event; (void)qpc; return 0; }
+void spu_coh_unwatch_tasksets(uint32_t owner) { assert(locked); (void)owner; }
+uint64_t spu_coh_taskset_ready_qpc_locked(uint32_t ea, uint32_t task)
+{ assert(locked); (void)ea; (void)task; return 0; }
 size_t spu_elf_image_size(const uint8_t* p, size_t max)
 { assert(!locked && p == memory + 0x4000 && max > 16); return 16; }
-int spu_workload_dispatch_async_task(const uint8_t* p, uint32_t size, uint32_t context,
-                                    uint32_t ts, uint32_t task)
+uint64_t spu_workload_async_trace_mark(void) { return ++mark_counter + 1000; }
+int spu_workload_dispatch_async_task_provenance(const uint8_t* p, uint32_t size,
+                                                uint32_t context, uint32_t ts,
+                                                uint32_t task, uint32_t cause,
+                                                uint64_t claim_qpc, uint64_t ready_qpc)
 {
     assert(!locked && p == memory + 0x4000 && size == 16);
     ++dispatches; last_task = task; last_ts = ts; last_context = context;
+    last_cause = cause; last_claim_qpc = claim_qpc; (void)ready_qpc;
     return !fail_dispatch;
 }
 static void write_be32(uint32_t ea, uint32_t v)
@@ -43,26 +56,41 @@ int main(void)
     assert(dispatches == 0);
     spu_taskset_poll(0x2000);
     assert(dispatches == 1 && last_ts == 0x100 && last_task == 1 && last_context == 0x5000);
+    assert(last_cause == SPU_TASKSET_DISPATCH_POLL && last_claim_qpc == 1001);
     spu_taskset_poll(0x2000);
     assert(dispatches == 1); /* claimed before asynchronous start */
     spu_taskset_task_exited(0x100, 1);
     assert(notifications == 1 && !(memory[0x100 + CSTS_ENABLED] & 0x40));
+    ready(5);
+    spu_taskset_task_exited(0x100, 1);
+    assert(dispatches == 2 && last_task == 5 &&
+           last_cause == SPU_TASKSET_DISPATCH_TASK_EXIT && last_claim_qpc == 1002);
     /* A task can finish between publication and CreateTask's scheduling call.
      * Scheduling again must not launch a saved, already completed ELF. */
     spu_taskset_start_ready(0x100);
-    assert(dispatches == 1);
+    assert(dispatches == 2);
     ready(1);
     spu_taskset_poll(0x2000);
-    assert(dispatches == 2 && last_task == 1); /* task IDs recycle */
+    assert(dispatches == 3 && last_task == 1); /* task IDs recycle */
+    assert(last_cause == SPU_TASKSET_DISPATCH_POLL && last_claim_qpc == 1003);
     ready(2);
     fail_dispatch = 1;
     spu_taskset_poll(0x2000);
-    assert(dispatches == 3);
+    assert(dispatches == 4);
     fail_dispatch = 0;
     spu_taskset_poll(0x2000);
-    assert(dispatches == 4 && last_task == 2); /* failed launch retried */
+    assert(dispatches == 5 && last_task == 2); /* failed launch retried */
+    assert(last_cause == SPU_TASKSET_DISPATCH_POLL && last_claim_qpc == 1005);
     spu_taskset_poll(0x2000);
-    assert(dispatches == 4);
+    assert(dispatches == 5);
+    ready(6);
+    spu_taskset_start_ready_cause(0x100, SPU_TASKSET_DISPATCH_CREATE);
+    assert(dispatches == 6 && last_task == 6 &&
+           last_cause == SPU_TASKSET_DISPATCH_CREATE && last_claim_qpc == 1006);
+    ready(7);
+    spu_taskset_poll_cause(0x2000, SPU_TASKSET_DISPATCH_WAKE);
+    assert(dispatches == 7 && last_task == 7 &&
+           last_cause == SPU_TASKSET_DISPATCH_WAKE && last_claim_qpc == 1007);
     uint32_t ti = 0x100 + CSTS_TASKINFO + TI_SIZE;
     const uint32_t expected[4] = {0x12000, 0, 0x34000, 0x56000};
     for (unsigned i = 0; i < 4; ++i) write_be32(ti + TI_ARGS + 4*i, expected[i]);

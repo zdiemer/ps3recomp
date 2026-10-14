@@ -281,6 +281,20 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler);
 void cellGcmTickVBlank(void);
 void cellGcmTickFlip(void);
 
+/* Optional bounded diagnostic for slow FIFO drain calls. It is disabled unless
+ * GCM_SLOW_DRAIN_CSV names an output path; call once during orderly shutdown. */
+void cellGcm_fifo_slow_drain_dump(void);
+
+/* Wait for the FIFO consumer kick event and report the observed outcome:
+ * 0 signaled, 1 timed out, 2 used Sleep fallback, 3 failed/other wait result.
+ * The legacy void API below/within the runtime preserves existing callers. */
+unsigned cellGcm_fifo_kick_wait_result(unsigned ms);
+void cellGcm_fifo_kick_wait(unsigned ms);
+
+/* Export the final opt-in VP burst experiment counters once during orderly
+ * shutdown. Periodic summaries require the file-control or profile mode. */
+void cellGcm_vp_burst_dump(void);
+
 /* NID: 0xF9BFCDA3 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);
 

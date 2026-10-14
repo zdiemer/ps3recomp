@@ -596,7 +596,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method >= NV4097_SET_TRANSFORM_PROGRAM &&
         method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
         u32 w = state->vp_ucode_write;
-        if (w + 4 <= sizeof(state->vp_ucode)) {
+        if (w <= sizeof(state->vp_ucode) - 4u) {
             /* data is host-endian already; store as little-endian bytes. */
             state->vp_ucode[w+0] = (u8)(data);
             state->vp_ucode[w+1] = (u8)(data >> 8);

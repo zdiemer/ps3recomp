@@ -52,6 +52,7 @@ def w_li(rt, si):          return (14 << 26) | (rt << 21) | (si & 0xFFFF)
 def w_addis(rt, ra, si):   return (15 << 26) | (rt << 21) | (ra << 16) | (si & 0xFFFF)
 def w_stdu(rs, ra, d):     return (62 << 26) | (rs << 21) | (ra << 16) | (d & 0xFFFC) | 1
 def w_bc(bo, bi, rel):     return (16 << 26) | (bo << 21) | (bi << 16) | (rel & 0xFFFC)
+def w_b(rel):              return (18 << 26) | (rel & 0x03FFFFFC)
 
 
 def w_mtctr(rs):
@@ -192,6 +193,81 @@ def test_two_level_base_past_early_return():
           [0x11100, 0x11200])
 
 
+def test_two_level_base_past_dead_tail_branch():
+    """A conditional dispatcher edge must skip an intervening tail epilogue.
+
+        lwz    r30, 8(r2)       <- prologue table-base root
+        bc     (le) -> dispatch
+        ld     r30, 0(r1)       <- dead epilogue restore
+        b      outside          <- tail branch; no fallthrough to dispatch
+        lwz    r11, -16(r30)    <- reachable only through the conditional edge
+        slwi r9,r3,2; lwzx r0,r9,r11; add r0,r0,r11; mtctr r0; bctr
+
+    The widened backward scan must ignore the dead restore just as it ignores
+    a `blr` epilogue, while retaining the prologue definition of r30.
+    """
+    mid, table = 0x200A00, 0x11000
+    mem = {TOC + 8: mid, mid - 16: table,
+           table + 0: 0x100, table + 4: 0x200, table + 8: 0xFFFFFFFF}
+    branch_pc = TEXT_LO + 4
+    dispatch_pc = TEXT_LO + 16
+    tail_pc = TEXT_LO + 12
+    words = [w_lwz(30, 2, 8), w_bc(4, 1, dispatch_pc - branch_pc),
+             w_ld(30, 1, 0), w_b((TEXT_LO - 4) - tail_pc),
+             w_lwz(11, 30, -16), w_slwi(9, 3, 2), w_lwzx(0, 9, 11),
+             w_add(0, 0, 11), w_mtctr(0), w_bctr()]
+    insns = decode_all(words)
+    tables = discover_jump_tables(insns, lambda a: mem.get(a & 0xFFFFFFFF),
+                                  [TOC], TEXT_LO, TEXT_HI,
+                                  func_starts=[TEXT_LO])
+    check("two-level base past a dead tail-branch epilogue",
+          tables.get(insns[-1].addr), [0x11100, 0x11200])
+
+
+def test_in_function_unconditional_branch_keeps_predecessor():
+    """An unconditional branch into the dispatcher keeps prior definitions.
+
+        lwz r30, 8(r2)
+        b   dispatch          <- live in-function edge, not a dead epilogue
+    dispatch:
+        lwz r11, -16(r30)
+        ...
+
+    This guards against treating every `b` as a dead-block boundary.
+    """
+    mid, table = 0x200B00, 0x11000
+    mem = {TOC + 8: mid, mid - 16: table,
+           table + 0: 0x100, table + 4: 0x200, table + 8: 0xFFFFFFFF}
+    words = [w_lwz(30, 2, 8), w_b(4), w_lwz(11, 30, -16),
+             w_slwi(9, 3, 2), w_lwzx(0, 9, 11), w_add(0, 0, 11),
+             w_mtctr(0), w_bctr()]
+    insns = decode_all(words)
+    tables = discover_jump_tables(insns, lambda a: mem.get(a & 0xFFFFFFFF),
+                                  [TOC], TEXT_LO, TEXT_HI,
+                                  func_starts=[TEXT_LO])
+    check("in-function unconditional branch retains predecessor definition",
+          tables.get(insns[-1].addr), [0x11100, 0x11200])
+
+
+def test_unconditional_branch_without_function_bounds_is_conservative():
+    """Without function starts, the backward scan window is not an extent.
+
+    The same in-function dispatcher edge must retain its earlier base
+    definition when discovery only has its fallback scan window.
+    """
+    mid, table = 0x200C00, 0x11000
+    mem = {TOC + 8: mid, mid - 16: table,
+           table + 0: 0x100, table + 4: 0x200, table + 8: 0xFFFFFFFF}
+    words = [w_lwz(30, 2, 8), w_b(4), w_lwz(11, 30, -16),
+             w_slwi(9, 3, 2), w_lwzx(0, 9, 11), w_add(0, 0, 11),
+             w_mtctr(0), w_bctr()]
+    insns = decode_all(words)
+    tables = discover_jump_tables(insns, lambda a: mem.get(a & 0xFFFFFFFF),
+                                  [TOC], TEXT_LO, TEXT_HI)
+    check("unbounded function extent preserves unconditional-branch predecessor",
+          tables.get(insns[-1].addr), [0x11100, 0x11200])
+
+
 def test_base_before_fallthrough_split():
     """The table base is loaded before a split point that is not an entry.
 
@@ -254,6 +330,9 @@ def main() -> int:
     test_offset_both_operands_r2_loaded()
     test_tie_keeps_first_candidate()
     test_two_level_base_past_early_return()
+    test_two_level_base_past_dead_tail_branch()
+    test_in_function_unconditional_branch_keeps_predecessor()
+    test_unconditional_branch_without_function_bounds_is_conservative()
     test_base_before_fallthrough_split()
     test_const_base_no_table()
     test_const_base_needs_constant()

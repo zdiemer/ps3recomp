@@ -41,6 +41,9 @@ void rsx_live_draw_set_texture_override(rsx_live_texture_revision_fn revision,
 int  rsx_live_draw_enabled(void) { return 0; }
 void rsx_live_draw_set_render_reference(u32 w, u32 h) { (void)w; (void)h; }
 void rsx_live_draw_set_shadow_reference(u32 size) { (void)size; }
+int rsx_live_draw_set_cpu_work(u32 flags) { return flags <= 16383u; }
+int rsx_live_draw_set_texture_write_watch(void* base, size_t bytes)
+{ (void)base; (void)bytes; return 0; }
 int  rsx_live_draw_init(void* hwnd, u32 w, u32 h, rsx_live_guest_ptr_fn f, void* u)
 { (void)hwnd; (void)w; (void)h; (void)f; (void)u; return 0; }
 void rsx_live_draw_seed_registers(const u32* r, u32 n) { (void)r; (void)n; }
@@ -50,6 +53,7 @@ void rsx_live_draw_set_display_buffer(
     u32 b, u32 l, u32 o, u32 p, u32 w, u32 h)
 { (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_live_draw_method(u32 m, u32 a) { (void)m; (void)a; }
+void rsx_live_draw_vp_burst_32(const u32 words[32]) { (void)words; }
 void rsx_live_draw_set_fifo_position(u32 g, u32 p) { (void)g; (void)p; }
 void rsx_live_draw_note_inline_transfer(u32 d, u32 o, u32 v)
 { (void)d; (void)o; (void)v; }
@@ -70,6 +74,7 @@ void* rsx_live_draw_get_present_thread_handle(void) { return NULL; }
 u32  rsx_live_draw_get_last_draws(void) { return 0; }
 double rsx_live_draw_get_present_fps(void) { return 0.0; }
 void rsx_live_draw_dump_present_samples(void) {}
+void rsx_live_draw_dump_shader_cache(void) {}
 void rsx_live_draw_a010_probe_begin(void) {}
 int  rsx_live_draw_a010_probe_active(void) { return 0; }
 int  rsx_live_draw_a010_world_ready(void) { return 1; }
@@ -83,6 +88,7 @@ void rsx_live_draw_shutdown(void) {}
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "rsx_dispatch.h"
+#include "rsx_vp_burst.h"
 #include "rsx_fp_decompiler.h"
 static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_surf = 0;
 /* Set once PS1 VRAM actually holds a drawn frame (see the PS1_PC heartbeat).
@@ -92,27 +98,146 @@ static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_sur
 static volatile long g_ld_ps1_vram_ready = 0;
 #include "rsx_restart_cuts.h"
 #include "rsx_vertex_compact.h"
+#include "rsx_vertex_refs.h"
+#include "rsx_vertex_pull.h"
 #include "rsx_vp_decompiler.h"
 #include "rsx_vp_program_cache.h"
 
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(YZ_PERF_PROFILE)
+#include "rsx_profile_buffer.h"
+static rsx_profile_buffer g_ld_profile_csv, g_ld_geometry_csv, g_ld_texture_misses_csv;
+static rsx_profile_buffer g_ld_texture_content_csv;
+static void ld_profile_buffers_dump(void)
+{
+    rsx_profile_buffer* buffers[] = {
+        &g_ld_profile_csv, &g_ld_geometry_csv, &g_ld_texture_misses_csv,
+        &g_ld_texture_content_csv };
+    const char* names[] = { "renderer", "geometry", "texture-misses", "texture-content" };
+    for (unsigned i=0; i<4; ++i) {
+        const rsx_profile_buffer* b=buffers[i];
+        if (!b->rows) continue;
+        const int ok=rsx_profile_buffer_dump(b);
+        fprintf(stderr,"[profile-buffer] stream=%s saved=%d recorded=%llu retained=%llu rejected=%llu\n",
+            names[i],ok,(unsigned long long)b->recorded,
+            (unsigned long long)(b->recorded>b->capacity ? b->capacity : b->recorded),
+            (unsigned long long)b->rejected);
+    }
+}
+#endif
+#include "rsx_texture_write_watch.h"
+
+/* Bulk references, dense remapping, specialized vertex decoding and triangle
+ * copies. Registering a native write tracker also enables regional reuse. */
+static unsigned g_ld_cpu_work=1283;
+int rsx_live_draw_set_cpu_work(u32 flags)
+{
+    if (flags > 16383u) return 0;
+    g_ld_cpu_work = flags;
+    return 1;
+}
+static rsx_texture_write_watch g_texture_watch;
+static u64 g_texture_watch_queries, g_texture_watch_dirty_pages;
+static u64 g_texture_watch_skips, g_texture_watch_skip_bytes;
+static u64 g_texture_watch_audits, g_texture_watch_races, g_texture_watch_failures;
+int rsx_live_draw_set_texture_write_watch(void* base, size_t bytes)
+{
+    if (g_texture_watch.base) return 0;
+    const int registered = rsx_texture_write_watch_init(&g_texture_watch, base, bytes);
+    if (registered) g_ld_cpu_work |= 4096u;
+    return registered;
+}
+static void ld_texture_watch_summary(void)
+{
+    if (!g_texture_watch.base) return;
+    fprintf(stderr,"[texture-write-watch-summary] healthy=%d queries=%llu dirty_pages=%llu skips=%llu skip_bytes=%llu audits=%llu races=%llu failures=%llu\n",
+        g_texture_watch.healthy,(unsigned long long)g_texture_watch_queries,
+        (unsigned long long)g_texture_watch_dirty_pages,(unsigned long long)g_texture_watch_skips,
+        (unsigned long long)g_texture_watch_skip_bytes,(unsigned long long)g_texture_watch_audits,
+        (unsigned long long)g_texture_watch_races,(unsigned long long)g_texture_watch_failures);
+}
 
 static rsx_vertex_payload_cache g_ld_vertex_cache;
+static int g_ld_vertex_workers=-1, g_vertex_worker_failed, g_vertex_worker_validate=-1;
+static u32 g_vertex_worker_min;
+typedef struct ld_vertex_worker_stats {
+    u64 draws, vertices, large_draws, large_vertices, parallel_draws, parallel_vertices;
+    u64 jobs, bypasses, audits, races, failures;
+} ld_vertex_worker_stats;
+static ld_vertex_worker_stats g_vertex_worker_stats;
+static u64 g_vertex_worker_wait_ticks;
+static int ld_vertex_worker_count(void)
+{
+    if (g_ld_vertex_workers<0) {
+        const char* option=getenv("RSX_VERTEX_WORKERS");
+        const int count=option?atoi(option):0;
+        g_ld_vertex_workers=count>=0 && count<=3?count:0;
+    }
+    return g_ld_vertex_workers;
+}
+static u32 ld_vertex_worker_minimum(void)
+{
+    if (!g_vertex_worker_min) {
+        const char* option=getenv("RSX_VERTEX_WORKER_MIN");
+        const int count=option?atoi(option):4096;
+        g_vertex_worker_min=count>=64?(u32)count:4096;
+    }
+    return g_vertex_worker_min;
+}
+static int ld_vertex_worker_audit_enabled(void)
+{
+    if (g_vertex_worker_validate<0) {
+        const char* option=getenv("RSX_VERTEX_WORKER_VALIDATE");
+        g_vertex_worker_validate=option && *option=='1';
+    }
+    return g_vertex_worker_validate;
+}
+static void ld_vertex_worker_summary(void)
+{
+    fprintf(stderr,"[vertex-worker-summary] requested=%d failed=%d draws=%llu vertices=%llu large_draws=%llu large_vertices=%llu parallel_draws=%llu parallel_vertices=%llu jobs=%llu bypasses=%llu audits=%llu races=%llu failures=%llu\n",
+        ld_vertex_worker_count(),g_vertex_worker_failed,g_vertex_worker_stats.draws,
+        g_vertex_worker_stats.vertices,g_vertex_worker_stats.large_draws,g_vertex_worker_stats.large_vertices,
+        g_vertex_worker_stats.parallel_draws,g_vertex_worker_stats.parallel_vertices,g_vertex_worker_stats.jobs,
+        g_vertex_worker_stats.bypasses,g_vertex_worker_stats.audits,g_vertex_worker_stats.races,g_vertex_worker_stats.failures);
+}
+static struct {
+    u64 hits, misses, bypasses, queries, dirty_pages, bytes, audits, races, failures, hit_vertices, hit_refs;
+} g_geom_stats;
+static u64 g_geom_query_ticks, g_geom_begin_ticks, g_geom_store_ticks, g_geom_copy_ticks;
+static int g_ld_geometry_cache_enabled=-1, g_geom_cache_failed, g_geom_validate=-1;
+static int ld_geometry_cache_enabled(void)
+{
+    if (g_ld_geometry_cache_enabled<0) {
+        const char* option=getenv("RSX_GEOMETRY_CACHE");
+        g_ld_geometry_cache_enabled=option && *option=='1';
+    }
+    return g_ld_geometry_cache_enabled;
+}
+static int ld_geometry_cache_validate(void)
+{
+    if (g_geom_validate<0) { const char* option=getenv("RSX_GEOMETRY_CACHE_VALIDATE"); g_geom_validate=option && *option=='1'; }
+    return g_geom_validate;
+}
+static void ld_geometry_cache_summary(void)
+{
+    if (!g_geom_stats.queries && !g_geom_stats.bypasses) return;
+    fprintf(stderr,"[geometry-cache-summary] enabled=%d failed=%d hits=%llu misses=%llu bypass=%llu queries=%llu dirty_pages=%llu bytes=%llu audits=%llu races=%llu failures=%llu\n",
+        ld_geometry_cache_enabled(),g_geom_cache_failed,g_geom_stats.hits,g_geom_stats.misses,
+        g_geom_stats.bypasses,g_geom_stats.queries,g_geom_stats.dirty_pages,g_geom_stats.bytes,
+        g_geom_stats.audits,g_geom_stats.races,g_geom_stats.failures);
+}
 static int g_ld_apply_polygon_bias=1;
 /* -1 follows the guest state; 0/1 are explicit diagnostic overrides. */
 static int g_ld_depth_clip_probe=-1;
 static unsigned g_ld_shadow_compare;
-static unsigned g_ld_depth_export;
+/* Full-screen depth transfers and soft particles require the guest export. */
+static unsigned g_ld_depth_export = 1;
 /* Honor RSX XY by default. Probe: 0=legacy, 1=RSX XY, 2=XY+reciprocal W. */
 static unsigned g_ld_window_position = 1;
 /* Correct Z16 clear packing; the file control permits native A/B validation. */
 static unsigned g_ld_depth_clear = 1;
-/* Default: bulk references (1), dense remapping (2), specialized vertex
- * decoding (256), and validated triangle remap copies (1024). Live changes
- * apply at presentation boundaries for independent comparisons. */
-static unsigned g_ld_cpu_work=1283;
 static rsx_vp_program_cache g_ld_vp_program_cache;
 static int g_ld_vertex_cache_enabled=-1;
 static int ld_vertex_cache_enabled(void)
@@ -203,7 +328,7 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 #define MAX_REJECTED_PSO_KEYS 8192
 #define UPLOAD_SIZE      (64u * 1024 * 1024)
 #define SHADER_DISK_CACHE_MAGIC   0x43535A59u /* "YZSC" */
-/* v2: OP_KIL now emits discard (was a dropped TODO) — cached v1 pixel
+/* v2: OP_KIL now emits discard (was a dropped TODO) â€” cached v1 pixel
  * shaders would silently keep the old no-discard codegen. */
 #define SHADER_DISK_CACHE_VERSION 2u
 #define SHADER_DISK_CACHE_MAX_BLOB (4u * 1024u * 1024u)
@@ -218,7 +343,10 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 #define UAV_ZDEPTH_BASE   (SRV_DEPTH_SOURCE_BASE + MAX_SURFACES)
 /* Per-surface copy a draw samples when it reads its own render target. */
 #define SRV_FEEDBACK_BASE (UAV_ZDEPTH_BASE + MAX_SURFACES)
-#define SRV_CPU_HEAP_SLOTS (SRV_FEEDBACK_BASE + MAX_SURFACES)
+#define SRV_STENCIL_SOURCE_BASE (SRV_FEEDBACK_BASE + MAX_SURFACES)
+#define SRV_PACKED_DEPTH_BASE (SRV_STENCIL_SOURCE_BASE + MAX_SURFACES)
+#define UAV_PACKED_DEPTH_BASE (SRV_PACKED_DEPTH_BASE + MAX_SURFACES)
+#define SRV_CPU_HEAP_SLOTS (UAV_PACKED_DEPTH_BASE + MAX_SURFACES)
 #define SRV_TABLE_SIZE   16
 #define SRV_RING_TABLES  4096
 
@@ -303,6 +431,10 @@ typedef struct {
     u64 depth_write_draws;
     u64 depth_both_draws;
     int reject_logged;
+    u32 guest_w, guest_h, pitch, format;
+    ID3D12Resource* packed;
+    u32 packed_w, packed_h, packed_guest_w, packed_guest_h;
+    u64 generation, packed_generation;
 } zdepth_t;
 typedef struct {
     u32 location, offset, format, width, height, pitch, remap;
@@ -310,6 +442,8 @@ typedef struct {
     ID3D12Resource* tex;
     u64 content_hash;
     unsigned content_hash_kind;
+    u64 write_watch_stamp;
+    int write_watch_valid;
     u64 override_revision;
     int override_rgba;
     u32 last_hash_frame;
@@ -410,6 +544,8 @@ typedef struct {
     ID3D12RootSignature*       rootsig_x;
     ID3D12RootSignature*       depth_snapshot_rootsig;
     ID3D12PipelineState*       depth_snapshot_pso;
+    ID3D12RootSignature*       depth_pack_rootsig;
+    ID3D12PipelineState*       depth_pack_pso;
     psocache_t                 psos[MAX_PSOS];
     u32                        n_psos;
     shader_blob_cache_t        vs_blobs;
@@ -637,6 +773,9 @@ typedef struct {
     u32 depth_export;
     u32 window_position;
     u32 depth_clear;
+    u32 vertex_cache;
+    u32 geometry_cache;
+    u32 vertex_workers;
     LONGLONG qpc;
     u64 process_kernel_100ns;
     u64 process_user_100ns;
@@ -726,6 +865,9 @@ static void ld_present_measure_record(u32 guest_frame)
     sample->depth_export = g_ld_depth_export;
     sample->window_position = g_ld_window_position;
     sample->depth_clear = g_ld_depth_clear;
+    sample->vertex_cache = (u32)ld_vertex_cache_enabled();
+    sample->geometry_cache = (u32)ld_geometry_cache_enabled();
+    sample->vertex_workers = (u32)ld_vertex_worker_count();
     sample->qpc = now.QuadPart;
     g_ld_frame_limiter.last_present = now.QuadPart;
     if (g_ld_schedule_diag) {
@@ -826,9 +968,9 @@ static void ld_present_measure_dump(void)
     if (g_ld_schedule_diag) {
         fprintf(f, "present_id,guest_frame,qpc,process_kernel_100ns,"
                    "process_user_100ns,present_thread_kernel_100ns,"
-                   "present_thread_user_100ns,present_thread_id,cpu_work,shadow_compare,depth_export,window_position,depth_clear\n");
+                   "present_thread_user_100ns,present_thread_id,cpu_work,shadow_compare,depth_export,window_position,depth_clear,vertex_cache,geometry_cache,vertex_workers\n");
     } else {
-        fprintf(f, "present_id,guest_frame,qpc,cpu_work,shadow_compare,depth_export,window_position,depth_clear\n");
+        fprintf(f, "present_id,guest_frame,qpc,cpu_work,shadow_compare,depth_export,window_position,depth_clear,vertex_cache,geometry_cache,vertex_workers\n");
     }
     const u64 first =
         g_ld_present_total > LD_PRESENT_RING_CAP
@@ -840,18 +982,18 @@ static void ld_present_measure_dump(void)
                                (LD_PRESENT_RING_CAP - 1u)];
         if (sample->present_id == present_id) {
             if (g_ld_schedule_diag) {
-                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u,%u\n",
+                fprintf(f, "%llu,%u,%lld,%llu,%llu,%llu,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
                         (unsigned long long)sample->present_id,
                         sample->guest_frame, sample->qpc,
                         (unsigned long long)sample->process_kernel_100ns,
                         (unsigned long long)sample->process_user_100ns,
                         (unsigned long long)sample->present_thread_kernel_100ns,
                         (unsigned long long)sample->present_thread_user_100ns,
-                        sample->present_thread_id, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position, sample->depth_clear);
+                        sample->present_thread_id, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position, sample->depth_clear, sample->vertex_cache, sample->geometry_cache, sample->vertex_workers);
             } else {
-                fprintf(f, "%llu,%u,%lld,%u,%u,%u,%u,%u\n",
+                fprintf(f, "%llu,%u,%lld,%u,%u,%u,%u,%u,%u,%u,%u\n",
                         (unsigned long long)sample->present_id,
-                        sample->guest_frame, sample->qpc, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position, sample->depth_clear);
+                        sample->guest_frame, sample->qpc, sample->cpu_work, sample->shadow_compare, sample->depth_export, sample->window_position, sample->depth_clear, sample->vertex_cache, sample->geometry_cache, sample->vertex_workers);
             }
         }
     }
@@ -1121,6 +1263,416 @@ static u64 g_ld_shader_disk_misses[2] = {0, 0};
 static u64 g_ld_shader_disk_writes[2] = {0, 0};
 static u64 g_ld_shader_disk_rejects = 0;
 
+typedef enum {
+    LD_TEXTURE_DECODE_MISS = 1,
+    LD_TEXTURE_DECODE_REFRESH = 2,
+    LD_TEXTURE_DECODE_RETRY = 3
+} ld_texture_decode_kind;
+
+/* BEGIN RSX_SLOW_DRAW_DIAGNOSTIC */
+/* Opt-in bounded per-draw phase timing. This remains available in ordinary
+ * builds, but the absent-environment path does not query either clock. */
+#define LD_SLOW_DRAW_CAP 1024u
+#define LD_SLOW_DRAW_STAGE_COUNT 4u
+/* Nested, disjoint call buckets inside the resource-resolution draw phase. */
+#define LD_SLOW_DRAW_RESOURCE_KIND_COUNT 4u
+typedef enum {
+    LD_SLOW_RESOURCE_SURFACE = 0,
+    LD_SLOW_RESOURCE_DEPTH,
+    LD_SLOW_RESOURCE_TEXTURE,
+    LD_SLOW_RESOURCE_VERTEX_TEXTURE
+} ld_slow_draw_resource_kind;
+
+typedef enum {
+    LD_SLOW_TEXTURE_UNCLASSIFIED = 0,
+    LD_SLOW_TEXTURE_HIT = 1,
+    LD_SLOW_TEXTURE_NEGATIVE_HIT = 2,
+    LD_SLOW_TEXTURE_RETRY = 3,
+    LD_SLOW_TEXTURE_REFRESH = 4,
+    LD_SLOW_TEXTURE_MISS = 5
+} ld_slow_texture_outcome;
+
+typedef struct {
+    u64 lookup_ticks, watch_ticks, hash_ticks, decode_ticks;
+    u64 srv_ticks, retire_ticks, log_ticks, residual_ticks;
+    /* Nested inside decode_ticks; not part of the disjoint slot partition. */
+    u64 resource_create_ticks;
+    u32 resource_create_calls;
+    u32 outcome, decode_attempted, decode_succeeded, watch_skipped, cache_full;
+    /* Predicate inputs are sampled before optional validation can reject a skip. */
+    u32 skip_evaluated, skip_override_changed, skip_watch_valid;
+    u32 skip_entry_valid, skip_stamp_match, skip_hash_kind_match;
+    /* rejection bits: override=1, watch=2, baseline=4, stamp=8, hash kind=16 */
+    u32 skip_validation, skip_rejection_mask;
+    /* 0=parallel FNV, 1=XXH3, 2=legacy serial FNV. */
+    u32 source_span, mipmaps, hash_kind;
+    /* QueryThreadCycleTime counts are raw and intentionally not converted. */
+    u64 hash_cycle_delta;
+    u32 hash_cycle_attempts, hash_cycle_successes, hash_cycle_failures;
+} ld_slow_texture_detail;
+
+typedef struct {
+    u64 total_ticks, max_ticks;
+    u32 calls;
+    u32 max_location, max_offset, max_format, max_width, max_height, max_slot;
+    ld_slow_texture_detail texture_detail;
+} ld_slow_draw_resource_stat;
+
+typedef enum {
+    LD_SLOW_DRAW_GEOMETRY_PREP = 0,
+    LD_SLOW_DRAW_PIPELINE_CONSTANTS,
+    LD_SLOW_DRAW_RESOURCE_RESOLUTION,
+    LD_SLOW_DRAW_COMMAND_RECORDING
+} ld_slow_draw_stage_id;
+
+typedef struct {
+    u64 callback_id;
+    u64 qpc_begin, qpc_end;
+    u64 cycle_begin, cycle_end;
+    u64 stage_ticks[LD_SLOW_DRAW_STAGE_COUNT];
+    ld_slow_draw_resource_stat resource[LD_SLOW_DRAW_RESOURCE_KIND_COUNT];
+    u64 get_pso_ticks;
+    u64 build_pso_ticks, shader_disk_load_ticks, d3d_compile_ticks;
+    u64 create_graphics_pso_ticks;
+    u32 frame, host_tid;
+    u32 primitive, packets, source_refs, vertices, topology_count;
+    u32 target, zslot, texture_mask, vertex_texture_mask;
+    u32 stage, cycle_valid, pso_lookup;
+} ld_slow_draw_event;
+
+enum {
+    LD_SLOW_DRAW_PSO_UNCALLED = 0,
+    LD_SLOW_DRAW_PSO_HIT = 1,
+    LD_SLOW_DRAW_PSO_MISS = 2
+};
+
+typedef struct {
+    int enabled, configured, dumped;
+    const char* path;
+    u64 qpc_frequency, threshold_ticks;
+    u32 threshold_us;
+    u64 callbacks, recorded, overwritten;
+    u32 next;
+    ld_slow_draw_event* events;
+} ld_slow_draw_profile;
+
+typedef struct {
+    int active;
+    ld_slow_draw_event event;
+    u64 stage_begin;
+} ld_slow_draw_scope;
+
+static ld_slow_draw_profile g_ld_slow_draw;
+static SRWLOCK g_ld_slow_draw_lock = SRWLOCK_INIT;
+
+static u64 ld_slow_draw_qpc(void)
+{
+    LARGE_INTEGER value;
+    QueryPerformanceCounter(&value);
+    return (u64)value.QuadPart;
+}
+
+static void ld_slow_draw_configure(void)
+{
+    if (g_ld_slow_draw.configured) return;
+    g_ld_slow_draw.configured = 1;
+    const char* path = getenv("RSX_SLOW_DRAW_CSV");
+    if (!path || !*path) return;
+    const char* threshold = getenv("RSX_SLOW_DRAW_THRESHOLD_US");
+    unsigned long threshold_us = threshold ? strtoul(threshold, NULL, 10) : 250ul;
+    if (!threshold_us || threshold_us > 1000000ul) threshold_us = 250ul;
+    LARGE_INTEGER frequency;
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
+        return;
+    g_ld_slow_draw.path = path;
+    g_ld_slow_draw.qpc_frequency = (u64)frequency.QuadPart;
+    g_ld_slow_draw.threshold_us = (u32)threshold_us;
+    g_ld_slow_draw.threshold_ticks =
+        g_ld_slow_draw.qpc_frequency * threshold_us / 1000000ull;
+    g_ld_slow_draw.events = (ld_slow_draw_event*)calloc(
+        LD_SLOW_DRAW_CAP, sizeof(ld_slow_draw_event));
+    if (!g_ld_slow_draw.events) {
+        g_ld_slow_draw.path = NULL;
+        return;
+    }
+    g_ld_slow_draw.enabled = 1;
+}
+
+static void ld_slow_draw_begin(ld_slow_draw_scope* scope)
+{
+    memset(scope, 0, sizeof(*scope));
+    if (!g_ld_slow_draw.enabled) return;
+    scope->active = 1;
+    scope->event.callback_id = (u64)InterlockedIncrement64(
+        (volatile LONG64*)&g_ld_slow_draw.callbacks);
+    scope->event.frame = g_ld_frames;
+    scope->event.host_tid = GetCurrentThreadId();
+    scope->event.target = UINT32_MAX;
+    scope->event.zslot = UINT32_MAX;
+    for (u32 i = 0; i < LD_SLOW_DRAW_RESOURCE_KIND_COUNT; ++i)
+        scope->event.resource[i].max_slot = UINT32_MAX;
+    scope->event.qpc_begin = ld_slow_draw_qpc();
+    scope->stage_begin = scope->event.qpc_begin;
+    scope->event.cycle_valid = (u32)QueryThreadCycleTime(
+        GetCurrentThread(), &scope->event.cycle_begin);
+}
+
+static u64 ld_slow_resource_begin(ld_slow_draw_scope* scope)
+{
+    return scope && scope->active ? ld_slow_draw_qpc() : 0;
+}
+
+static u64 ld_slow_texture_phase_begin(ld_slow_draw_scope* scope,
+    ld_slow_texture_detail* detail)
+{
+    return scope && scope->active && detail ? ld_slow_draw_qpc() : 0;
+}
+
+static void ld_slow_texture_phase_end(ld_slow_draw_scope* scope,
+    ld_slow_texture_detail* detail, u64* ticks, u64 begin)
+{
+    if (!scope || !scope->active || !detail || !ticks) return;
+    const u64 end = ld_slow_draw_qpc();
+    if (end >= begin) *ticks += end - begin;
+}
+
+static int ld_slow_texture_hash_cycles_begin(ld_slow_texture_detail* detail,
+    u64* begin)
+{
+    if (!detail) return 0;
+    ++detail->hash_cycle_attempts;
+    if (!QueryThreadCycleTime(GetCurrentThread(), begin)) {
+        ++detail->hash_cycle_failures;
+        return 0;
+    }
+    return 1;
+}
+
+static void ld_slow_texture_hash_cycles_end(ld_slow_texture_detail* detail,
+    u64 begin, int begin_valid)
+{
+    if (!detail || !begin_valid) return;
+    u64 end = 0;
+    if (!QueryThreadCycleTime(GetCurrentThread(), &end) || end < begin) {
+        ++detail->hash_cycle_failures;
+        return;
+    }
+    detail->hash_cycle_delta += end - begin;
+    ++detail->hash_cycle_successes;
+}
+
+static void ld_slow_texture_resource_create(ld_slow_texture_detail* detail,
+    u64 begin)
+{
+    if (!detail) return;
+    const u64 end = ld_slow_draw_qpc();
+    if (end >= begin) detail->resource_create_ticks += end - begin;
+    ++detail->resource_create_calls;
+}
+
+static void ld_slow_resource_finish_at(ld_slow_draw_scope* scope,
+    ld_slow_draw_resource_kind kind, u64 begin, u32 location, u32 offset,
+    u32 format, u32 width, u32 height, u32 slot, u64 end)
+{
+    if (!scope || !scope->active) return;
+    if (end < begin) return;
+    const u64 elapsed = end - begin;
+    ld_slow_draw_resource_stat* stat = &scope->event.resource[kind];
+    ++stat->calls;
+    stat->total_ticks += elapsed;
+    if (stat->calls == 1 || elapsed > stat->max_ticks) {
+        stat->max_ticks = elapsed;
+        stat->max_location = location;
+        stat->max_offset = offset;
+        stat->max_format = format;
+        stat->max_width = width;
+        stat->max_height = height;
+        stat->max_slot = slot;
+    }
+}
+
+static void ld_slow_resource_finish(ld_slow_draw_scope* scope,
+    ld_slow_draw_resource_kind kind, u64 begin, u32 location, u32 offset,
+    u32 format, u32 width, u32 height, u32 slot)
+{
+    if (!scope || !scope->active) return;
+    ld_slow_resource_finish_at(scope, kind, begin, location, offset, format,
+        width, height, slot, ld_slow_draw_qpc());
+}
+
+static void ld_slow_texture_resource_finish(ld_slow_draw_scope* scope,
+    u64 begin, const rsx_dsp_texture* texture, u32 slot,
+    ld_slow_texture_detail* detail)
+{
+    if (!scope || !scope->active) return;
+    const u64 end = ld_slow_draw_qpc();
+    if (end < begin) return;
+    ld_slow_draw_resource_stat* stat =
+        &scope->event.resource[LD_SLOW_RESOURCE_TEXTURE];
+    const u64 elapsed = end - begin;
+    ++stat->calls;
+    stat->total_ticks += elapsed;
+    if (stat->calls == 1 || elapsed > stat->max_ticks) {
+        stat->max_ticks = elapsed;
+        stat->max_location = texture->location;
+        stat->max_offset = texture->offset;
+        stat->max_format = texture->format;
+        stat->max_width = texture->width;
+        stat->max_height = texture->height;
+        stat->max_slot = slot;
+        if (detail) {
+            const u64 measured = detail->lookup_ticks + detail->watch_ticks +
+                detail->hash_ticks + detail->decode_ticks + detail->srv_ticks +
+                detail->retire_ticks + detail->log_ticks;
+            detail->residual_ticks = elapsed > measured ? elapsed - measured : 0;
+            stat->texture_detail = *detail;
+        }
+    }
+}
+
+static void ld_slow_draw_advance(ld_slow_draw_scope* scope,
+                                ld_slow_draw_stage_id next_stage)
+{
+    if (!scope || !scope->active) return;
+    const u64 now = ld_slow_draw_qpc();
+    if (scope->event.stage < LD_SLOW_DRAW_STAGE_COUNT && now >= scope->stage_begin)
+        scope->event.stage_ticks[scope->event.stage] += now - scope->stage_begin;
+    scope->event.stage = (u32)next_stage;
+    scope->stage_begin = now;
+}
+
+static void ld_slow_draw_finish(ld_slow_draw_scope* scope)
+{
+    if (!scope || !scope->active) return;
+    scope->event.cycle_valid = scope->event.cycle_valid &&
+        QueryThreadCycleTime(GetCurrentThread(), &scope->event.cycle_end);
+    if (scope->event.cycle_end < scope->event.cycle_begin)
+        scope->event.cycle_valid = 0;
+    scope->event.qpc_end = ld_slow_draw_qpc();
+    if (scope->event.stage < LD_SLOW_DRAW_STAGE_COUNT &&
+        scope->event.qpc_end >= scope->stage_begin)
+        scope->event.stage_ticks[scope->event.stage] +=
+            scope->event.qpc_end - scope->stage_begin;
+    if (scope->event.qpc_end < scope->event.qpc_begin ||
+        scope->event.qpc_end - scope->event.qpc_begin <
+            g_ld_slow_draw.threshold_ticks)
+        return;
+    AcquireSRWLockExclusive(&g_ld_slow_draw_lock);
+    g_ld_slow_draw.events[g_ld_slow_draw.next] = scope->event;
+    g_ld_slow_draw.next = (g_ld_slow_draw.next + 1u) % LD_SLOW_DRAW_CAP;
+    if (g_ld_slow_draw.recorded < LD_SLOW_DRAW_CAP)
+        ++g_ld_slow_draw.recorded;
+    else
+        ++g_ld_slow_draw.overwritten;
+    ReleaseSRWLockExclusive(&g_ld_slow_draw_lock);
+}
+
+static void ld_slow_draw_dump(void)
+{
+    if (!g_ld_slow_draw.enabled || g_ld_slow_draw.dumped) return;
+    FILE* csv = fopen(g_ld_slow_draw.path, "wb");
+    if (!csv) {
+        fprintf(stderr, "[slow-draw] cannot open %s\n", g_ld_slow_draw.path);
+        return;
+    }
+    AcquireSRWLockExclusive(&g_ld_slow_draw_lock);
+    g_ld_slow_draw.dumped = 1;
+    fprintf(csv,
+        "qpc_frequency,threshold_us,callback_id,frame,host_tid,qpc_begin,qpc_end,wall_ms,"
+        "thread_cycles_valid,thread_cycles_begin,thread_cycles_end,thread_cycles_delta_not_ms,"
+        "primitive,packets,source_refs,vertices,topology_count,"
+        "target,zslot,texture_mask,vertex_texture_mask,geometry_preparation_ms,pipeline_constants_ms,"
+        "resource_resolution_ms,command_recording_ms,get_pso_ms,pso_lookup,"
+        "build_pso_ms,shader_disk_load_ms,d3d_compile_ms,create_graphics_pso_ms,"
+        "surface_calls,surface_total_ms,surface_max_ms,surface_max_location,surface_max_offset,surface_max_format,surface_max_width,surface_max_height,surface_max_slot,"
+        "depth_calls,depth_total_ms,depth_max_ms,depth_max_location,depth_max_offset,depth_max_format,depth_max_width,depth_max_height,depth_max_slot,"
+        "texture_calls,texture_total_ms,texture_max_ms,texture_max_location,texture_max_offset,texture_max_format,texture_max_width,texture_max_height,texture_max_slot,"
+        "vertex_texture_calls,vertex_texture_total_ms,vertex_texture_max_ms,vertex_texture_max_location,vertex_texture_max_offset,vertex_texture_max_format,vertex_texture_max_width,vertex_texture_max_height,vertex_texture_max_slot,"
+        "texture_outcome,texture_decode_attempted,texture_decode_succeeded,texture_watch_skipped,texture_cache_full,"
+        "texture_slot_lookup_ms,texture_slot_watch_ms,texture_slot_hash_ms,texture_slot_decode_ms,"
+        "texture_slot_srv_ms,texture_slot_retire_ms,texture_slot_log_ms,texture_slot_residual_ms,"
+        "texture_resource_create_ms,texture_resource_create_calls,"
+        "resource_residual_ms,texture_skip_evaluated,texture_skip_override_changed,"
+        "texture_skip_watch_valid,texture_skip_entry_valid,texture_skip_stamp_match,"
+        "texture_skip_hash_kind_match,texture_skip_validation,texture_skip_rejection_mask,"
+        "texture_source_span,texture_mipmaps,texture_hash_kind,texture_hash_cycle_attempts,"
+        "texture_hash_cycle_successes,texture_hash_cycle_failures,"
+        "texture_hash_cycle_valid,texture_hash_cycle_delta_not_ms\n");
+    const u64 first = (g_ld_slow_draw.next + LD_SLOW_DRAW_CAP -
+        g_ld_slow_draw.recorded) % LD_SLOW_DRAW_CAP;
+    const double scale = g_ld_slow_draw.qpc_frequency
+        ? 1000.0 / (double)g_ld_slow_draw.qpc_frequency : 0.0;
+    const unsigned long threshold_us = g_ld_slow_draw.threshold_us;
+    for (u64 i = 0; i < g_ld_slow_draw.recorded; ++i) {
+        const ld_slow_draw_event* e =
+            &g_ld_slow_draw.events[(first + i) % LD_SLOW_DRAW_CAP];
+        const u64 cycles = e->cycle_valid && e->cycle_end >= e->cycle_begin
+            ? e->cycle_end - e->cycle_begin : 0;
+        fprintf(csv,
+            "%llu,%lu,%llu,%u,%u,%llu,%llu,%.6f,%u,%llu,%llu,%llu,%u,%u,%u,%u,%u,"
+            "%u,%u,0x%08X,0x%08X,%.6f,%.6f,%.6f,%.6f,%.6f,%u,"
+            "%.6f,%.6f,%.6f,%.6f",
+            (unsigned long long)g_ld_slow_draw.qpc_frequency, threshold_us,
+            (unsigned long long)e->callback_id, e->frame, e->host_tid,
+            (unsigned long long)e->qpc_begin,
+            (unsigned long long)e->qpc_end,
+            (e->qpc_end - e->qpc_begin) * scale, e->cycle_valid,
+            (unsigned long long)e->cycle_begin,
+            (unsigned long long)e->cycle_end,
+            (unsigned long long)cycles, e->primitive, e->packets,
+            e->source_refs, e->vertices, e->topology_count, e->target, e->zslot,
+            e->texture_mask, e->vertex_texture_mask,
+            e->stage_ticks[LD_SLOW_DRAW_GEOMETRY_PREP] * scale,
+            e->stage_ticks[LD_SLOW_DRAW_PIPELINE_CONSTANTS] * scale,
+            e->stage_ticks[LD_SLOW_DRAW_RESOURCE_RESOLUTION] * scale,
+            e->stage_ticks[LD_SLOW_DRAW_COMMAND_RECORDING] * scale,
+            e->get_pso_ticks * scale, e->pso_lookup,
+            e->build_pso_ticks * scale, e->shader_disk_load_ticks * scale,
+            e->d3d_compile_ticks * scale, e->create_graphics_pso_ticks * scale);
+        u64 nested_resource_ticks = 0;
+        for (u32 k = 0; k < LD_SLOW_DRAW_RESOURCE_KIND_COUNT; ++k) {
+            const ld_slow_draw_resource_stat* stat = &e->resource[k];
+            nested_resource_ticks += stat->total_ticks;
+            fprintf(csv, ",%u,%.6f,%.6f,%u,%u,%u,%u,%u,%u",
+                stat->calls, stat->total_ticks * scale, stat->max_ticks * scale,
+                stat->max_location, stat->max_offset, stat->max_format,
+                stat->max_width, stat->max_height, stat->max_slot);
+        }
+        const u64 resource_ticks = e->stage_ticks[LD_SLOW_DRAW_RESOURCE_RESOLUTION];
+        const u64 residual_ticks = resource_ticks > nested_resource_ticks
+            ? resource_ticks - nested_resource_ticks : 0;
+        const ld_slow_texture_detail* td =
+            &e->resource[LD_SLOW_RESOURCE_TEXTURE].texture_detail;
+        fprintf(csv, ",%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f"
+                     ",%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%llu\n",
+            td->outcome, td->decode_attempted, td->decode_succeeded,
+            td->watch_skipped, td->cache_full,
+            td->lookup_ticks * scale, td->watch_ticks * scale,
+            td->hash_ticks * scale, td->decode_ticks * scale,
+            td->srv_ticks * scale, td->retire_ticks * scale,
+            td->log_ticks * scale, td->residual_ticks * scale,
+            td->resource_create_ticks * scale, td->resource_create_calls,
+            residual_ticks * scale,
+            td->skip_evaluated, td->skip_override_changed, td->skip_watch_valid,
+            td->skip_entry_valid, td->skip_stamp_match, td->skip_hash_kind_match,
+            td->skip_validation, td->skip_rejection_mask, td->source_span,
+            td->mipmaps, td->hash_kind, td->hash_cycle_attempts,
+            td->hash_cycle_successes, td->hash_cycle_failures,
+            td->hash_cycle_attempts != 0 && td->hash_cycle_failures == 0,
+            (unsigned long long)td->hash_cycle_delta);
+    }
+    fclose(csv);
+    ReleaseSRWLockExclusive(&g_ld_slow_draw_lock);
+    fprintf(stderr,
+        "[slow-draw] saved=%llu overwritten=%llu callbacks=%llu threshold_us=%lu "
+        "thread_cycles_are_raw_counts_not_ms path=%s\n",
+        (unsigned long long)g_ld_slow_draw.recorded,
+        (unsigned long long)g_ld_slow_draw.overwritten,
+        (unsigned long long)g_ld_slow_draw.callbacks, threshold_us,
+        g_ld_slow_draw.path);
+}
+/* END RSX_SLOW_DRAW_DIAGNOSTIC */
+
 /*
  * Profile-lane-only renderer accounting.  These counters deliberately live
  * outside ld_state so the clean benchmark lane keeps the exact same state
@@ -1187,6 +1739,12 @@ typedef struct {
     u64 vp_prepare_qpc, fp_prepare_qpc;
     u64 vp_cache_hits, vp_cache_misses;
     u64 pso_lookup_qpc;
+    u64 shader_disk_load_qpc, shader_disk_store_qpc, shader_blob_create_qpc;
+    u64 shader_disk_load_calls, shader_disk_store_calls;
+    u64 shader_disk_load_open_qpc, shader_disk_load_read_qpc;
+    u64 shader_disk_load_close_qpc, shader_disk_load_progress_qpc;
+    u64 shader_disk_load_open_calls, shader_disk_load_read_calls;
+    u64 shader_disk_load_close_calls, shader_disk_load_progress_writes;
     u64 vertex_refs_qpc;
     u64 vertex_remap_qpc;
     u64 vertex_plan_qpc;
@@ -1208,8 +1766,15 @@ typedef struct {
     u64 texture_upload_bytes;
     u64 texture_decode_calls;
     u64 texture_decode_qpc;
+    u64 texture_decode_miss_calls, texture_decode_refresh_calls;
+    u64 texture_decode_retry_calls;
+    u64 texture_decode_create_qpc, texture_decode_create_calls;
+    u64 texture_decode_upload_memcpy_qpc, texture_decode_upload_rows;
+    u64 texture_decode_copy_record_qpc, texture_decode_copy_regions;
+    u64 texture_decode_barrier_record_qpc, texture_decode_barriers;
     u64 texture_hash_qpc;
     u64 texture_hash_bytes;
+    u64 texture_watch_qpc;
     u64 gpu_ticks;
     u64 ps_constant_allocations;
     u64 ps_constant_upload_bytes;
@@ -1238,6 +1803,12 @@ typedef struct {
     u32 frame_upload_high;
     u32 frame_vb_high;
     u32 frame_retired_high;
+    u64 frame_texture_create_max_qpc;
+    u32 frame_texture_create_max_width, frame_texture_create_max_height;
+    u32 frame_texture_create_max_format, frame_texture_create_max_mips;
+    u32 frame_texture_create_max_array_size, frame_texture_create_max_kind;
+    int texture_decode_active;
+    u32 texture_decode_kind;
     u32 total_upload_high;
     u32 total_vb_high;
     u32 total_retired_high;
@@ -1276,6 +1847,24 @@ static LONGLONG ld_profile_qpc(void)
     LARGE_INTEGER value;
     QueryPerformanceCounter(&value);
     return value.QuadPart;
+}
+
+static void ld_profile_note_texture_create(
+    LONGLONG begin, const D3D12_RESOURCE_DESC* desc)
+{
+    if (!g_ld_profile.texture_decode_active) return;
+    const u64 ticks = (u64)(ld_profile_qpc() - begin);
+    g_ld_profile.total.texture_decode_create_qpc += ticks;
+    ++g_ld_profile.total.texture_decode_create_calls;
+    if (ticks > g_ld_profile.frame_texture_create_max_qpc) {
+        g_ld_profile.frame_texture_create_max_qpc = ticks;
+        g_ld_profile.frame_texture_create_max_width = (u32)desc->Width;
+        g_ld_profile.frame_texture_create_max_height = desc->Height;
+        g_ld_profile.frame_texture_create_max_format = (u32)desc->Format;
+        g_ld_profile.frame_texture_create_max_mips = desc->MipLevels;
+        g_ld_profile.frame_texture_create_max_array_size = desc->DepthOrArraySize;
+        g_ld_profile.frame_texture_create_max_kind = g_ld_profile.texture_decode_kind;
+    }
 }
 
 static void ld_profile_note_ring_highwater(void)
@@ -1560,7 +2149,7 @@ static void decode_render_state(render_state_t* rs)
       if (nc) rs->cull_enable = 0; }
     rs->cull_face   = rsx_dsp_reg(&g.rsx, M_CULL_FACE);
     rs->front_face  = rsx_dsp_reg(&g.rsx, M_FRONT_FACE);
-    /* s31 (scratch/s31_blue_emitter.md): honor the RAW register — 0 is a
+    /* s31 (scratch/s31_blue_emitter.md): honor the RAW register â€” 0 is a
      * legitimate game-written "write no color channels" (the character
      * shadow-mask depth-prime pass). rsx_dispatch_init seeds the nv40
      * reset default (0x01010101), so never-written reads as all-on. */
@@ -1605,7 +2194,7 @@ static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
     D3D12_RENDER_TARGET_BLEND_DESC* b = &pd->BlendState.RenderTarget[0];
     /* nv40_3d COLOR_MASK byte layout (Mesa/nouveau nv40_3d.xml.h, MIT/X11):
      * B=[0:7] G=[8:15] R=[16:23] A=[24:31]; any nonzero byte = channel on.
-     * (s31: was hardcoded ENABLE_ALL — the blue-character class' live twin.) */
+     * (s31: was hardcoded ENABLE_ALL â€” the blue-character class' live twin.) */
     b->RenderTargetWriteMask =
         (((rs->color_mask       ) & 0xFF) ? D3D12_COLOR_WRITE_ENABLE_BLUE  : 0) |
         (((rs->color_mask >>  8 ) & 0xFF) ? D3D12_COLOR_WRITE_ENABLE_GREEN : 0) |
@@ -1932,8 +2521,236 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
 /* ---------------------------------------------------------------------------
  * command list submit/wait (simple synchronous model, like the harness)
  * -----------------------------------------------------------------------*/
+
+/* BEGIN RSX SLOW FLUSH DIAGNOSTIC */
+/* Opt-in ordinary-build attribution for synchronous command-list flushes.
+ * There is no allocation or file I/O on the flush path; when disabled the
+ * only work is the once-initialized path check. Records are published only
+ * after a flush completes (or returns through one of its existing failure
+ * branches), so shutdown never observes a partially-written event. */
+#define LD_SLOW_FLUSH_CAP 4096u
+enum {
+    LD_SLOW_FLUSH_CLOSE = 0,
+    LD_SLOW_FLUSH_EXECUTE,
+    LD_SLOW_FLUSH_SIGNAL,
+    LD_SLOW_FLUSH_COMPLETED_VALUE,
+    LD_SLOW_FLUSH_SET_EVENT,
+    LD_SLOW_FLUSH_WAIT,
+    LD_SLOW_FLUSH_INFO_QUEUE,
+    LD_SLOW_FLUSH_RETIRED_RELEASE,
+    LD_SLOW_FLUSH_ALLOC_RESET,
+    LD_SLOW_FLUSH_LIST_RESET,
+    LD_SLOW_FLUSH_STAGE_COUNT
+};
+
+typedef struct {
+    u64 qpc_begin, qpc_end;
+    u64 thread_cycles_begin, thread_cycles_end;
+    u64 stage_ticks[LD_SLOW_FLUSH_STAGE_COUNT];
+    u64 fence_value, completed_value;
+    u64 sequence;
+    u32 frame, host_tid, reason, retired_count;
+    u32 thread_cycles_valid, waited, wait_result, wait_error;
+    u32 stage_mask;
+    u32 close_hr, signal_hr, set_event_hr;
+    u32 alloc_reset_hr, list_reset_hr, failed_stage;
+} ld_slow_flush_event;
+
+typedef struct {
+    int active;
+    ld_slow_flush_event event;
+} ld_slow_flush_scope;
+
+static INIT_ONCE g_ld_slow_flush_once = INIT_ONCE_STATIC_INIT;
+static volatile LONG g_ld_slow_flush_config_state = -1;
+static const char* g_ld_slow_flush_path;
+static u64 g_ld_slow_flush_frequency;
+static u64 g_ld_slow_flush_threshold_ticks;
+static u32 g_ld_slow_flush_threshold_us = 2000;
+static SRWLOCK g_ld_slow_flush_lock = SRWLOCK_INIT;
+static ld_slow_flush_event g_ld_slow_flush_events[LD_SLOW_FLUSH_CAP];
+static u64 g_ld_slow_flush_next, g_ld_slow_flush_count;
+static u64 g_ld_slow_flush_overwritten, g_ld_slow_flush_sequence;
+static LONG g_ld_slow_flush_dumped;
+
+static BOOL CALLBACK ld_slow_flush_configure(PINIT_ONCE once, PVOID param,
+                                              PVOID* context)
+{
+    (void)once; (void)param; (void)context;
+    const char* path = getenv("RSX_SLOW_FLUSH_CSV");
+    if (path && *path) {
+        LARGE_INTEGER frequency;
+        if (QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0) {
+            g_ld_slow_flush_path = path;
+            g_ld_slow_flush_frequency = (u64)frequency.QuadPart;
+            const char* threshold = getenv("RSX_SLOW_FLUSH_THRESHOLD_US");
+            if (threshold && *threshold) {
+                char* end = NULL;
+                const unsigned long value = strtoul(threshold, &end, 10);
+                if (end != threshold && *end == '\0' && value > 0 &&
+                    value <= 1000000ul)
+                    g_ld_slow_flush_threshold_us = (u32)value;
+            }
+            g_ld_slow_flush_threshold_ticks =
+                g_ld_slow_flush_frequency * g_ld_slow_flush_threshold_us / 1000000ull;
+        } else {
+            fprintf(stderr, "[slow-rsx-flush] QPC frequency unavailable; diagnostic disabled\n");
+        }
+    }
+    InterlockedExchange(&g_ld_slow_flush_config_state,
+                        g_ld_slow_flush_path ? 1 : 0);
+    return TRUE;
+}
+
+static u64 ld_slow_flush_qpc(void)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (u64)now.QuadPart;
+}
+
+static u64 ld_slow_flush_cycles(u32* valid)
+{
+    ULONG64 cycles = 0;
+    *valid = QueryThreadCycleTime(GetCurrentThread(), &cycles) != 0;
+    return *valid ? (u64)cycles : 0;
+}
+
+static void ld_slow_flush_begin(ld_slow_flush_scope* scope,
+                                ld_flush_reason reason)
+{
+    scope->active = 0;
+    if (InterlockedCompareExchange(&g_ld_slow_flush_config_state, -1, -1) == -1)
+        InitOnceExecuteOnce(&g_ld_slow_flush_once, ld_slow_flush_configure,
+                            NULL, NULL);
+    if (!g_ld_slow_flush_path || !g_ld_slow_flush_frequency ||
+        InterlockedCompareExchange(&g_ld_slow_flush_dumped, 0, 0))
+        return;
+    memset(&scope->event, 0, sizeof(scope->event));
+    scope->active = 1;
+    scope->event.thread_cycles_begin = ld_slow_flush_cycles(
+        &scope->event.thread_cycles_valid);
+    scope->event.host_tid = GetCurrentThreadId();
+    scope->event.frame = g_ld_frames;
+    scope->event.reason = (u32)reason;
+    scope->event.retired_count = g.n_retired_textures;
+    scope->event.wait_result = UINT32_MAX;
+    scope->event.completed_value = UINT64_MAX;
+    scope->event.qpc_begin = ld_slow_flush_qpc();
+}
+
+static void ld_slow_flush_finish(ld_slow_flush_scope* scope)
+{
+    if (!scope->active) return;
+    ld_slow_flush_event* event = &scope->event;
+    event->qpc_end = ld_slow_flush_qpc();
+    u32 cycles_end_valid = 0;
+    event->thread_cycles_end = ld_slow_flush_cycles(&cycles_end_valid);
+    event->thread_cycles_valid = event->thread_cycles_valid && cycles_end_valid;
+    if (event->qpc_end < event->qpc_begin) return;
+    const u64 elapsed = event->qpc_end - event->qpc_begin;
+    if (elapsed <= g_ld_slow_flush_threshold_ticks && !event->failed_stage)
+        return;
+
+    AcquireSRWLockExclusive(&g_ld_slow_flush_lock);
+    if (!InterlockedCompareExchange(&g_ld_slow_flush_dumped, 0, 0)) {
+        event->sequence = ++g_ld_slow_flush_sequence;
+        g_ld_slow_flush_events[g_ld_slow_flush_next] = *event;
+        g_ld_slow_flush_next = (g_ld_slow_flush_next + 1u) % LD_SLOW_FLUSH_CAP;
+        if (g_ld_slow_flush_count < LD_SLOW_FLUSH_CAP)
+            ++g_ld_slow_flush_count;
+        else
+            ++g_ld_slow_flush_overwritten;
+    }
+    ReleaseSRWLockExclusive(&g_ld_slow_flush_lock);
+}
+
+static void ld_slow_flush_dump(void)
+{
+    if (InterlockedCompareExchange(&g_ld_slow_flush_config_state, -1, -1) == -1)
+        InitOnceExecuteOnce(&g_ld_slow_flush_once, ld_slow_flush_configure,
+                            NULL, NULL);
+    if (!g_ld_slow_flush_path || !g_ld_slow_flush_frequency) return;
+    AcquireSRWLockExclusive(&g_ld_slow_flush_lock);
+    if (InterlockedCompareExchange(&g_ld_slow_flush_dumped, 1, 0)) {
+        ReleaseSRWLockExclusive(&g_ld_slow_flush_lock);
+        return;
+    }
+    FILE* file = fopen(g_ld_slow_flush_path, "wb");
+    if (!file) {
+        fprintf(stderr, "[slow-rsx-flush] cannot open %s\n", g_ld_slow_flush_path);
+        ReleaseSRWLockExclusive(&g_ld_slow_flush_lock);
+        return;
+    }
+    int io_error = 0;
+    if (fprintf(file, "#qpc_frequency,%llu,threshold_us,%u,capacity,%u,retained,%llu,overwritten,%llu\n",
+            (unsigned long long)g_ld_slow_flush_frequency,
+            g_ld_slow_flush_threshold_us, LD_SLOW_FLUSH_CAP,
+            (unsigned long long)g_ld_slow_flush_count,
+            (unsigned long long)g_ld_slow_flush_overwritten) < 0)
+        io_error = 1;
+    if (fprintf(file,
+            "sequence,frame,host_tid,reason,qpc_begin,qpc_end,total_ticks,"
+            "thread_cycles_valid,thread_cycles_delta,fence_value,completed_value,"
+            "retired_count,waited,wait_result,wait_error,stage_mask,close_hr,signal_hr,"
+            "set_event_hr,alloc_reset_hr,list_reset_hr,failed_stage,"
+            "unaccounted_ticks,close_ticks,execute_ticks,signal_ticks,completed_value_ticks,"
+            "set_event_ticks,wait_ticks,info_queue_ticks,retired_release_ticks,"
+            "alloc_reset_ticks,list_reset_ticks\n") < 0)
+        io_error = 1;
+    const u64 retained = g_ld_slow_flush_count;
+    const u64 first = g_ld_slow_flush_count < LD_SLOW_FLUSH_CAP
+        ? 0 : g_ld_slow_flush_next;
+    for (u64 i = 0; i < retained; ++i) {
+        const ld_slow_flush_event* e =
+            &g_ld_slow_flush_events[(first + i) % LD_SLOW_FLUSH_CAP];
+        const u64 cycles = e->thread_cycles_valid &&
+            e->thread_cycles_end >= e->thread_cycles_begin
+            ? e->thread_cycles_end - e->thread_cycles_begin : 0;
+        u64 stages_total = 0;
+        for (u32 stage = 0; stage < LD_SLOW_FLUSH_STAGE_COUNT; ++stage)
+            stages_total += e->stage_ticks[stage];
+        const u64 total_ticks = e->qpc_end - e->qpc_begin;
+        const u64 unaccounted_ticks = total_ticks > stages_total
+            ? total_ticks - stages_total : 0;
+        if (fprintf(file,
+            "%llu,%u,%u,%u,%llu,%llu,%llu,%u,%llu,%llu,%llu,%u,%u,%u,%u,%u,"
+            "0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,%u,%llu,"
+            "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+            (unsigned long long)e->sequence,e->frame,e->host_tid,e->reason,
+            (unsigned long long)e->qpc_begin,(unsigned long long)e->qpc_end,
+            (unsigned long long)(e->qpc_end-e->qpc_begin),
+            e->thread_cycles_valid,(unsigned long long)cycles,
+            (unsigned long long)e->fence_value,
+            (unsigned long long)e->completed_value,e->retired_count,e->waited,
+            e->wait_result,e->wait_error,e->stage_mask,e->close_hr,e->signal_hr,e->set_event_hr,
+            e->alloc_reset_hr,e->list_reset_hr,e->failed_stage,
+            (unsigned long long)unaccounted_ticks,
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_CLOSE],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_EXECUTE],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_SIGNAL],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_COMPLETED_VALUE],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_SET_EVENT],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_WAIT],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_INFO_QUEUE],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_RETIRED_RELEASE],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_ALLOC_RESET],
+            (unsigned long long)e->stage_ticks[LD_SLOW_FLUSH_LIST_RESET]) < 0)
+            io_error = 1;
+    }
+    if (ferror(file)) io_error = 1;
+    if (fclose(file) != 0) io_error = 1;
+    if (io_error)
+        fprintf(stderr, "[slow-rsx-flush] write failed for %s\n", g_ld_slow_flush_path);
+    ReleaseSRWLockExclusive(&g_ld_slow_flush_lock);
+}
+/* END RSX SLOW FLUSH DIAGNOSTIC */
+
+/* BEGIN RSX SLOW FLUSH WRAPPER */
 static void ld_flush(ld_flush_reason reason)
 {
+    ld_slow_flush_scope slow_flush;
+    ld_slow_flush_begin(&slow_flush, reason);
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG flush_begin = ld_profile_qpc();
     g_ld_profile.total.flush_reason[reason]++;
@@ -1964,35 +2781,77 @@ static void ld_flush(ld_flush_reason reason)
 #else
     (void)reason;
 #endif
+    u64 stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
     const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_CLOSE] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_CLOSE;
+        slow_flush.event.close_hr = (u32)close_hr;
+    }
     if (FAILED(close_hr)) {
         fprintf(stderr,
                 "[d3d-fail] command-list Close hr=0x%08lX frame=%u\n",
                 (unsigned long)close_hr, g_ld_frames);
         ld_dump_dred("Close", close_hr);
         g.ready = 0;
+        if (slow_flush.active)
+            slow_flush.event.failed_stage = LD_SLOW_FLUSH_CLOSE + 1;
+        ld_slow_flush_finish(&slow_flush);
         return;
     }
     ID3D12CommandList* lists[] = {(ID3D12CommandList*)g.list};
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
     g.queue->lpVtbl->ExecuteCommandLists(g.queue, 1, lists);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_EXECUTE] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_EXECUTE;
+    }
     const u64 v = ++g.fence_value;
+    if (slow_flush.active) slow_flush.event.fence_value = v;
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
     const HRESULT signal_hr =
         g.queue->lpVtbl->Signal(g.queue, g.fence, v);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_SIGNAL] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_SIGNAL;
+        slow_flush.event.signal_hr = (u32)signal_hr;
+    }
     if (FAILED(signal_hr)) {
         fprintf(stderr,
                 "[d3d-fail] queue Signal hr=0x%08lX frame=%u\n",
                 (unsigned long)signal_hr, g_ld_frames);
         ld_dump_dred("Signal", signal_hr);
         g.ready = 0;
+        if (slow_flush.active)
+            slow_flush.event.failed_stage = LD_SLOW_FLUSH_SIGNAL + 1;
+        ld_slow_flush_finish(&slow_flush);
         return;
     }
-    if (g.fence->lpVtbl->GetCompletedValue(g.fence) < v) {
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
+    const u64 completed_value = g.fence->lpVtbl->GetCompletedValue(g.fence);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_COMPLETED_VALUE] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_COMPLETED_VALUE;
+        slow_flush.event.completed_value = completed_value;
+    }
+    if (completed_value < v) {
 #if defined(YZ_PERF_PROFILE)
         const LONGLONG wait_begin = ld_profile_qpc();
 #endif
+        stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
         const HRESULT event_hr =
             g.fence->lpVtbl->SetEventOnCompletion(
                 g.fence, v, g.fence_event);
+        if (slow_flush.active) {
+            slow_flush.event.stage_ticks[LD_SLOW_FLUSH_SET_EVENT] =
+                ld_slow_flush_qpc() - stage_begin;
+            slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_SET_EVENT;
+            slow_flush.event.set_event_hr = (u32)event_hr;
+        }
         if (FAILED(event_hr)) {
             fprintf(stderr,
                     "[d3d-fail] fence SetEventOnCompletion "
@@ -2000,16 +2859,38 @@ static void ld_flush(ld_flush_reason reason)
                     (unsigned long)event_hr, g_ld_frames);
             ld_dump_dred("SetEventOnCompletion", event_hr);
             g.ready = 0;
+            if (slow_flush.active)
+                slow_flush.event.failed_stage = LD_SLOW_FLUSH_SET_EVENT + 1;
+            ld_slow_flush_finish(&slow_flush);
             return;
         }
-        WaitForSingleObject(g.fence_event, INFINITE);
+        if (slow_flush.active) slow_flush.event.waited = 1;
+        stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
+        const DWORD wait_result = WaitForSingleObject(g.fence_event, INFINITE);
+        const DWORD wait_error = wait_result == WAIT_FAILED
+            ? GetLastError() : 0;
+        if (slow_flush.active) {
+            slow_flush.event.stage_ticks[LD_SLOW_FLUSH_WAIT] =
+                ld_slow_flush_qpc() - stage_begin;
+            slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_WAIT;
+            slow_flush.event.wait_result = wait_result;
+            slow_flush.event.wait_error = wait_error;
+            if (wait_result == WAIT_FAILED)
+                slow_flush.event.failed_stage = LD_SLOW_FLUSH_WAIT + 1;
+        }
 #if defined(YZ_PERF_PROFILE)
         const u64 wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
         g_ld_profile.total.fence_wait_qpc += wait_ticks;
         g_ld_profile.total.fence_reason_qpc[reason] += wait_ticks;
 #endif
     }
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
     ld_drain_info_queue("flush");
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_INFO_QUEUE] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_INFO_QUEUE;
+    }
 #if defined(YZ_PERF_PROFILE)
     if (g_ld_gpu_armed && g_ld_gpu_results[1] >= g_ld_gpu_results[0])
         g_ld_profile.total.gpu_ticks += g_ld_gpu_results[1] - g_ld_gpu_results[0];
@@ -2018,11 +2899,37 @@ static void ld_flush(ld_flush_reason reason)
      * earlier draw in this command list still references the old one.  The
      * fence above is the first safe point at which those old resources may be
      * released. */
+    if (slow_flush.active)
+        slow_flush.event.retired_count = g.n_retired_textures;
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
     for (u32 i = 0; i < g.n_retired_textures; i++)
         g.retired_textures[i]->lpVtbl->Release(g.retired_textures[i]);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_RETIRED_RELEASE] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_RETIRED_RELEASE;
+    }
     g.n_retired_textures = 0;
-    g.alloc->lpVtbl->Reset(g.alloc);
-    g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
+    const HRESULT alloc_reset_hr = g.alloc->lpVtbl->Reset(g.alloc);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_ALLOC_RESET] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_ALLOC_RESET;
+        slow_flush.event.alloc_reset_hr = (u32)alloc_reset_hr;
+        if (FAILED(alloc_reset_hr) && !slow_flush.event.failed_stage)
+            slow_flush.event.failed_stage = LD_SLOW_FLUSH_ALLOC_RESET + 1;
+    }
+    stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
+    const HRESULT list_reset_hr = g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+    if (slow_flush.active) {
+        slow_flush.event.stage_ticks[LD_SLOW_FLUSH_LIST_RESET] =
+            ld_slow_flush_qpc() - stage_begin;
+        slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_LIST_RESET;
+        slow_flush.event.list_reset_hr = (u32)list_reset_hr;
+        if (FAILED(list_reset_hr) && !slow_flush.event.failed_stage)
+            slow_flush.event.failed_stage = LD_SLOW_FLUSH_LIST_RESET + 1;
+    }
 #if defined(YZ_PERF_PROFILE)
     g_ld_gpu_armed = g_ld_gpu_results && g_ld_gpu_frequency;
     if (g_ld_gpu_armed)
@@ -2034,7 +2941,9 @@ static void ld_flush(ld_flush_reason reason)
     g_ld_profile.total.flush_qpc += flush_ticks;
     g_ld_profile.total.flush_reason_qpc[reason] += flush_ticks;
 #endif
+    ld_slow_flush_finish(&slow_flush);
 }
+/* END RSX SLOW FLUSH WRAPPER */
 
 /* DXGI can change fullscreen state on focus loss/restore. Refresh only the
  * scanout buffers after the present fence; guest surfaces and internal raster
@@ -2206,7 +3115,8 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
 
 typedef struct { u32 w, h; const u8* data; u32 row_bytes, rows; } tex_level_t;
 
-static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t* lv, u32 n)
+static ID3D12Resource* create_texture_mipped_scoped(DXGI_FORMAT fmt,
+    const tex_level_t* lv, u32 n, ld_slow_texture_detail* slow_detail)
 {
     if (n == 0 || n > 14) return NULL;
     /* Reject incomplete uploads before creating a resource or recording copy
@@ -2228,16 +3138,43 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     rd.Width = lv[0].w; rd.Height = lv[0].h; rd.DepthOrArraySize = 1;
     rd.MipLevels = (u16)n; rd.Format = fmt; rd.SampleDesc.Count = 1;
     ID3D12Resource* tex = NULL;
-    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG create_begin = g_ld_profile.texture_decode_active
+        ? ld_profile_qpc() : 0;
+#endif
+    const u64 slow_create_begin = slow_detail ? ld_slow_draw_qpc() : 0;
+    const HRESULT create_result = g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
                                                       D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-                                                      &IID_ID3D12Resource, (void**)&tex)))
+                                                      &IID_ID3D12Resource, (void**)&tex);
+    if (slow_detail) ld_slow_texture_resource_create(slow_detail, slow_create_begin);
+    if (FAILED(create_result)) {
+#if defined(YZ_PERF_PROFILE)
+        if (g_ld_profile.texture_decode_active)
+            ld_profile_note_texture_create(create_begin, &rd);
+#endif
         return NULL;
+    }
+#if defined(YZ_PERF_PROFILE)
+    if (g_ld_profile.texture_decode_active)
+        ld_profile_note_texture_create(create_begin, &rd);
+#endif
     for (u32 m = 0; m < n; m++) {
         const u32 pitch = (lv[m].row_bytes + 255) & ~255u;
         const u32 start = (g.upload_used + 511) & ~511u;
+#if defined(YZ_PERF_PROFILE)
+        const LONGLONG memcpy_begin = g_ld_profile.texture_decode_active
+            ? ld_profile_qpc() : 0;
+#endif
         for (u32 y = 0; y < lv[m].rows; y++)
             memcpy(g.upload_mapped + start + (size_t)y * pitch,
                    lv[m].data + (size_t)y * lv[m].row_bytes, lv[m].row_bytes);
+#if defined(YZ_PERF_PROFILE)
+        if (g_ld_profile.texture_decode_active) {
+            g_ld_profile.total.texture_decode_upload_memcpy_qpc +=
+                (u64)(ld_profile_qpc() - memcpy_begin);
+            g_ld_profile.total.texture_decode_upload_rows += lv[m].rows;
+        }
+#endif
         D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
         src.pResource = g.upload; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint.Offset = start;
@@ -2248,7 +3185,18 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
         src.PlacedFootprint.Footprint.RowPitch = pitch;
         dst.pResource = tex; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst.SubresourceIndex = m;
+#if defined(YZ_PERF_PROFILE)
+        const LONGLONG copy_begin = g_ld_profile.texture_decode_active
+            ? ld_profile_qpc() : 0;
+#endif
         g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+#if defined(YZ_PERF_PROFILE)
+        if (g_ld_profile.texture_decode_active) {
+            g_ld_profile.total.texture_decode_copy_record_qpc +=
+                (u64)(ld_profile_qpc() - copy_begin);
+            ++g_ld_profile.total.texture_decode_copy_regions;
+        }
+#endif
         g.upload_used = start + pitch * lv[m].rows;
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.texture_upload_bytes +=
@@ -2261,16 +3209,72 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG barrier_begin = g_ld_profile.texture_decode_active
+        ? ld_profile_qpc() : 0;
+#endif
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+#if defined(YZ_PERF_PROFILE)
+    if (g_ld_profile.texture_decode_active) {
+        g_ld_profile.total.texture_decode_barrier_record_qpc +=
+            (u64)(ld_profile_qpc() - barrier_begin);
+        ++g_ld_profile.total.texture_decode_barriers;
+    }
+#endif
     return tex;
 }
 
+static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt,
+    const tex_level_t* lv, u32 n)
+{
+    return create_texture_mipped_scoped(fmt, lv, n, NULL);
+}
+
 #include "rsx_texture_content_cache.h"
+static void ld_texture_content_summary(void)
+{
+    fprintf(stderr,"[texture-content] requests=%llu hits=%llu misses=%llu bypasses=%llu "
+        "evictions=%llu entries=%u cpu_bytes=%llu scratch_bytes=%u gpu_bytes=%llu "
+        "compared_bytes=%llu snapshot_bytes=%llu\n",
+        g_ld_texture_content.requests,g_ld_texture_content.hits,
+        g_ld_texture_content.misses,g_ld_texture_content.bypasses,
+        g_ld_texture_content.evictions,g_ld_texture_content.count,
+        g_ld_texture_content.cpu_bytes,g_ld_texture_content.scratch_size,
+        g_ld_texture_content.gpu_bytes,g_ld_texture_content.compared_bytes,
+        g_ld_texture_content.snapshot_bytes);
+}
+#if defined(YZ_PERF_PROFILE)
+static void ld_texture_content_profile(u32 frame,LONGLONG qpc)
+{
+    rsx_profile_buffer* csv=&g_ld_texture_content_csv;
+    static int initialized;
+    if (!initialized) {
+        initialized=1;
+        const char* output=getenv("RSX_PROFILE_CSV");
+        if (output && *output) {
+            char path[4096];
+            const int n=snprintf(path,sizeof path,"%s.texture-content.csv",output);
+            if (n>0 && n<sizeof path && !rsx_profile_buffer_init(csv,path,
+                "frame,qpc,requests,hits,misses,bypasses,evictions,entries,cpu_bytes,scratch_bytes,gpu_bytes,compared_bytes,snapshot_bytes\n",32768,320))
+                fprintf(stderr,"[profile-buffer] texture-content allocation failed\n");
+        }
+    }
+    if (csv->rows) rsx_profile_buffer_printf(csv,
+        "%u,%lld,%llu,%llu,%llu,%llu,%llu,%u,%llu,%u,%llu,%llu,%llu\n",
+        frame,qpc,g_ld_texture_content.requests,g_ld_texture_content.hits,
+        g_ld_texture_content.misses,g_ld_texture_content.bypasses,
+        g_ld_texture_content.evictions,g_ld_texture_content.count,
+        g_ld_texture_content.cpu_bytes,g_ld_texture_content.scratch_size,
+        g_ld_texture_content.gpu_bytes,g_ld_texture_content.compared_bytes,
+        g_ld_texture_content.snapshot_bytes);
+}
+#endif
 
 /* Cubemap faces are stored face-major in guest memory. D3D12 subresources use
  * that same order: face * mip_count + mip. */
 static ID3D12Resource* create_texture_cube(
-    DXGI_FORMAT fmt, const tex_level_t* lv, u32 n_mips)
+    DXGI_FORMAT fmt, const tex_level_t* lv, u32 n_mips,
+    ld_slow_texture_detail* slow_detail)
 {
     if (!n_mips) return NULL;
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -2279,11 +3283,27 @@ static ID3D12Resource* create_texture_cube(
     rd.Width = lv[0].w; rd.Height = lv[0].h; rd.DepthOrArraySize = 6;
     rd.MipLevels = (u16)n_mips; rd.Format = fmt; rd.SampleDesc.Count = 1;
     ID3D12Resource* tex = NULL;
-    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG create_begin = g_ld_profile.texture_decode_active
+        ? ld_profile_qpc() : 0;
+#endif
+    const u64 slow_create_begin = slow_detail ? ld_slow_draw_qpc() : 0;
+    const HRESULT create_result = g.dev->lpVtbl->CreateCommittedResource(
             g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
             D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-            &IID_ID3D12Resource, (void**)&tex)))
+            &IID_ID3D12Resource, (void**)&tex);
+    if (slow_detail) ld_slow_texture_resource_create(slow_detail, slow_create_begin);
+    if (FAILED(create_result)) {
+#if defined(YZ_PERF_PROFILE)
+        if (g_ld_profile.texture_decode_active)
+            ld_profile_note_texture_create(create_begin, &rd);
+#endif
         return NULL;
+    }
+#if defined(YZ_PERF_PROFILE)
+    if (g_ld_profile.texture_decode_active)
+        ld_profile_note_texture_create(create_begin, &rd);
+#endif
     for (u32 face = 0; face < 6; face++) {
         for (u32 mip = 0; mip < n_mips; mip++) {
             const tex_level_t* level = &lv[face * n_mips + mip];
@@ -2293,10 +3313,21 @@ static ID3D12Resource* create_texture_cube(
                 tex->lpVtbl->Release(tex);
                 return NULL;
             }
+#if defined(YZ_PERF_PROFILE)
+            const LONGLONG memcpy_begin = g_ld_profile.texture_decode_active
+                ? ld_profile_qpc() : 0;
+#endif
             for (u32 y = 0; y < level->rows; y++)
                 memcpy(g.upload_mapped + start + (size_t)y * pitch,
                        level->data + (size_t)y * level->row_bytes,
                        level->row_bytes);
+#if defined(YZ_PERF_PROFILE)
+            if (g_ld_profile.texture_decode_active) {
+                g_ld_profile.total.texture_decode_upload_memcpy_qpc +=
+                    (u64)(ld_profile_qpc() - memcpy_begin);
+                g_ld_profile.total.texture_decode_upload_rows += level->rows;
+            }
+#endif
             D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
             src.pResource = g.upload;
             src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -2309,8 +3340,19 @@ static ID3D12Resource* create_texture_cube(
             dst.pResource = tex;
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             dst.SubresourceIndex = face * n_mips + mip;
+#if defined(YZ_PERF_PROFILE)
+            const LONGLONG copy_begin = g_ld_profile.texture_decode_active
+                ? ld_profile_qpc() : 0;
+#endif
             g.list->lpVtbl->CopyTextureRegion(
                 g.list, &dst, 0, 0, 0, &src, NULL);
+#if defined(YZ_PERF_PROFILE)
+            if (g_ld_profile.texture_decode_active) {
+                g_ld_profile.total.texture_decode_copy_record_qpc +=
+                    (u64)(ld_profile_qpc() - copy_begin);
+                ++g_ld_profile.total.texture_decode_copy_regions;
+            }
+#endif
             g.upload_used = start + pitch * level->rows;
 #if defined(YZ_PERF_PROFILE)
             g_ld_profile.total.texture_upload_bytes +=
@@ -2325,8 +3367,27 @@ static ID3D12Resource* create_texture_cube(
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG barrier_begin = g_ld_profile.texture_decode_active
+        ? ld_profile_qpc() : 0;
+#endif
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+#if defined(YZ_PERF_PROFILE)
+    if (g_ld_profile.texture_decode_active) {
+        g_ld_profile.total.texture_decode_barrier_record_qpc +=
+            (u64)(ld_profile_qpc() - barrier_begin);
+        ++g_ld_profile.total.texture_decode_barriers;
+    }
+#endif
     return tex;
+}
+
+static ID3D12Resource* create_texture_rgba_scoped(const u8* rgba, u32 w, u32 h,
+    ld_slow_texture_detail* slow_detail)
+{
+    tex_level_t lv = { w, h, rgba, w * 4, h };
+    return create_texture_mipped_scoped(DXGI_FORMAT_R8G8B8A8_UNORM,
+        &lv, 1, slow_detail);
 }
 
 static ID3D12Resource* create_texture_rgba(const u8* rgba, u32 w, u32 h)
@@ -2392,7 +3453,10 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
 }
 
 #include "rsx_texture_hash.h"
-static u64 texture_content_hash_kind(const rsx_dsp_texture* t, int* readable, unsigned kind)
+static int texture_legacy_hash_enabled(void);
+static unsigned texture_hash_algorithm_kind(void);
+static u64 texture_content_hash_kind_scoped(const rsx_dsp_texture* t, int* readable,
+    unsigned kind, ld_slow_texture_detail* slow_detail)
 {
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG hash_begin = ld_profile_qpc();
@@ -2429,11 +3493,13 @@ static u64 texture_content_hash_kind(const rsx_dsp_texture* t, int* readable, un
           tsn++;
       } }
 
+    u64 hash_cycles_begin = 0;
+    const int hash_cycles_valid =
+        ld_slow_texture_hash_cycles_begin(slow_detail, &hash_cycles_begin);
     /* One hash per cached texture per presented frame.  Word-at-a-time FNV is
      * deliberately cheap; this is a mutation detector, not a content ID. */
     u64 hash = 1469598103934665603ull;
-    static int legacy_hash = -1;
-    if (legacy_hash < 0) legacy_hash = getenv("RSX_LEGACY_TEXTURE_HASH") != NULL;
+    const int legacy_hash = texture_legacy_hash_enabled();
     if (kind == 1) hash = rsx_texture_hash_xxh3(src, span);
     else if (!legacy_hash) hash = rsx_texture_hash(src, span);
     else {
@@ -2449,6 +3515,8 @@ static u64 texture_content_hash_kind(const rsx_dsp_texture* t, int* readable, un
         hash *= 1099511628211ull;
     }
     }
+    ld_slow_texture_hash_cycles_end(slow_detail, hash_cycles_begin,
+        hash_cycles_valid);
     *readable = 1;
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.texture_hash_bytes += span;
@@ -2456,28 +3524,83 @@ static u64 texture_content_hash_kind(const rsx_dsp_texture* t, int* readable, un
 #endif
     return hash;
 }
+static u64 texture_content_hash_kind(const rsx_dsp_texture* t, int* readable,
+    unsigned kind)
+{
+    return texture_content_hash_kind_scoped(t, readable, kind, NULL);
+}
 
 static unsigned texture_hash_kind(void) { return (g_ld_cpu_work >> 2) & 1u; }
+static int texture_watch_stamp(const rsx_dsp_texture* t, u64* stamp, u32* bytes)
+{
+    if (!(g_ld_cpu_work & 4096u) || !g_texture_watch.healthy) return 0;
+    static int observation = -1;
+    if (observation < 0) observation = getenv("LD_TEX_RACE") || getenv("LD_FBDBG");
+    if (observation) return 0; /* Preserve full-read diagnostic semantics. */
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG begin = ld_profile_qpc();
+#endif
+    const u32 span = texture_source_span(t);
+    const u8* source = span ? guest_ptr(t->location,t->offset,span) : NULL;
+    size_t dirty = 0;
+    const int healthy_before = g_texture_watch.healthy;
+    const int ok = source && rsx_texture_write_watch_stamp(&g_texture_watch,source,span,stamp,&dirty);
+    ++g_texture_watch_queries;
+    g_texture_watch_dirty_pages += dirty;
+    if (healthy_before && !g_texture_watch.healthy) {
+        ++g_texture_watch_failures;
+        fprintf(stderr,"[texture-write-watch] query failed; disabling reuse\n");
+    }
+    if (bytes) *bytes = span;
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.texture_watch_qpc += ld_profile_qpc()-begin;
+#endif
+    return ok;
+}
+static u64 texture_content_hash_scoped(const rsx_dsp_texture* t, int* readable,
+    ld_slow_texture_detail* slow_detail)
+{
+    return texture_content_hash_kind_scoped(t, readable, texture_hash_kind(), slow_detail);
+}
 static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
 {
-    return texture_content_hash_kind(t, readable, texture_hash_kind());
+    return texture_content_hash_scoped(t, readable, NULL);
 }
-static int texture_cached_content_changed(
-    texcache_t* entry, const rsx_dsp_texture* t, u64 hash, int* readable)
+static int texture_legacy_hash_enabled(void)
+{
+    static int legacy_hash = -1;
+    if (legacy_hash < 0) legacy_hash = getenv("RSX_LEGACY_TEXTURE_HASH") != NULL;
+    return legacy_hash;
+}
+static unsigned texture_hash_algorithm_kind(void)
+{
+    const unsigned kind = texture_hash_kind();
+    return kind == 1u ? 1u : (texture_legacy_hash_enabled() ? 2u : 0u);
+}
+static int texture_cached_content_changed_scoped(
+    texcache_t* entry, const rsx_dsp_texture* t, u64 hash, int* readable,
+    ld_slow_texture_detail* slow_detail)
 {
     if (!*readable) return 0;
     if (entry->content_hash_kind == texture_hash_kind())
         return hash != entry->content_hash;
     /* A benchmark toggle must not trigger fake uploads or conceal mutation. */
-    const u64 old_hash = texture_content_hash_kind(t, readable, entry->content_hash_kind);
+    const u64 old_hash = texture_content_hash_kind_scoped(t, readable,
+        entry->content_hash_kind, slow_detail);
     if (!*readable) return 0;
     if (old_hash != entry->content_hash) return 1;
     entry->content_hash = hash;
     entry->content_hash_kind = texture_hash_kind();
     return 0;
 }
+static int texture_cached_content_changed(
+    texcache_t* entry, const rsx_dsp_texture* t, u64 hash, int* readable)
+{
+    return texture_cached_content_changed_scoped(entry, t, hash, readable, NULL);
+}
 
-static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+static ID3D12Resource* decode_guest_texture_scoped(const rsx_dsp_texture* t,
+    u32 remap, ld_slow_texture_detail* slow_detail)
 {
     const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
     const int linear = (t->format & TEX_FMT_LINEAR) != 0;
@@ -2534,7 +3657,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
                     mh = mh > 1 ? mh >> 1 : 1;
                 }
             }
-            return create_texture_cube(dxgi, cube_levels, n_mips);
+            return create_texture_cube(dxgi, cube_levels, n_mips, slow_detail);
         }
         tex_level_t levels[14];
         u32 mw = w, mh = h, off = 0, n = 0;
@@ -2551,7 +3674,9 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
             mw = mw > 1 ? mw >> 1 : 1;
             mh = mh > 1 ? mh >> 1 : 1;
         }
-        return create_texture_mipped_cached(dxgi, levels, n);
+        return slow_detail
+            ? create_texture_mipped_cached_scoped(dxgi, levels, n, slow_detail)
+            : create_texture_mipped_cached(dxgi, levels, n);
     }
 
     u32 texel_size;
@@ -2623,7 +3748,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
         }
         ID3D12Resource* resource = (!oom && level == 6 * n_mips)
             ? create_texture_cube(
-                DXGI_FORMAT_R8G8B8A8_UNORM, cube_levels, n_mips)
+                DXGI_FORMAT_R8G8B8A8_UNORM, cube_levels, n_mips, slow_detail)
             : NULL;
         for (u32 i = 0; i < level; i++) free(rgba[i]);
         return resource;
@@ -2721,9 +3846,15 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
         mh = mh > 1 ? mh >> 1 : 1;
     }
     ID3D12Resource* resource = (!oom && n)
-        ? create_texture_mipped(DXGI_FORMAT_R8G8B8A8_UNORM, levels, n) : NULL;
+        ? create_texture_mipped_scoped(DXGI_FORMAT_R8G8B8A8_UNORM, levels, n,
+            slow_detail) : NULL;
     for (u32 m = 0; m < n; m++) free(rgba[m]);
     return resource;
+}
+
+static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
+{
+    return decode_guest_texture_scoped(t, remap, NULL);
 }
 
 static u64 texture_override_revision(const rsx_dsp_texture* t)
@@ -2736,11 +3867,20 @@ static u64 texture_override_revision(const rsx_dsp_texture* t)
 }
 
 static ID3D12Resource* decode_guest_texture_profiled(
-    const rsx_dsp_texture* texture, u32 remap, int* override_rgba)
+    const rsx_dsp_texture* texture, u32 remap, int* override_rgba,
+    ld_texture_decode_kind kind, ld_slow_texture_detail* slow_detail)
 {
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG begin = ld_profile_qpc();
     g_ld_profile.total.texture_decode_calls++;
+    if (kind == LD_TEXTURE_DECODE_MISS)
+        ++g_ld_profile.total.texture_decode_miss_calls;
+    else if (kind == LD_TEXTURE_DECODE_REFRESH)
+        ++g_ld_profile.total.texture_decode_refresh_calls;
+    else if (kind == LD_TEXTURE_DECODE_RETRY)
+        ++g_ld_profile.total.texture_decode_retry_calls;
+    g_ld_profile.texture_decode_active = 1;
+    g_ld_profile.texture_decode_kind = (u32)kind;
 #endif
     *override_rgba=0;
     ID3D12Resource* result = NULL;
@@ -2750,14 +3890,19 @@ static ID3D12Resource* decode_guest_texture_profiled(
         const u8* pixels=source ? g_texture_pixels(texture->format,
             texture->width,texture->height,source,bytes,g_texture_override_user) : NULL;
         if (pixels) {
-            result=create_texture_rgba(pixels,texture->width,texture->height);
+            result=create_texture_rgba_scoped(pixels,texture->width,
+                texture->height, slow_detail);
             if (result) *override_rgba=1;
         }
     }
-    if (!result) result = decode_guest_texture(texture, remap);
+    if (!result) result = slow_detail
+        ? decode_guest_texture_scoped(texture, remap, slow_detail)
+        : decode_guest_texture(texture, remap);
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.texture_decode_qpc +=
         (u64)(ld_profile_qpc() - begin);
+    g_ld_profile.texture_decode_active = 0;
+    g_ld_profile.texture_decode_kind = 0;
 #endif
     return result;
 }
@@ -2858,41 +4003,271 @@ static void texture_cache_unlink(u32 index)
     if (*link) *link = g.textures[index].hash_next;
 }
 
+/* BEGIN RSX_TEXTURE_DIAGNOSTIC_DEFERRED */
+#define LD_TEXTURE_DIAG_CAP 256u
+typedef enum {
+    LD_TEXTURE_DIAG_CACHE_FULL = 1,
+    LD_TEXTURE_DIAG_DECODE_FAILURE = 2,
+    LD_TEXTURE_DIAG_REFRESH = 3
+} ld_texture_diag_kind;
+typedef struct {
+    u64 count, evictions;
+    u32 kind, frame, slot, capacity;
+    u32 location, offset, format, width, height, pitch;
+} ld_texture_diag_event;
+typedef struct {
+    ld_texture_diag_event events[LD_TEXTURE_DIAG_CAP];
+    u64 records, overwritten;
+    u32 next, retained, dumped;
+} ld_texture_diag_ring;
+static ld_texture_diag_ring g_ld_texture_diag;
+static u32 g_ld_texture_refresh_count;
+
+/* One renderer/cache owner writes this fixed ring. No allocation, formatting,
+ * clock query, or I/O occurs here; records correspond to messages that the
+ * old throttled diagnostics would have printed. */
+static void ld_texture_diag_record(ld_texture_diag_kind kind, u64 count,
+    const rsx_dsp_texture* texture, u32 slot, u32 capacity, u64 evictions)
+{
+    ld_texture_diag_event* event = &g_ld_texture_diag.events[g_ld_texture_diag.next];
+    memset(event, 0, sizeof(*event));
+    event->kind = (u32)kind;
+    event->count = count;
+    event->evictions = evictions;
+    event->frame = g_ld_frames;
+    event->slot = slot;
+    event->capacity = capacity;
+    if (texture) {
+        event->location = texture->location;
+        event->offset = texture->offset;
+        event->format = texture->format;
+        event->width = texture->width;
+        event->height = texture->height;
+        event->pitch = texture->pitch;
+    }
+    g_ld_texture_diag.next = (g_ld_texture_diag.next + 1u) % LD_TEXTURE_DIAG_CAP;
+    if (g_ld_texture_diag.retained < LD_TEXTURE_DIAG_CAP)
+        ++g_ld_texture_diag.retained;
+    else
+        ++g_ld_texture_diag.overwritten;
+    ++g_ld_texture_diag.records;
+}
+
+static void ld_texture_diag_dump(void)
+{
+    if (g_ld_texture_diag.dumped) return;
+    g_ld_texture_diag.dumped = 1;
+    fprintf(stderr,
+        "[texture-diagnostic-summary] full=%llu decode_failures=%llu refreshes=%llu "
+        "records=%llu retained=%u overwritten=%llu capacity=%u\n",
+        (unsigned long long)g_ld_texture_cache_full,
+        (unsigned long long)g_ld_texture_decode_fail,
+        (unsigned long long)g_ld_texture_refresh_count,
+        (unsigned long long)g_ld_texture_diag.records,
+        g_ld_texture_diag.retained,
+        (unsigned long long)g_ld_texture_diag.overwritten,
+        LD_TEXTURE_DIAG_CAP);
+    const u32 first = (g_ld_texture_diag.next + LD_TEXTURE_DIAG_CAP -
+        g_ld_texture_diag.retained) % LD_TEXTURE_DIAG_CAP;
+    for (u32 i = 0; i < g_ld_texture_diag.retained; ++i) {
+        const ld_texture_diag_event* event =
+            &g_ld_texture_diag.events[(first + i) % LD_TEXTURE_DIAG_CAP];
+        switch ((ld_texture_diag_kind)event->kind) {
+        case LD_TEXTURE_DIAG_CACHE_FULL:
+            fprintf(stderr,
+                "[texture-cache] FULL cap=%u lru-evictions=%llu n=%llu frame=%u "
+                "src=%u:0x%08X fmt=0x%02X %ux%u pitch=%u slot=%u\n",
+                event->capacity, (unsigned long long)event->evictions,
+                (unsigned long long)event->count, event->frame,
+                event->location, event->offset, event->format, event->width,
+                event->height, event->pitch, event->slot);
+            break;
+        case LD_TEXTURE_DIAG_DECODE_FAILURE:
+            fprintf(stderr,
+                "[texture-cache] decode failed n=%llu src=%u:0x%08X "
+                "fmt=0x%02X %ux%u pitch=%u frame=%u slot=%u\n",
+                (unsigned long long)event->count, event->location, event->offset,
+                event->format, event->width, event->height, event->pitch,
+                event->frame, event->slot);
+            break;
+        case LD_TEXTURE_DIAG_REFRESH:
+            fprintf(stderr,
+                "[tex-refresh] n=%llu frame=%u unit-src=%u:0x%08X "
+                "fmt=0x%02X %ux%u pitch=%u slot=%u\n",
+                (unsigned long long)event->count, event->frame, event->location,
+                event->offset, event->format, event->width, event->height,
+                event->pitch, event->slot);
+            break;
+        default:
+            break;
+        }
+    }
+    fflush(stderr);
+}
+/* END RSX_TEXTURE_DIAGNOSTIC_DEFERRED */
+
+#if defined(YZ_PERF_PROFILE)
+/* Record descriptor identities only on misses. Bounded storage and shutdown
+ * output avoid disk traffic in the render loop. The content hash is already
+ * computed by the cache; this trace performs no additional guest reads. */
+static void texture_profile_miss(u32 slot, int evicted,
+    const texcache_t* replacement, u64 previous_use)
+{
+    rsx_profile_buffer* csv = &g_ld_texture_misses_csv;
+    static int initialized;
+    if (!initialized) {
+        initialized = 1;
+        const char* output = getenv("RSX_PROFILE_CSV");
+        if (output && *output) {
+            char path[4096];
+            const int n = snprintf(path, sizeof path, "%s.texture-misses.csv", output);
+            if (n > 0 && n < sizeof path && !rsx_profile_buffer_init(csv, path,
+                "event,frame,qpc,use_serial,slot,evicted,previous_use_serial,location,offset,format,width,height,pitch,remap,cubemap,mipmaps,dimension,content_hash,decoded\n",
+                65536, 320))
+                fprintf(stderr, "[profile-buffer] texture-misses allocation failed\n");
+        }
+    }
+    if (!csv->rows) return;
+    const texcache_t* e = replacement;
+    rsx_profile_buffer_printf(csv,
+        "%llu,%u,%lld,%llu,%u,%u,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%llu,%u\n",
+        (unsigned long long)csv->recorded, g_ld_frames, ld_profile_qpc(),
+        (unsigned long long)e->last_use_serial, slot, (unsigned)evicted,
+        (unsigned long long)previous_use, e->location, e->offset, e->format,
+        e->width, e->height, e->pitch, e->remap, e->cubemap, e->mipmaps,
+        e->dimension, (unsigned long long)e->content_hash, e->tex != NULL);
+}
+#endif
+
 /* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
  * descriptor-only cache, re-hash the source once per frame and refresh the
  * D3D resource when the game rewrites the same guest address. */
-static u32 texture_srv_slot(const rsx_dsp_texture* t)
+static u32 texture_srv_slot_scoped(const rsx_dsp_texture* t,
+    ld_slow_draw_scope* slow_scope, ld_slow_texture_detail* slow_detail)
 {
     const u32 remap = t->remap & 0xFFFF;
+    if (slow_detail) {
+        slow_detail->source_span = texture_source_span(t);
+        slow_detail->mipmaps = t->mipmaps;
+        slow_detail->hash_kind = texture_hash_algorithm_kind();
+    }
     static int refresh_enabled = -1;
     if (refresh_enabled < 0)
         refresh_enabled = getenv("RSX_NO_TEX_REFRESH") ? 0 : 1;
 
+    u64 phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
     const u32 bucket = texture_cache_bucket(t);
     const u64 override_revision=texture_override_revision(t);
     const u32 i = texture_cache_find(t, bucket);
+    ld_slow_texture_phase_end(slow_scope, slow_detail,
+        slow_detail ? &slow_detail->lookup_ticks : NULL, phase_begin);
     if (i != UINT32_MAX) {
         texcache_t* entry = &g.textures[i];
         /* Failed decodes need a cache identity too. Retry at most once per
          * frame so transient unmapped data can recover, without a full LRU
          * scan and decode attempt at every binding of an unsupported format. */
         if (!entry->tex && entry->last_hash_frame != g_ld_frames) {
+            if (slow_detail) slow_detail->outcome = LD_SLOW_TEXTURE_RETRY;
+            if (slow_detail) slow_detail->decode_attempted = 1;
             entry->last_hash_frame=g_ld_frames;
-            entry->tex=decode_guest_texture_profiled(t,remap,&entry->override_rgba);
+            phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
+            entry->tex=decode_guest_texture_profiled(
+                t, remap, &entry->override_rgba, LD_TEXTURE_DECODE_RETRY,
+                slow_detail);
+            ld_slow_texture_phase_end(slow_scope, slow_detail,
+                slow_detail ? &slow_detail->decode_ticks : NULL, phase_begin);
+            if (slow_detail) slow_detail->decode_succeeded = entry->tex != NULL;
             if (entry->tex) {
                 entry->override_revision=override_revision;
                 int readable=0;
-                entry->content_hash=texture_content_hash(t,&readable);
+                phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
+                entry->content_hash=texture_content_hash_scoped(t,&readable,slow_detail);
+                ld_slow_texture_phase_end(slow_scope, slow_detail,
+                    slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
                 entry->content_hash_kind=texture_hash_kind();
+                phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                 write_texture_srv(i,entry);
+                ld_slow_texture_phase_end(slow_scope, slow_detail,
+                    slow_detail ? &slow_detail->srv_ticks : NULL, phase_begin);
             } else ++g_ld_texture_decode_fail;
         }
+        if (slow_detail && slow_detail->outcome == LD_SLOW_TEXTURE_UNCLASSIFIED)
+            slow_detail->outcome = entry->tex ? LD_SLOW_TEXTURE_HIT : LD_SLOW_TEXTURE_NEGATIVE_HIT;
         const int override_changed=entry->override_revision!=override_revision;
         if ((refresh_enabled || override_changed) && entry->tex &&
             (entry->last_hash_frame != g_ld_frames || override_changed)) {
-            int readable = 0;
-            const u64 hash = texture_content_hash(t, &readable);
-            const int hash_changed = texture_cached_content_changed(entry,t,hash,&readable);
+            u64 watch_stamp = 0;
+            u32 watch_bytes = 0;
+            phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
+            int watch_valid = texture_watch_stamp(t,&watch_stamp,&watch_bytes);
+            ld_slow_texture_phase_end(slow_scope, slow_detail,
+                slow_detail ? &slow_detail->watch_ticks : NULL, phase_begin);
+            int skip = !override_changed && watch_valid && entry->write_watch_valid &&
+                entry->write_watch_stamp == watch_stamp &&
+                entry->content_hash_kind == texture_hash_kind();
+            static int validate = -1;
+            if (validate < 0) {
+                const char* option = getenv("RSX_TEXTURE_WRITE_WATCH_VALIDATE");
+                validate = option && *option == '1';
+            }
+            if (slow_detail) {
+                const int entry_valid = entry->write_watch_valid != 0;
+                const int stamp_match = entry->write_watch_stamp == watch_stamp;
+                const int hash_kind_match =
+                    entry->content_hash_kind == texture_hash_kind();
+                slow_detail->skip_evaluated = 1;
+                slow_detail->skip_override_changed = override_changed != 0;
+                slow_detail->skip_watch_valid = watch_valid != 0;
+                slow_detail->skip_entry_valid = entry_valid;
+                slow_detail->skip_stamp_match = stamp_match;
+                slow_detail->skip_hash_kind_match = hash_kind_match;
+                slow_detail->skip_validation = validate != 0;
+                slow_detail->skip_rejection_mask =
+                    (override_changed ? 1u : 0u) |
+                    (!watch_valid ? 2u : 0u) |
+                    (!entry_valid ? 4u : 0u) |
+                    (!stamp_match ? 8u : 0u) |
+                    (!hash_kind_match ? 16u : 0u);
+            }
+            int readable = skip && !validate;
+            phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
+            const u64 hash = readable ? entry->content_hash :
+                texture_content_hash_scoped(t, &readable, slow_detail);
+            ld_slow_texture_phase_end(slow_scope, slow_detail,
+                slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
+            if (skip && validate) {
+                ++g_texture_watch_audits;
+                u64 after = 0;
+                phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
+                const int stable = texture_watch_stamp(t,&after,NULL) && after == watch_stamp;
+                ld_slow_texture_phase_end(slow_scope, slow_detail,
+                    slow_detail ? &slow_detail->watch_ticks : NULL, phase_begin);
+                if (!stable) {
+                    ++g_texture_watch_races;
+                    watch_valid = 0;
+                    skip = 0;
+                } else if (!readable || hash != entry->content_hash) {
+                    ++g_texture_watch_failures;
+                    g_texture_watch.healthy = 0;
+                    watch_valid = 0; skip = 0;
+                    phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
+                    fprintf(stderr,"[texture-write-watch] unchanged-stamp hash mismatch; disabling reuse\n");
+                    ld_slow_texture_phase_end(slow_scope, slow_detail,
+                        slow_detail ? &slow_detail->log_ticks : NULL, phase_begin);
+                }
+            }
+            if (skip) {
+                if (slow_detail) slow_detail->watch_skipped = 1;
+                ++g_texture_watch_skips;
+                g_texture_watch_skip_bytes += watch_bytes;
+            }
+            /* A failed decode must not stamp old GPU contents as current. */
+            entry->write_watch_valid = 0;
+            phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
+            const int hash_changed = texture_cached_content_changed_scoped(
+                entry,t,hash,&readable,slow_detail);
+            ld_slow_texture_phase_end(slow_scope, slow_detail,
+                slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
              * reads are microseconds apart, so they can only disagree if a
              * guest thread is writing this texture right now -- i.e. we are
@@ -2902,11 +4277,15 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
               if (race < 0) race = getenv("LD_TEX_RACE") ? 1 : 0;
               if (race && readable) {
                   int r2 = 0;
-                  const u64 again = texture_content_hash(t, &r2);
+                  phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
+                  const u64 again = texture_content_hash_scoped(t, &r2, slow_detail);
+                  ld_slow_texture_phase_end(slow_scope, slow_detail,
+                      slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
                   static unsigned long long checks = 0, torn = 0;
                   checks++;
                   if (r2 && again != hash) torn++;
-                  if ((checks % 256) == 0)
+                  if ((checks % 256) == 0) {
+                      phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                       fprintf(stderr,
                               "[tex-race] src=%u:0x%08X %ux%u  torn %llu/%llu reads"
                               " (%.1f%%)\n",
@@ -2914,6 +4293,9 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                               (unsigned long long)torn,
                               (unsigned long long)checks,
                               100.0 * (double)torn / (double)checks);
+                      ld_slow_texture_phase_end(slow_scope, slow_detail,
+                          slow_detail ? &slow_detail->log_ticks : NULL, phase_begin);
+                  }
               } }
             /* LD_FBDBG=1: account for the PS1 framebuffer specifically
              * (location 1, offset 0x400000, the 1024x512 fmt 0xE2 texture the
@@ -2930,18 +4312,30 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                   checks++;
                   if (!readable) unread++;
                   if (hash_changed) changed++;
-                  if ((checks % 64) == 0 || checks < 4)
+                  if ((checks % 64) == 0 || checks < 4) {
+                      phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                       fprintf(stderr, "[fbdbg] ps1fb checks=%llu unreadable=%llu"
                                       " changed=%llu span=%u %ux%u pitch=%u\n",
                               checks, unread, changed,
                               texture_source_span(t), t->width, t->height,
                               t->pitch);
+                      ld_slow_texture_phase_end(slow_scope, slow_detail,
+                          slow_detail ? &slow_detail->log_ticks : NULL, phase_begin);
+                  }
               } }
             entry->last_hash_frame = g_ld_frames;
             if (hash_changed || override_changed) {
                 int override_rgba=0;
+                if (slow_detail) slow_detail->outcome = LD_SLOW_TEXTURE_REFRESH;
+                if (slow_detail) slow_detail->decode_attempted = 1;
+                phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                 ID3D12Resource* replacement =
-                    decode_guest_texture_profiled(t, remap, &override_rgba);
+                    decode_guest_texture_profiled(
+                        t, remap, &override_rgba, LD_TEXTURE_DECODE_REFRESH,
+                        slow_detail);
+                ld_slow_texture_phase_end(slow_scope, slow_detail,
+                    slow_detail ? &slow_detail->decode_ticks : NULL, phase_begin);
+                if (slow_detail) slow_detail->decode_succeeded = replacement != NULL;
                 if (replacement) {
                     ID3D12Resource* old = entry->tex;
                     entry->tex = replacement;
@@ -2949,17 +4343,25 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                     entry->override_revision=override_revision;
                     entry->content_hash = hash;
                     entry->content_hash_kind = texture_hash_kind();
+                    phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                     write_texture_srv(i, entry);
+                    ld_slow_texture_phase_end(slow_scope, slow_detail,
+                        slow_detail ? &slow_detail->srv_ticks : NULL, phase_begin);
+                    phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
                     retire_texture(old);
-                    static u32 refresh_count = 0;
-                    refresh_count++;
-                    if (refresh_count <= 64 || (refresh_count & 255) == 0)
-                        fprintf(stderr,
-                                "[tex-refresh] n=%u frame=%u unit-src=%u:0x%08X "
-                                "fmt=0x%02X %ux%u\n",
-                                refresh_count, g_ld_frames, t->location, t->offset,
-                                t->format, t->width, t->height);
+                    ld_slow_texture_phase_end(slow_scope, slow_detail,
+                        slow_detail ? &slow_detail->retire_ticks : NULL, phase_begin);
+                    ++g_ld_texture_refresh_count;
+                    if (g_ld_texture_refresh_count <= 64 ||
+                        (g_ld_texture_refresh_count & 255) == 0)
+                        ld_texture_diag_record(LD_TEXTURE_DIAG_REFRESH,
+                            g_ld_texture_refresh_count, t, i, 0, 0);
                 }
+            }
+            if (readable && entry->content_hash == hash &&
+                entry->override_revision == override_revision && g_texture_watch.healthy) {
+                entry->write_watch_valid = watch_valid;
+                entry->write_watch_stamp = watch_stamp;
             }
         }
         entry->last_use_serial = ++g_ld_texture_use_serial;
@@ -2990,10 +4392,9 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         evicted = g.textures[index].tex;
         if (g_ld_texture_cache_full <= 16 ||
             (g_ld_texture_cache_full & (g_ld_texture_cache_full - 1)) == 0)
-            fprintf(stderr,
-                    "[texture-cache] FULL cap=%u lru-evictions=%llu\n",
-                    MAX_TEXTURES,
-                    (unsigned long long)g_ld_texture_cache_evictions);
+            ld_texture_diag_record(LD_TEXTURE_DIAG_CACHE_FULL,
+                g_ld_texture_cache_full, t, index, MAX_TEXTURES,
+                g_ld_texture_cache_evictions);
     }
 
     texcache_t replacement;
@@ -3012,35 +4413,62 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     replacement.last_use_serial = ++g_ld_texture_use_serial;
     {
         int readable = 0;
-        replacement.content_hash = texture_content_hash(t, &readable);
+        phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
+        replacement.content_hash = texture_content_hash_scoped(t, &readable, slow_detail);
+        ld_slow_texture_phase_end(slow_scope, slow_detail,
+            slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
         replacement.content_hash_kind = texture_hash_kind();
     }
-    replacement.tex = decode_guest_texture_profiled(t, remap, &replacement.override_rgba);
+    if (slow_detail) {
+        slow_detail->outcome = LD_SLOW_TEXTURE_MISS;
+        slow_detail->cache_full = cache_was_full;
+        slow_detail->decode_attempted = 1;
+    }
+    phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
+    replacement.tex = decode_guest_texture_profiled(
+        t, remap, &replacement.override_rgba, LD_TEXTURE_DECODE_MISS,
+        slow_detail);
+    ld_slow_texture_phase_end(slow_scope, slow_detail,
+        slow_detail ? &slow_detail->decode_ticks : NULL, phase_begin);
+    if (slow_detail) slow_detail->decode_succeeded = replacement.tex != NULL;
     replacement.override_revision=override_revision;
     /* Commit negative entries even when full. Previously this branch kept the
      * old LRU entry on failure, so the same descriptor missed forever. */
     texcache_t* entry = &g.textures[index];
+#if defined(YZ_PERF_PROFILE)
+    texture_profile_miss(index, cache_was_full, &replacement,
+        cache_was_full ? entry->last_use_serial : 0);
+#endif
     if (cache_was_full) {
         texture_cache_unlink(index);
         ++g_ld_texture_cache_evictions;
     }
-    if (evicted) retire_texture(evicted);
+    if (evicted) {
+        phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
+        retire_texture(evicted);
+        ld_slow_texture_phase_end(slow_scope, slow_detail,
+            slow_detail ? &slow_detail->retire_ticks : NULL, phase_begin);
+    }
     *entry = replacement;
     texture_cache_link(index, bucket);
     if (replacement.tex) {
+        phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
         write_texture_srv(index, entry);
+        ld_slow_texture_phase_end(slow_scope, slow_detail,
+            slow_detail ? &slow_detail->srv_ticks : NULL, phase_begin);
     } else {
         g_ld_texture_decode_fail++;
         if (g_ld_texture_decode_fail <= 16 ||
             (g_ld_texture_decode_fail & (g_ld_texture_decode_fail - 1)) == 0)
-            fprintf(stderr,
-                    "[texture-cache] decode failed n=%llu src=%u:0x%08X "
-                    "fmt=0x%02X %ux%u pitch=%u\n",
-                    (unsigned long long)g_ld_texture_decode_fail,
-                    t->location, t->offset, t->format, t->width, t->height,
-                    t->pitch);
+            ld_texture_diag_record(LD_TEXTURE_DIAG_DECODE_FAILURE,
+                g_ld_texture_decode_fail, t, index, 0, 0);
     }
     return replacement.tex ? SRV_TEXTURE_BASE + index : SRV_WHITE;
+}
+
+static u32 texture_srv_slot(const rsx_dsp_texture* t)
+{
+    return texture_srv_slot_scoped(t, NULL, NULL);
 }
 
 typedef struct {
@@ -3456,6 +4884,8 @@ static int   s_csv_gate_open;
 
 static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
                        u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h);
+static int ld_blit_depth(u32 src_loc, u32 src_abs, u32 src_pitch,
+                        u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h);
 int rsx_live_draw_blit(u32 src_loc, u32 src_abs, u32 src_pitch,
                        u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h)
 {
@@ -3608,7 +5038,8 @@ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
     if (!g.ready || !src_pitch || !dst_pitch || !w || !h) return 0;
     u32 sx, sy, dx = 0, dy = 0;
     const int si = surface_containing(src_loc, src_abs, src_pitch, w, h, &sx, &sy);
-    if (si < 0) return -1;            /* source is not a live surface */
+    if (si < 0) return ld_blit_depth(src_loc, src_abs, src_pitch,
+        dst_loc, dst_abs, dst_pitch, w, h);
     int di = surface_containing(dst_loc, dst_abs, dst_pitch, w, h, &dx, &dy);
     if (di < 0) {
         const u32 slot = surface_get(dst_loc, dst_abs, dst_pitch / 4u, h,
@@ -3666,6 +5097,31 @@ static u32 current_surface(void)
                            : DXGI_FORMAT_R8G8B8A8_UNORM);
 }
 
+static u32 surface_get_slow_draw(ld_slow_draw_scope* slow_draw,
+    u32 location, u32 offset, u32 width, u32 height, DXGI_FORMAT format)
+{
+    const u64 begin = ld_slow_resource_begin(slow_draw);
+    const u32 slot = surface_get(location, offset, width, height, format);
+    ld_slow_resource_finish(slow_draw, LD_SLOW_RESOURCE_SURFACE, begin,
+        location, offset, (u32)format, width, height, slot);
+    return slot;
+}
+
+static u32 current_surface_slow_draw(ld_slow_draw_scope* slow_draw)
+{
+    const u64 begin = ld_slow_resource_begin(slow_draw);
+    const u32 slot = current_surface();
+    const u64 end = ld_slow_draw_qpc();
+    rsx_dsp_surface sf;
+    rsx_dsp_get_surface(&g.rsx, &sf);
+    const DXGI_FORMAT format = sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+        ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+    ld_slow_resource_finish_at(slow_draw, LD_SLOW_RESOURCE_SURFACE, begin,
+        sf.color_location[0], sf.color_offset[0], (u32)format,
+        sf.clip_w, sf.clip_h, slot, end);
+    return slot;
+}
+
 /* On RSX each zeta (depth) address is distinct memory. The offline renderer's
  * s31 fix proved that sharing one D3D depth resource across all of this game's
  * shadow, scene and post-processing passes cross-contaminates later depth
@@ -3695,6 +5151,8 @@ static D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle(u32 slot)
 static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
 {
     if (!honor_zeta_track()) return 0;
+    rsx_dsp_surface guest_surface;
+    rsx_dsp_get_surface(&g.rsx, &guest_surface);
     /* The DSV must cover the complete live framebuffer/viewport it is bound
      * with.  Some early passes declare a smaller clip than the active canvas;
      * allocating only that clip causes the D3D device to reject later
@@ -3710,6 +5168,17 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     for (u32 i = 0; i < g.n_zdepths; i++) {
         zdepth_t* z = &g.zdepths[i];
         if (z->location == location && z->offset == offset) {
+            if (guest_surface.zeta_location == location && guest_surface.zeta_offset == offset) {
+                const u32 guest_w = rt_w ? rt_w : g.width;
+                const u32 guest_h = rt_h ? rt_h : g.height;
+                if (z->guest_w != guest_w || z->guest_h != guest_h ||
+                    z->pitch != guest_surface.zeta_pitch || z->format != guest_surface.depth_format)
+                    ++z->generation;
+                z->guest_w = guest_w;
+                z->guest_h = guest_h;
+                z->pitch = guest_surface.zeta_pitch;
+                z->format = guest_surface.depth_format;
+            }
             if (z->w >= want_w && z->h >= want_h) return 1 + i;
             slot = i;
             break;
@@ -3772,6 +5241,11 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     }
     z->location = location;
     z->offset = offset;
+    z->guest_w = rt_w ? rt_w : g.width;
+    z->guest_h = rt_h ? rt_h : g.height;
+    z->pitch = guest_surface.zeta_pitch;
+    z->format = guest_surface.depth_format;
+    ++z->generation;
     z->w = want_w;
     z->h = want_h;
     z->had_write = 0;
@@ -3916,6 +5390,143 @@ static int zdepth_snapshot(u32 slot)
     return 1;
 }
 
+/* Z24S8 may be read through an A8R8G8B8 view. Its big-endian guest bytes
+ * become A=depth[23:16], R=depth[15:8], G=depth[7:0], B=stencil.
+ * Keep this snapshot separate from the scalar depth SRV used by shadows. */
+static int zdepth_pack(u32 index, u32 guest_w, u32 guest_h)
+{
+    if (index >= g.n_zdepths || !g.depth_pack_pso || !guest_w || !guest_h) return 0;
+    zdepth_t* z = &g.zdepths[index];
+    if (z->format != 2 || !z->tex || (u64)guest_w * 4 > z->pitch || guest_h > z->guest_h) return 0;
+    u32 w, h;
+    rsx_render_surface_extent(&g_ld_resolution, guest_w, guest_h, &w, &h);
+    if (w > 16384 || h > 16384 || g.srv_ring_used >= SRV_RING_TABLES) return 0;
+    if (!z->packed || z->packed_w != w || z->packed_h != h) {
+        if (z->packed) { retire_texture(z->packed); z->packed = NULL; }
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = w; rd.Height = h; rd.DepthOrArraySize = rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp,
+                D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                NULL, &IID_ID3D12Resource, (void**)&z->packed))) return 0;
+        z->packed_w = w; z->packed_h = h;
+        z->packed_generation = UINT64_MAX;
+        srv_write(SRV_PACKED_DEPTH_BASE + index, z->packed);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {0};
+        ud.Format = rd.Format; ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        g.dev->lpVtbl->CreateUnorderedAccessView(g.dev, z->packed, NULL, &ud,
+            srv_cpu(UAV_PACKED_DEPTH_BASE + index));
+    }
+    if (z->packed_generation == z->generation && z->packed_guest_w == guest_w &&
+        z->packed_guest_h == guest_h) return 1;
+    z->packed_guest_w = guest_w; z->packed_guest_h = guest_h;
+    srv_write_depth_source(SRV_DEPTH_SOURCE_BASE + index, z->tex);
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {0};
+    sd.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = 1; sd.Texture2D.PlaneSlice = 1;
+    g.dev->lpVtbl->CreateShaderResourceView(g.dev, z->tex, &sd,
+        srv_cpu(SRV_STENCIL_SOURCE_BASE + index));
+    const u32 descriptors[3] = {SRV_DEPTH_SOURCE_BASE + index,
+        SRV_STENCIL_SOURCE_BASE + index, UAV_PACKED_DEPTH_BASE + index};
+    const u32 base = g.srv_ring_used++ * SRV_TABLE_SIZE;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+    g.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(g.srv_heap, &cpu);
+    g.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(g.srv_heap, &gpu);
+    cpu.ptr += (size_t)base * g.srv_step; gpu.ptr += (u64)base * g.srv_step;
+    for (u32 i = 0; i < 3; ++i) {
+        g.dev->lpVtbl->CopyDescriptorsSimple(g.dev, 1, cpu, srv_cpu(descriptors[i]),
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        cpu.ptr += g.srv_step;
+    }
+    D3D12_RESOURCE_BARRIER bars[2] = {0};
+    for (u32 i = 0; i < 2; ++i) {
+        bars[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bars[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    bars[0].Transition.pResource = z->tex;
+    bars[0].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    bars[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    bars[1].Transition.pResource = z->packed;
+    bars[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    bars[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, bars);
+    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
+    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+    g.list->lpVtbl->SetPipelineState(g.list, g.depth_pack_pso);
+    g.list->lpVtbl->SetComputeRootSignature(g.list, g.depth_pack_rootsig);
+    g.list->lpVtbl->SetComputeRootDescriptorTable(g.list, 0, gpu);
+    gpu.ptr += 2u * g.srv_step;
+    g.list->lpVtbl->SetComputeRootDescriptorTable(g.list, 1, gpu);
+    u32 source_w, source_h;
+    rsx_render_surface_extent(&g_ld_resolution, z->guest_w, z->guest_h, &source_w, &source_h);
+    float scale[2] = {(float)guest_w / w * source_w / z->guest_w,
+                      (float)guest_h / h * source_h / z->guest_h};
+    g.list->lpVtbl->SetComputeRoot32BitConstants(g.list, 2, 2, scale, 0);
+    g.list->lpVtbl->Dispatch(g.list, (w + 7) / 8, (h + 7) / 8, 1);
+    for (u32 i = 0; i < 2; ++i) {
+        D3D12_RESOURCE_STATES before = bars[i].Transition.StateBefore;
+        bars[i].Transition.StateBefore = bars[i].Transition.StateAfter;
+        bars[i].Transition.StateAfter = before;
+    }
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, bars);
+    z->packed_generation = z->generation;
+    return 1;
+}
+
+static int ld_blit_depth(u32 sl, u32 sa, u32 sp, u32 dl, u32 da, u32 dp, u32 w, u32 h)
+{
+    for (u32 zi = 0; zi < g.n_zdepths; ++zi) {
+        zdepth_t* z = &g.zdepths[zi];
+        if (z->location != sl || z->offset != sa || z->pitch != sp ||
+            w > sp / 4 || w > dp / 4 || h > z->guest_h || ((sa | da | sp | dp) & 3u)) continue;
+        if (!zdepth_pack(zi, sp / 4, z->guest_h)) return -1;
+        u32 dx = 0, dy = 0;
+        int di = surface_containing(dl, da, dp, w, h, &dx, &dy);
+        if (di < 0) di = (int)surface_get(dl, da, dp / 4, h, DXGI_FORMAT_R8G8B8A8_UNORM);
+        if ((u32)di >= g.n_surfaces || g.surfaces[di].fmt != DXGI_FORMAT_R8G8B8A8_UNORM) return -2;
+        surface_t* dst = &g.surfaces[di];
+        const u32 cw = rsx_render_edge(w, z->packed_guest_w, z->packed_w);
+        const u32 ch = rsx_render_edge(h, z->packed_guest_h, z->packed_h);
+        const u32 ex = rsx_render_edge(dx + w, dst->guest_w, dst->w);
+        const u32 ey = rsx_render_edge(dy + h, dst->guest_h, dst->h);
+        dx = rsx_render_edge(dx, dst->guest_w, dst->w);
+        dy = rsx_render_edge(dy, dst->guest_h, dst->h);
+        if (ex > dst->w || ey > dst->h || ex - dx != cw || ey - dy != ch) return -6;
+        D3D12_RESOURCE_BARRIER bars[2] = {0};
+        for (u32 i = 0; i < 2; ++i) {
+            bars[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            bars[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        bars[0].Transition.pResource = z->packed;
+        bars[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        bars[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        bars[1].Transition.pResource = dst->tex;
+        bars[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        bars[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        g.list->lpVtbl->ResourceBarrier(g.list, 2, bars);
+        D3D12_TEXTURE_COPY_LOCATION src = {0}, dest = {0};
+        src.pResource = z->packed; dest.pResource = dst->tex;
+        src.Type = dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_BOX box = {0, 0, 0, cw, ch, 1};
+        g.list->lpVtbl->CopyTextureRegion(g.list, &dest, dx, dy, 0, &src, &box);
+        for (u32 i = 0; i < 2; ++i) {
+            D3D12_RESOURCE_STATES before = bars[i].Transition.StateBefore;
+            bars[i].Transition.StateBefore = bars[i].Transition.StateAfter;
+            bars[i].Transition.StateAfter = before;
+        }
+        g.list->lpVtbl->ResourceBarrier(g.list, 2, bars);
+        ld_surface_note_write((u32)di, LD_SURFACE_WRITE_COPY);
+        return 1;
+    }
+    return -1;
+}
+
 /* ---------------------------------------------------------------------------
  * PSO cache (VP+FP+render-state keyed)
  * -----------------------------------------------------------------------*/
@@ -3941,10 +5552,15 @@ static u32 shader_disk_cache_stage_index(u32 stage)
     return stage == 'V' ? 0u : 1u;
 }
 
-static void shader_disk_cache_progress(u64 value)
+static int shader_disk_cache_progress_due(u64 value)
 {
-    if (value > 4u && (value & (value - 1u)) != 0u)
-        return;
+    return value <= 4u || (value & (value - 1u)) == 0u;
+}
+
+static int shader_disk_cache_progress(u64 value)
+{
+    if (!shader_disk_cache_progress_due(value))
+        return 0;
     fprintf(stderr,
             "[shader-disk-cache] hits{vs=%llu ps=%llu} "
             "misses{vs=%llu ps=%llu} writes{vs=%llu ps=%llu} "
@@ -3956,6 +5572,28 @@ static void shader_disk_cache_progress(u64 value)
             (unsigned long long)g_ld_shader_disk_writes[0],
             (unsigned long long)g_ld_shader_disk_writes[1],
             (unsigned long long)g_ld_shader_disk_rejects);
+    return 1;
+}
+
+/* Loads and stores share the progress message, but only load-side output is
+ * included in the load subphase counters below. */
+static void shader_disk_cache_load_progress(u64 value)
+{
+#if defined(YZ_PERF_PROFILE)
+    if (!shader_disk_cache_progress_due(value)) {
+        (void)shader_disk_cache_progress(value);
+        return;
+    }
+    const LONGLONG begin = ld_profile_qpc();
+    const int emitted = shader_disk_cache_progress(value);
+    if (emitted) {
+        g_ld_profile.total.shader_disk_load_progress_qpc +=
+            ld_profile_qpc() - begin;
+        ++g_ld_profile.total.shader_disk_load_progress_writes;
+    }
+#else
+    (void)shader_disk_cache_progress(value);
+#endif
 }
 
 static int shader_disk_cache_prepare(void)
@@ -4011,7 +5649,660 @@ static int shader_disk_cache_path(
     return length > 0 && length < MAX_PATH;
 }
 
-static ID3DBlob* shader_disk_cache_load(
+/* BEGIN RSX SHADER BUNDLE */
+#define SHADER_BUNDLE_MAGIC "HZSHBND1"
+#define SHADER_BUNDLE_SCHEMA_VERSION 1u
+#define SHADER_BUNDLE_COMPILER_TAG 0xD59F4A31u /* D3DCompile vs/ps_5_0, flags=0 */
+#define SHADER_BUNDLE_MAX_BYTES (64u * 1024u * 1024u)
+#define SHADER_BUNDLE_MAX_ENTRIES (2u * MAX_SHADER_BLOBS)
+#define SHADER_BUNDLE_MAX_MERGE_ITEMS (2u * SHADER_BUNDLE_MAX_ENTRIES)
+#define SHADER_BUNDLE_MAX_SOURCE (256u * 1024u)
+#define SHADER_BUNDLE_MAX_BLOB SHADER_DISK_CACHE_MAX_BLOB
+
+typedef struct shader_bundle_header {
+    char magic[8];
+    u32 schema_version;
+    u32 disk_cache_version;
+    u32 compiler_tag;
+    u32 entry_count;
+    u32 entry_size;
+    u32 total_size;
+    u32 index_offset;
+    u32 data_offset;
+} shader_bundle_header;
+
+typedef struct shader_bundle_record {
+    u32 stage;
+    u32 reserved;
+    u64 hash;
+    u32 source_length;
+    u32 blob_length;
+    u32 source_offset;
+    u32 blob_offset;
+    u64 blob_hash;
+} shader_bundle_record;
+
+typedef struct shader_bundle_view {
+    const u8* bytes;
+    size_t size;
+    u32 count;
+    const shader_bundle_record* records;
+} shader_bundle_view;
+
+typedef struct shader_bundle_item {
+    u32 stage;
+    u64 hash;
+    u32 source_length;
+    u32 blob_length;
+    const u8* source;
+    const u8* blob;
+} shader_bundle_item;
+
+typedef char shader_bundle_header_must_be_40_bytes[
+    sizeof(shader_bundle_header) == 40 ? 1 : -1];
+typedef char shader_bundle_record_must_be_40_bytes[
+    sizeof(shader_bundle_record) == 40 ? 1 : -1];
+
+static u64 shader_bundle_hash(const u8* source, u32 length)
+{
+    u64 hash = 1469598103934665603ull;
+    u32 i;
+    for (i = 0; i < length; ++i) {
+        hash ^= source[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static u64 shader_bundle_blob_hash(const u8* blob, u32 length)
+{
+    return shader_bundle_hash(blob, length);
+}
+
+static int shader_bundle_key_order(
+    u32 stage_a, u64 hash_a, u32 length_a, const u8* source_a,
+    u32 stage_b, u64 hash_b, u32 length_b, const u8* source_b)
+{
+    if (stage_a != stage_b) return stage_a < stage_b ? -1 : 1;
+    if (hash_a != hash_b) return hash_a < hash_b ? -1 : 1;
+    if (length_a != length_b) return length_a < length_b ? -1 : 1;
+    if (!length_a) return 0;
+    {
+        const int result = memcmp(source_a, source_b, length_a);
+        return result < 0 ? -1 : result > 0 ? 1 : 0;
+    }
+}
+
+static int shader_bundle_item_compare(const void* left, const void* right)
+{
+    const shader_bundle_item* a = (const shader_bundle_item*)left;
+    const shader_bundle_item* b = (const shader_bundle_item*)right;
+    return shader_bundle_key_order(
+        a->stage, a->hash, a->source_length, a->source,
+        b->stage, b->hash, b->source_length, b->source);
+}
+
+/* The v1 layout is canonical: index immediately follows the header; source
+ * and blob bytes follow records in index order with no gaps or aliases. */
+static int shader_bundle_parse(
+    const void* data, size_t length, shader_bundle_view* out)
+{
+    const u8* bytes = (const u8*)data;
+    const shader_bundle_header* header;
+    const shader_bundle_record* records;
+    size_t expected;
+    u32 i;
+    if (out) memset(out, 0, sizeof(*out));
+    if (!bytes || !out || length < sizeof(shader_bundle_header) ||
+        length > SHADER_BUNDLE_MAX_BYTES)
+        return 0;
+    header = (const shader_bundle_header*)bytes;
+    if (memcmp(header->magic, SHADER_BUNDLE_MAGIC, 8) != 0 ||
+        header->schema_version != SHADER_BUNDLE_SCHEMA_VERSION ||
+        header->disk_cache_version != SHADER_DISK_CACHE_VERSION ||
+        header->compiler_tag != SHADER_BUNDLE_COMPILER_TAG ||
+        header->entry_count > SHADER_BUNDLE_MAX_ENTRIES ||
+        header->entry_size != sizeof(shader_bundle_record) ||
+        header->total_size != length ||
+        header->index_offset != sizeof(shader_bundle_header) ||
+        header->data_offset != sizeof(shader_bundle_header) +
+            (size_t)header->entry_count * sizeof(shader_bundle_record) ||
+        header->data_offset > header->total_size)
+        return 0;
+    records = (const shader_bundle_record*)(bytes + header->index_offset);
+    expected = header->data_offset;
+    for (i = 0; i < header->entry_count; ++i) {
+        const shader_bundle_record* record = &records[i];
+        const u8* source;
+        if ((record->stage != (u32)'V' && record->stage != (u32)'P') ||
+            record->reserved != 0 ||
+            record->source_length > SHADER_BUNDLE_MAX_SOURCE ||
+            !record->blob_length ||
+            record->blob_length > SHADER_BUNDLE_MAX_BLOB ||
+            record->source_offset != expected ||
+            record->source_length > header->total_size - expected)
+            return 0;
+        source = bytes + record->source_offset;
+        expected += record->source_length;
+        if (record->blob_offset != expected ||
+            record->blob_length > header->total_size - expected)
+            return 0;
+        if (shader_bundle_blob_hash(bytes + record->blob_offset,
+                record->blob_length) != record->blob_hash)
+            return 0;
+        expected += record->blob_length;
+        if (shader_bundle_hash(source, record->source_length) != record->hash)
+            return 0;
+        if (i && shader_bundle_key_order(
+                records[i - 1].stage, records[i - 1].hash,
+                records[i - 1].source_length,
+                bytes + records[i - 1].source_offset,
+                record->stage, record->hash, record->source_length,
+                source) >= 0)
+            return 0;
+    }
+    if (expected != header->total_size)
+        return 0;
+    out->bytes = bytes;
+    out->size = length;
+    out->count = header->entry_count;
+    out->records = records;
+    return 1;
+}
+
+static const shader_bundle_record* shader_bundle_find(
+    const shader_bundle_view* view, u32 stage, const char* source,
+    u32 source_length, u64 hash)
+{
+    u32 low = 0, high;
+    if (!view || !view->bytes || (!source && source_length) ||
+        source_length > SHADER_BUNDLE_MAX_SOURCE)
+        return NULL;
+    high = view->count;
+    while (low < high) {
+        const u32 middle = low + (high - low) / 2u;
+        const shader_bundle_record* record = &view->records[middle];
+        if (record->stage < stage ||
+            (record->stage == stage && record->hash < hash) ||
+            (record->stage == stage && record->hash == hash &&
+             record->source_length < source_length))
+            low = middle + 1u;
+        else
+            high = middle;
+    }
+    while (low < view->count) {
+        const shader_bundle_record* record = &view->records[low++];
+        if (record->stage != stage || record->hash != hash ||
+            record->source_length != source_length)
+            break;
+        if (!source_length || !memcmp(view->bytes + record->source_offset,
+                    source, source_length))
+            return record;
+    }
+    return NULL;
+}
+
+static int shader_bundle_serialize(
+    shader_bundle_item* items, u32 count, u8** out_data, size_t* out_size)
+{
+    shader_bundle_header* header;
+    shader_bundle_record* records;
+    size_t total, data_offset;
+    u32 i, unique_count;
+    u8* bytes;
+    if (!out_data || !out_size) return 0;
+    *out_data = NULL;
+    *out_size = 0;
+    if (count > SHADER_BUNDLE_MAX_MERGE_ITEMS || (count && !items)) return 0;
+    for (i = 0; i < count; ++i) {
+        const shader_bundle_item* item = &items[i];
+        if ((item->stage != (u32)'V' && item->stage != (u32)'P') ||
+            (!item->source && item->source_length) || !item->blob ||
+            item->source_length > SHADER_BUNDLE_MAX_SOURCE ||
+            !item->blob_length || item->blob_length > SHADER_BUNDLE_MAX_BLOB ||
+            shader_bundle_hash(item->source, item->source_length) != item->hash)
+            return 0;
+    }
+    qsort(items, count, sizeof(*items), shader_bundle_item_compare);
+    unique_count = 0;
+    for (i = 0; i < count; ++i) {
+        if (unique_count && shader_bundle_item_compare(
+                &items[unique_count - 1u], &items[i]) == 0) {
+            const shader_bundle_item* previous = &items[unique_count - 1u];
+            if (previous->blob_length != items[i].blob_length ||
+                memcmp(previous->blob, items[i].blob, previous->blob_length))
+                return 0;
+            continue;
+        }
+        if (unique_count && items[unique_count - 1u].stage == items[i].stage &&
+            items[unique_count - 1u].hash == items[i].hash &&
+            items[unique_count - 1u].source_length == items[i].source_length)
+            return 0; /* same hash key with distinct bytes: refuse ambiguity */
+        if (unique_count != i) items[unique_count] = items[i];
+        ++unique_count;
+        if (unique_count > SHADER_BUNDLE_MAX_ENTRIES) return 0;
+    }
+    data_offset = sizeof(shader_bundle_header) +
+        (size_t)unique_count * sizeof(shader_bundle_record);
+    total = data_offset;
+    for (i = 0; i < unique_count; ++i) {
+        if (items[i].source_length > SHADER_BUNDLE_MAX_BYTES - total)
+            return 0;
+        total += items[i].source_length;
+        if (items[i].blob_length > SHADER_BUNDLE_MAX_BYTES - total)
+            return 0;
+        total += items[i].blob_length;
+    }
+    if (total > SHADER_BUNDLE_MAX_BYTES || total > 0xffffffffu)
+        return 0;
+    bytes = (u8*)calloc(1, total ? total : sizeof(shader_bundle_header));
+    if (!bytes) return 0;
+    header = (shader_bundle_header*)bytes;
+    memcpy(header->magic, SHADER_BUNDLE_MAGIC, 8);
+    header->schema_version = SHADER_BUNDLE_SCHEMA_VERSION;
+    header->disk_cache_version = SHADER_DISK_CACHE_VERSION;
+    header->compiler_tag = SHADER_BUNDLE_COMPILER_TAG;
+    header->entry_count = unique_count;
+    header->entry_size = sizeof(shader_bundle_record);
+    header->total_size = (u32)total;
+    header->index_offset = sizeof(shader_bundle_header);
+    header->data_offset = (u32)data_offset;
+    records = (shader_bundle_record*)(bytes + header->index_offset);
+    total = data_offset;
+    for (i = 0; i < unique_count; ++i) {
+        shader_bundle_record* record = &records[i];
+        const shader_bundle_item* item = &items[i];
+        record->stage = item->stage;
+        record->hash = item->hash;
+        record->source_length = item->source_length;
+        record->blob_length = item->blob_length;
+        record->source_offset = (u32)total;
+        if (item->source_length)
+            memcpy(bytes + total, item->source, item->source_length);
+        total += item->source_length;
+        record->blob_offset = (u32)total;
+        memcpy(bytes + total, item->blob, item->blob_length);
+        record->blob_hash = shader_bundle_blob_hash(
+            bytes + total, item->blob_length);
+        total += item->blob_length;
+    }
+    *out_data = bytes;
+    *out_size = total;
+    return 1;
+}
+/* END RSX SHADER BUNDLE */
+
+static u8* g_shader_bundle_bytes;
+static shader_bundle_view g_shader_bundle;
+static volatile LONG g_shader_bundle_dump_state;
+static volatile LONG64 g_shader_bundle_hits;
+static volatile LONG64 g_shader_bundle_misses;
+static volatile LONG64 g_shader_bundle_fallbacks;
+static volatile LONG64 g_shader_bundle_saved_bytes;
+static volatile LONG g_shader_bundle_saved_entries;
+
+static int shader_bundle_path(char path[MAX_PATH])
+{
+    const int length = snprintf(
+        path, MAX_PATH, "%s\\shader_cache.bundle", g_ld_shader_disk_dir);
+    return length > 0 && length < MAX_PATH;
+}
+
+/* BEGIN RSX SHADER BUNDLE PERSIST */
+/* Return 1 for a valid existing bundle, 0 if absent, and -1 for an existing
+ * but unreadable/invalid bundle. Callers never overwrite the latter. */
+static int shader_bundle_read_file(
+    const char* path, u8** data, size_t* size, shader_bundle_view* view)
+{
+    HANDLE file;
+    LARGE_INTEGER file_size;
+    u8* bytes;
+    DWORD got;
+    size_t offset = 0;
+    if (data) *data = NULL;
+    if (size) *size = 0;
+    if (view) memset(view, 0, sizeof(*view));
+    if (!data || !size || !view) return -1;
+    file = CreateFileA(path, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND
+            ? 0 : -1;
+    }
+    if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart < 0 ||
+        (u64)file_size.QuadPart > SHADER_BUNDLE_MAX_BYTES) {
+        CloseHandle(file);
+        return -1;
+    }
+    bytes = (u8*)malloc((size_t)file_size.QuadPart);
+    if (!bytes) {
+        CloseHandle(file);
+        return -1;
+    }
+    while (offset < (size_t)file_size.QuadPart) {
+        const DWORD request = (DWORD)(((size_t)file_size.QuadPart - offset) >
+            1024u * 1024u ? 1024u * 1024u :
+            (size_t)file_size.QuadPart - offset);
+        if (!ReadFile(file, bytes + offset, request, &got, NULL) ||
+            !got || got > request) {
+            free(bytes);
+            CloseHandle(file);
+            return -1;
+        }
+        offset += got;
+    }
+    CloseHandle(file);
+    if (!shader_bundle_parse(bytes, offset, view)) {
+        free(bytes);
+        return -1;
+    }
+    *data = bytes;
+    *size = offset;
+    return 1;
+}
+
+static int shader_bundle_lock_file(
+    const char* path, HANDLE* lock_file, OVERLAPPED* lock_state)
+{
+    char lock_path[MAX_PATH];
+    const int length = snprintf(lock_path, sizeof(lock_path), "%s.lock", path);
+    ULONGLONG start;
+    if (length <= 0 || length >= (int)sizeof(lock_path)) return 0;
+    *lock_file = CreateFileA(lock_path, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, NULL);
+    if (*lock_file == INVALID_HANDLE_VALUE) return 0;
+    memset(lock_state, 0, sizeof(*lock_state));
+    start = GetTickCount64();
+    for (;;) {
+        if (LockFileEx(*lock_file,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0, 1, 0, lock_state))
+            return 1;
+        if (GetLastError() != ERROR_LOCK_VIOLATION ||
+            GetTickCount64() - start >= 5000u) {
+            CloseHandle(*lock_file);
+            *lock_file = INVALID_HANDLE_VALUE;
+            return 0;
+        }
+        Sleep(10);
+    }
+}
+
+static int shader_bundle_persist_file(
+    const char* path, const shader_bundle_item* incoming, u32 incoming_count,
+    u32* saved_entries, size_t* saved_bytes)
+{
+    HANDLE lock_file = INVALID_HANDLE_VALUE;
+    OVERLAPPED lock_state;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    char temporary[MAX_PATH] = {0};
+    u8* old_bytes = NULL;
+    size_t old_size = 0, output_size = 0;
+    shader_bundle_view old_view;
+    shader_bundle_item* merged = NULL;
+    u8* output = NULL;
+    u32 count = 0, i;
+    int old_result, success = 0;
+    LARGE_INTEGER nonce;
+    if (saved_entries) *saved_entries = 0;
+    if (saved_bytes) *saved_bytes = 0;
+    if (!path || incoming_count > SHADER_BUNDLE_MAX_ENTRIES ||
+        (incoming_count && !incoming) ||
+        !shader_bundle_lock_file(path, &lock_file, &lock_state))
+        return 0;
+
+    old_result = shader_bundle_read_file(path, &old_bytes, &old_size, &old_view);
+    if (old_result < 0)
+        goto done; /* preserve a corrupt/unreadable archive for diagnosis */
+    merged = (shader_bundle_item*)calloc(
+        SHADER_BUNDLE_MAX_MERGE_ITEMS, sizeof(*merged));
+    if (!merged) goto done;
+    if (old_result == 1) {
+        for (i = 0; i < old_view.count; ++i) {
+            const shader_bundle_record* record = &old_view.records[i];
+            merged[count].stage = record->stage;
+            merged[count].hash = record->hash;
+            merged[count].source_length = record->source_length;
+            merged[count].blob_length = record->blob_length;
+            merged[count].source = old_view.bytes + record->source_offset;
+            merged[count].blob = old_view.bytes + record->blob_offset;
+            ++count;
+        }
+    }
+    if (incoming_count)
+        memcpy(merged + count, incoming,
+            (size_t)incoming_count * sizeof(*incoming));
+    count += incoming_count;
+    if (!shader_bundle_serialize(merged, count, &output, &output_size))
+        goto done;
+
+    QueryPerformanceCounter(&nonce);
+    {
+        const int length = snprintf(temporary, sizeof(temporary),
+            "%s.tmp.%lu.%08lX", path, (unsigned long)GetCurrentProcessId(),
+            (unsigned long)nonce.LowPart);
+        if (length <= 0 || length >= (int)sizeof(temporary)) goto done;
+    }
+    file = CreateFileA(temporary, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
+    if (file == INVALID_HANDLE_VALUE) goto done;
+    {
+        size_t offset = 0;
+        while (offset < output_size) {
+            DWORD wrote = 0;
+            const DWORD request = (DWORD)((output_size - offset) >
+                1024u * 1024u ? 1024u * 1024u : output_size - offset);
+            if (!WriteFile(file, output + offset, request, &wrote, NULL) ||
+                !wrote || wrote > request)
+                goto done;
+            offset += wrote;
+        }
+    }
+    if (!FlushFileBuffers(file)) goto done;
+    if (!CloseHandle(file)) goto done;
+    file = INVALID_HANDLE_VALUE;
+    if (!MoveFileExA(temporary, path,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        goto done;
+    if (saved_entries)
+        *saved_entries = ((const shader_bundle_header*)output)->entry_count;
+    if (saved_bytes) *saved_bytes = output_size;
+    success = 1;
+done:
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    if (!success && temporary[0]) DeleteFileA(temporary);
+    free(output);
+    free(merged);
+    free(old_bytes);
+    if (lock_file != INVALID_HANDLE_VALUE) {
+        UnlockFileEx(lock_file, 0, 1, 0, &lock_state);
+        CloseHandle(lock_file);
+    }
+    return success;
+}
+/* END RSX SHADER BUNDLE PERSIST */
+
+static void shader_bundle_load_initial(void)
+{
+    char path[MAX_PATH];
+    u8* bytes = NULL;
+    size_t size = 0;
+    shader_bundle_view view;
+    LARGE_INTEGER begin, end, frequency;
+    const int64_t started = QueryPerformanceCounter(&begin) ? begin.QuadPart : 0;
+    if (!shader_disk_cache_prepare() || !shader_bundle_path(path)) {
+        fprintf(stderr,
+            "[shader-cache-bundle-init] status=disabled entries=0 bytes=0 "
+            "read_ms=0.000 schema=%u compiler_tag=%08X\n",
+            SHADER_BUNDLE_SCHEMA_VERSION, SHADER_BUNDLE_COMPILER_TAG);
+        return;
+    }
+    const int result = shader_bundle_read_file(path, &bytes, &size, &view);
+    if (result < 0) {
+        fprintf(stderr,
+            "[shader-cache-bundle] ignored invalid/unreadable archive; "
+            "legacy per-file cache remains enabled\n");
+    } else if (result == 0) {
+        fprintf(stderr,
+            "[shader-cache-bundle] absent; legacy per-file cache remains enabled\n");
+    } else {
+        g_shader_bundle_bytes = bytes;
+        g_shader_bundle = view;
+    }
+    QueryPerformanceCounter(&end);
+    QueryPerformanceFrequency(&frequency);
+    fprintf(stderr,
+        "[shader-cache-bundle-init] status=%s entries=%u bytes=%llu "
+        "read_ms=%.3f schema=%u compiler_tag=%08X\n",
+        result == 1 ? "loaded" : result == 0 ? "absent" : "rejected",
+        result == 1 ? view.count : 0,
+        (unsigned long long)(result == 1 ? size : 0),
+        started && end.QuadPart >= started && frequency.QuadPart > 0
+            ? 1000.0 * (double)(end.QuadPart - started) /
+                (double)frequency.QuadPart : 0.0,
+        SHADER_BUNDLE_SCHEMA_VERSION, SHADER_BUNDLE_COMPILER_TAG);
+}
+
+static ID3DBlob* shader_bundle_load_blob(
+    u32 stage, const char* source, u32 source_length, u64 hash)
+{
+    const shader_bundle_record* record = shader_bundle_find(
+        &g_shader_bundle, stage, source, source_length, hash);
+    ID3DBlob* blob = NULL;
+    if (!record) {
+        InterlockedIncrement64(&g_shader_bundle_misses);
+        return NULL;
+    }
+    if (FAILED(D3DCreateBlob(record->blob_length, &blob)) || !blob) {
+        InterlockedIncrement64(&g_shader_bundle_misses);
+        return NULL;
+    }
+    memcpy(blob->lpVtbl->GetBufferPointer(blob),
+        g_shader_bundle.bytes + record->blob_offset, record->blob_length);
+    InterlockedIncrement64(&g_shader_bundle_hits);
+    return blob;
+}
+
+static void shader_bundle_append_cache(
+    shader_bundle_item* items, u32* count, const shader_blob_cache_t* cache,
+    u32 stage, u32 capacity)
+{
+    u32 i;
+    for (i = 0; i < cache->count && *count < capacity; ++i) {
+        const shader_blob_t* entry = &cache->entries[i];
+        const size_t blob_length = entry->blob
+            ? entry->blob->lpVtbl->GetBufferSize(entry->blob) : 0;
+        const char* blob_bytes = entry->blob
+            ? (const char*)entry->blob->lpVtbl->GetBufferPointer(entry->blob) : NULL;
+        if (!entry->source || !blob_bytes || !blob_length ||
+            entry->source_length > SHADER_BUNDLE_MAX_SOURCE ||
+            blob_length > SHADER_BUNDLE_MAX_BLOB)
+            continue;
+        items[*count].stage = stage;
+        items[*count].hash = entry->hash;
+        items[*count].source_length = entry->source_length;
+        items[*count].blob_length = (u32)blob_length;
+        items[*count].source = (const u8*)entry->source;
+        items[*count].blob = (const u8*)blob_bytes;
+        ++*count;
+    }
+}
+
+static int shader_bundle_write_merged(void)
+{
+    char path[MAX_PATH];
+    shader_bundle_item* items;
+    u32 count = 0, saved_entries = 0;
+    size_t saved_bytes = 0;
+    int success;
+    if (!shader_disk_cache_prepare() || !shader_bundle_path(path))
+        return 0;
+    items = (shader_bundle_item*)calloc(
+        SHADER_BUNDLE_MAX_ENTRIES, sizeof(*items));
+    if (!items) return 0;
+    shader_bundle_append_cache(items, &count, &g.vs_blobs, (u32)'V',
+        SHADER_BUNDLE_MAX_ENTRIES);
+    shader_bundle_append_cache(items, &count, &g.ps_blobs, (u32)'P',
+        SHADER_BUNDLE_MAX_ENTRIES);
+    success = shader_bundle_persist_file(
+        path, items, count, &saved_entries, &saved_bytes);
+    if (success) {
+        InterlockedExchange64(&g_shader_bundle_saved_bytes,
+            (LONG64)saved_bytes);
+        InterlockedExchange(&g_shader_bundle_saved_entries,
+            (LONG)saved_entries);
+    }
+    free(items);
+    return success;
+}
+
+void rsx_live_draw_dump_shader_cache(void)
+{
+    LARGE_INTEGER begin, end, frequency;
+    if (!g.ready) return;
+    if (InterlockedCompareExchange(&g_shader_bundle_dump_state, 1, 0) != 0)
+        return;
+    QueryPerformanceCounter(&begin);
+    const int success = shader_bundle_write_merged();
+    QueryPerformanceCounter(&end);
+    QueryPerformanceFrequency(&frequency);
+    fprintf(stderr,
+        "[shader-cache-bundle-save] status=%s entries=%u bytes=%llu "
+        "hits=%llu misses=%llu legacy_fallbacks=%llu elapsed_ms=%.3f\n",
+        success ? "saved" : "skipped",
+        success ? (u32)InterlockedCompareExchange(
+            &g_shader_bundle_saved_entries, 0, 0) : 0,
+        (unsigned long long)InterlockedCompareExchange64(
+            &g_shader_bundle_saved_bytes, 0, 0),
+        (unsigned long long)InterlockedCompareExchange64(
+            &g_shader_bundle_hits, 0, 0),
+        (unsigned long long)InterlockedCompareExchange64(
+            &g_shader_bundle_misses, 0, 0),
+        (unsigned long long)InterlockedCompareExchange64(
+            &g_shader_bundle_fallbacks, 0, 0),
+        frequency.QuadPart > 0
+            ? 1000.0 * (double)(end.QuadPart - begin.QuadPart) /
+                (double)frequency.QuadPart : -1.0);
+    /* This is an orderly-exit hook; free the startup index before process
+     * teardown so merging does not retain both archive generations. */
+    free(g_shader_bundle_bytes);
+    g_shader_bundle_bytes = NULL;
+    memset(&g_shader_bundle, 0, sizeof(g_shader_bundle));
+    InterlockedExchange(&g_shader_bundle_dump_state, success ? 2 : 0);
+}
+
+static HRESULT shader_disk_create_blob(size_t size, ID3DBlob** blob)
+{
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG begin = ld_profile_qpc();
+#endif
+    const HRESULT result = D3DCreateBlob(size, blob);
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.shader_blob_create_qpc += ld_profile_qpc() - begin;
+#endif
+    return result;
+}
+
+#if defined(YZ_PERF_PROFILE)
+static size_t shader_disk_cache_load_fread(
+    void* buffer, size_t size, size_t count, FILE* file)
+{
+    const LONGLONG begin = ld_profile_qpc();
+    ++g_ld_profile.total.shader_disk_load_read_calls;
+    const size_t result = fread(buffer, size, count, file);
+    g_ld_profile.total.shader_disk_load_read_qpc +=
+        ld_profile_qpc() - begin;
+    return result;
+}
+#else
+#define shader_disk_cache_load_fread fread
+#endif
+
+static ID3DBlob* shader_disk_cache_load_impl(
     u32 stage, const char* source, u32 source_length, u64 hash)
 {
     char path[MAX_PATH];
@@ -4019,16 +6310,35 @@ static ID3DBlob* shader_disk_cache_load(
     if (!shader_disk_cache_path(path, stage, hash, source_length))
         return NULL;
 
+    {
+        ID3DBlob* bundle_blob = shader_bundle_load_blob(
+            stage, source, source_length, hash);
+        if (bundle_blob) {
+            ++g_ld_shader_disk_hits[stage_index];
+            return bundle_blob;
+        }
+        InterlockedIncrement64(&g_shader_bundle_fallbacks);
+    }
+
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG open_begin = ld_profile_qpc();
+    ++g_ld_profile.total.shader_disk_load_open_calls;
+#endif
     FILE* file = fopen(path, "rb");
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.shader_disk_load_open_qpc +=
+        ld_profile_qpc() - open_begin;
+#endif
     if (!file) {
         const u64 value = ++g_ld_shader_disk_misses[stage_index];
-        shader_disk_cache_progress(value);
+        shader_disk_cache_load_progress(value);
         return NULL;
     }
 
     shader_disk_cache_header header;
     memset(&header, 0, sizeof(header));
-    int valid = fread(&header, sizeof(header), 1, file) == 1 &&
+    int valid = shader_disk_cache_load_fread(
+        &header, sizeof(header), 1, file) == 1 &&
         header.magic == SHADER_DISK_CACHE_MAGIC &&
         header.version == SHADER_DISK_CACHE_VERSION &&
         header.stage == stage && header.source_hash == hash &&
@@ -4040,16 +6350,26 @@ static ID3DBlob* shader_disk_cache_load(
     if (valid) {
         stored_source = (char*)malloc(source_length ? source_length : 1u);
         valid = stored_source != NULL &&
-            fread(stored_source, 1, source_length, file) == source_length &&
+            shader_disk_cache_load_fread(
+                stored_source, 1, source_length, file) == source_length &&
             memcmp(stored_source, source, source_length) == 0;
     }
     if (valid) {
-        valid = SUCCEEDED(D3DCreateBlob(header.blob_length, &blob)) && blob &&
-            fread(blob->lpVtbl->GetBufferPointer(blob), 1,
-                  header.blob_length, file) == header.blob_length;
+        valid = SUCCEEDED(shader_disk_create_blob(header.blob_length, &blob)) && blob &&
+            shader_disk_cache_load_fread(
+                blob->lpVtbl->GetBufferPointer(blob), 1,
+                header.blob_length, file) == header.blob_length;
     }
     free(stored_source);
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG close_begin = ld_profile_qpc();
+    ++g_ld_profile.total.shader_disk_load_close_calls;
+#endif
     fclose(file);
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.shader_disk_load_close_qpc +=
+        ld_profile_qpc() - close_begin;
+#endif
 
     if (!valid) {
         if (blob)
@@ -4057,16 +6377,38 @@ static ID3DBlob* shader_disk_cache_load(
         DeleteFileA(path);
         g_ld_shader_disk_rejects++;
         const u64 value = ++g_ld_shader_disk_misses[stage_index];
-        shader_disk_cache_progress(value);
+        shader_disk_cache_load_progress(value);
         return NULL;
     }
 
     const u64 value = ++g_ld_shader_disk_hits[stage_index];
-    shader_disk_cache_progress(value);
+    shader_disk_cache_load_progress(value);
     return blob;
 }
 
-static void shader_disk_cache_store(
+static ID3DBlob* shader_disk_cache_load(
+    u32 stage, const char* source, u32 source_length, u64 hash,
+    ld_slow_draw_scope* slow_draw)
+{
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG begin = ld_profile_qpc();
+    ++g_ld_profile.total.shader_disk_load_calls;
+#endif
+    const u64 slow_begin = slow_draw && slow_draw->active
+        ? ld_slow_draw_qpc() : 0;
+    ID3DBlob* blob = shader_disk_cache_load_impl(stage, source, source_length, hash);
+    if (slow_draw && slow_draw->active) {
+        const u64 slow_end = ld_slow_draw_qpc();
+        if (slow_end >= slow_begin)
+            slow_draw->event.shader_disk_load_ticks += slow_end - slow_begin;
+    }
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.shader_disk_load_qpc += ld_profile_qpc() - begin;
+#endif
+    return blob;
+}
+
+static void shader_disk_cache_store_impl(
     u32 stage, const char* source, u32 source_length, u64 hash,
     ID3DBlob* blob)
 {
@@ -4113,6 +6455,19 @@ static void shader_disk_cache_store(
     const u32 stage_index = shader_disk_cache_stage_index(stage);
     const u64 value = ++g_ld_shader_disk_writes[stage_index];
     shader_disk_cache_progress(value);
+}
+
+static void shader_disk_cache_store(
+    u32 stage, const char* source, u32 source_length, u64 hash, ID3DBlob* blob)
+{
+#if defined(YZ_PERF_PROFILE)
+    const LONGLONG begin = ld_profile_qpc();
+    ++g_ld_profile.total.shader_disk_store_calls;
+#endif
+    shader_disk_cache_store_impl(stage, source, source_length, hash, blob);
+#if defined(YZ_PERF_PROFILE)
+    g_ld_profile.total.shader_disk_store_qpc += ld_profile_qpc() - begin;
+#endif
 }
 
 static u64 ld_hash_structural_render_state(
@@ -4448,9 +6803,75 @@ static void ld_vp_cached_info(const u8* code, u32 bytes, rsx_vp_program_info* ou
 #endif
 }
 
+static rsx_vertex_pull_payload g_ld_pull_payload;
+static int g_ld_pull_active, g_ld_pull_enabled=-1;
+static u64 g_ld_pull_draws, g_ld_pull_vertices, g_ld_pull_bytes, g_ld_pull_bypasses;
+static void ld_pull_summary(void);
+static void ld_pull_update(void)
+{
+    static const char* control;
+    static ULONGLONG next;
+    const ULONGLONG now=GetTickCount64();
+    int changed=0;
+    if (g_ld_pull_enabled<0) {
+        const char* option=getenv("RSX_GPU_VERTEX_PULL");
+        g_ld_pull_enabled=option && option[0]>='1' && option[0]<='2' && !option[1]
+            ? option[0]-'0' : 0;
+        control=getenv("RSX_GPU_VERTEX_PULL_FILE"); changed=1;
+    }
+    if (control && now>=next) {
+        next=now+100;
+        FILE* file=fopen(control,"r"); unsigned enabled;
+        if (file) {
+            if (fscanf(file,"%u",&enabled)==1 && enabled<=2 && (int)enabled!=g_ld_pull_enabled) {
+                g_ld_pull_enabled=(int)enabled; changed=1;
+            }
+            fclose(file);
+        }
+    }
+    if (changed) {
+        ld_pull_summary();
+        LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+        fprintf(stderr,"[gpu-vertex-pull-mode] enabled=%d qpc=%lld\n",g_ld_pull_enabled,qpc.QuadPart);
+    }
+}
+static void ld_pull_summary(void)
+{
+    LARGE_INTEGER qpc; QueryPerformanceCounter(&qpc);
+    fprintf(stderr,"[gpu-vertex-pull-summary] enabled=%d qpc=%lld prepared_draws=%llu vertices=%llu upload_bytes=%llu bypasses=%llu\n",
+        g_ld_pull_enabled,qpc.QuadPart,g_ld_pull_draws,g_ld_pull_vertices,g_ld_pull_bytes,g_ld_pull_bypasses);
+}
+#if defined(YZ_PERF_PROFILE)
+/* Cumulative counters paired by QPC with the renderer stage CSV. Keep these
+ * out of ordinary measurements; subtraction retains all frames in a window. */
+static void ld_pull_profile(u32 frame, LONGLONG qpc)
+{
+    ld_texture_content_profile(frame,qpc);
+    rsx_profile_buffer* csv=&g_ld_geometry_csv;
+    static int initialized;
+    if (!initialized) {
+        initialized=1;
+        const char* output=getenv("RSX_PROFILE_CSV");
+        if (output && *output) {
+            char path[4096];
+            const int n=snprintf(path,sizeof path,"%s.geometry.csv",output);
+            if (n>0 && n<sizeof path && !rsx_profile_buffer_init(csv,path,
+                "frame,qpc,enabled,prepared_draws,vertices,raw_upload_bytes,bypasses,total_vertex_upload_bytes\n",32768,256))
+                fprintf(stderr,"[profile-buffer] geometry allocation failed\n");
+        }
+    }
+    if (csv->rows) {
+        rsx_profile_buffer_printf(csv,"%u,%lld,%d,%llu,%llu,%llu,%llu,%llu\n",frame,qpc,
+            g_ld_pull_enabled,g_ld_pull_draws,g_ld_pull_vertices,g_ld_pull_bytes,
+            g_ld_pull_bypasses,g_ld_profile.total.vertex_upload_bytes);
+    }
+}
+#endif
+
 static ID3D12PipelineState* build_pso(
     const char* vs_hlsl, const char* ps_hlsl, const render_state_t* rs,
-    const rsx_vertex_layout_plan* masked_layout, int packed_offsets)
+    const rsx_vertex_layout_plan* masked_layout, int packed_offsets,
+    ld_slow_draw_scope* slow_draw)
 {
     ID3DBlob *vs = NULL, *ps = NULL, *err = NULL;
     static u32 compile_fail_logs = 0;
@@ -4491,7 +6912,7 @@ static ID3D12PipelineState* build_pso(
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.vs_blob_misses++;
 #endif
-        vs = shader_disk_cache_load('V', vs_hlsl, vs_length, vs_hash);
+        vs = shader_disk_cache_load('V', vs_hlsl, vs_length, vs_hash, slow_draw);
         if (vs) {
             shader_blob_cache_insert_accounted(
                 &g.vs_blobs, vs_hlsl, vs_length, vs_hash, vs,
@@ -4501,9 +6922,17 @@ static ID3D12PipelineState* build_pso(
             g_ld_profile.total.vs_compile_calls++;
             const LONGLONG compile_begin = ld_profile_qpc();
 #endif
+            const u64 slow_compile_begin = slow_draw && slow_draw->active
+                ? ld_slow_draw_qpc() : 0;
             vs_hr = D3DCompile(
                 vs_hlsl, vs_length, "xvs", NULL, NULL, "main",
                 "vs_5_0", 0, 0, &vs, &err);
+            if (slow_draw && slow_draw->active) {
+                const u64 slow_compile_end = ld_slow_draw_qpc();
+                if (slow_compile_end >= slow_compile_begin)
+                    slow_draw->event.d3d_compile_ticks +=
+                        slow_compile_end - slow_compile_begin;
+            }
 #if defined(YZ_PERF_PROFILE)
             g_ld_profile.total.vs_compile_qpc +=
                 (u64)(ld_profile_qpc() - compile_begin);
@@ -4553,7 +6982,7 @@ static ID3D12PipelineState* build_pso(
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.ps_blob_misses++;
 #endif
-        ps = shader_disk_cache_load('P', ps_hlsl, ps_length, ps_hash);
+        ps = shader_disk_cache_load('P', ps_hlsl, ps_length, ps_hash, slow_draw);
         if (ps) {
             shader_blob_cache_insert_accounted(
                 &g.ps_blobs, ps_hlsl, ps_length, ps_hash, ps,
@@ -4563,9 +6992,17 @@ static ID3D12PipelineState* build_pso(
             g_ld_profile.total.ps_compile_calls++;
             const LONGLONG compile_begin = ld_profile_qpc();
 #endif
+            const u64 slow_compile_begin = slow_draw && slow_draw->active
+                ? ld_slow_draw_qpc() : 0;
             ps_hr = D3DCompile(
                 ps_hlsl, ps_length, "xps", NULL, NULL, "main",
                 "ps_5_0", 0, 0, &ps, &err);
+            if (slow_draw && slow_draw->active) {
+                const u64 slow_compile_end = ld_slow_draw_qpc();
+                if (slow_compile_end >= slow_compile_begin)
+                    slow_draw->event.d3d_compile_ticks +=
+                        slow_compile_end - slow_compile_begin;
+            }
 #if defined(YZ_PERF_PROFILE)
             g_ld_profile.total.ps_compile_qpc +=
                 (u64)(ld_profile_qpc() - compile_begin);
@@ -4593,8 +7030,8 @@ static ID3D12PipelineState* build_pso(
         err = NULL;
     }
     D3D12_INPUT_ELEMENT_DESC il[16];
-    const u32 input_count =
-        masked_layout ? masked_layout->count : RSX_DSP_NUM_VERTEX_ATTR;
+    const u32 input_count = g_ld_pull_active ? 0 :
+        (masked_layout ? masked_layout->count : RSX_DSP_NUM_VERTEX_ATTR);
     for (u32 slot = 0; slot < input_count; slot++) {
         const u32 attr =
             masked_layout ? masked_layout->attrs[slot] : slot;
@@ -4626,8 +7063,16 @@ static ID3D12PipelineState* build_pso(
     g_ld_profile.total.create_pso_calls++;
     const LONGLONG create_begin = ld_profile_qpc();
 #endif
+    const u64 slow_create_begin = slow_draw && slow_draw->active
+        ? ld_slow_draw_qpc() : 0;
     HRESULT hr = g.dev->lpVtbl->CreateGraphicsPipelineState(
         g.dev, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    if (slow_draw && slow_draw->active) {
+        const u64 slow_create_end = ld_slow_draw_qpc();
+        if (slow_create_end >= slow_create_begin)
+            slow_draw->event.create_graphics_pso_ticks +=
+                slow_create_end - slow_create_begin;
+    }
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.create_pso_qpc +=
         (u64)(ld_profile_qpc() - create_begin);
@@ -4693,7 +7138,8 @@ static void ld_pso_bail(int* said, const char* reason)
     do { static int _said_ = 0; ld_pso_bail(&_said_, (reason)); } while (0)
 
 static ID3D12PipelineState* get_pso(
-    const rsx_vertex_layout_plan* masked_layout, int packed_payload)
+    const rsx_vertex_layout_plan* masked_layout, int packed_payload,
+    ld_slow_draw_scope* slow_draw)
 {
     memset(&g_ld_current_pso, 0, sizeof(g_ld_current_pso));
     const u32 start = rsx_dsp_vp_start(&g.rsx);
@@ -4756,7 +7202,7 @@ static ID3D12PipelineState* get_pso(
     if (!fp_uc) { LD_PSO_BAIL("fragment program is not fully mapped in guest memory"); return NULL; }
 
     /* Fragment output register mode (fp16 h0 vs fp32 r0) is driven by the
-     * SHADER_CONTROL word bit 0x40 (same fix as the replay harness — the
+     * SHADER_CONTROL word bit 0x40 (same fix as the replay harness â€” the
      * AUTO heuristic returned stale fp32 scratch for h0-writing materials);
      * fold the deciding bit into the cache key so a program reused under a
      * different export mode gets its own PSO. Kill-switch RSX_FP_CTRL_AUTO=1
@@ -4812,7 +7258,11 @@ static ID3D12PipelineState* get_pso(
     g.fp_alpha_ref = rsx_fp_alpha_ref(
         rs.alpha_ref_raw, rs.alpha_ref_format);
 
-    u64 key = cache_vp ? vp_info.hash : ld_vp_hash(vp_uc, vp_instrs * 16);
+    /* g.rsx.vp belongs to this renderer thread and does not change within
+     * get_pso. Keep this lookup's hash for the diagnostic identity below,
+     * rather than walking the same program bytes twice on every draw. */
+    const u64 vp_hash = cache_vp ? vp_info.hash : ld_vp_hash(vp_uc, vp_instrs * 16);
+    u64 key = vp_hash;
     if (ld_fp_constants_buffered())
         key = ld_fp_structural_hash(fp_uc, fp_size, key);
     else
@@ -4872,6 +7322,10 @@ static ID3D12PipelineState* get_pso(
         key = ld_hash_structural_render_state(&rs, key);
     else
         key = fnv1a(&rs, sizeof(rs), key);
+    if (g_ld_pull_active) {
+        const u32 tag=0x31555047u; /* GPU1: raw vertex shader input */
+        key=fnv1a(&tag,sizeof tag,key);
+    }
 #if defined(YZ_PERF_PROFILE)
     { static int variants = -1;
       if (variants < 0) variants = getenv("RSX_PROFILE_LIGHT") == NULL;
@@ -4880,7 +7334,7 @@ static ID3D12PipelineState* get_pso(
 #endif
     g_ld_current_pso.valid = 1;
     g_ld_current_pso.key = key;
-    g_ld_current_pso.vp_hash = cache_vp ? vp_info.hash : ld_vp_hash(vp_uc, vp_instrs * 16);
+    g_ld_current_pso.vp_hash = vp_hash;
     g_ld_current_pso.vp_start = start;
     g_ld_current_pso.vp_instrs = vp_instrs;
     g_ld_current_pso.fp_location = fp_loc;
@@ -4928,6 +7382,8 @@ static ID3D12PipelineState* get_pso(
         g_ld_profile.total.pso_probes++;
 #endif
         if (g.psos[i].key == key) {
+            if (slow_draw && slow_draw->active)
+                slow_draw->event.pso_lookup = LD_SLOW_DRAW_PSO_HIT;
 #if defined(YZ_PERF_PROFILE)
             g_ld_profile.total.pso_hits++;
             g_ld_profile.total.pso_lookup_qpc += ld_profile_qpc() - lookup_begin;
@@ -4935,6 +7391,8 @@ static ID3D12PipelineState* get_pso(
             return g.psos[i].pso;
         }
     }
+    if (slow_draw && slow_draw->active)
+        slow_draw->event.pso_lookup = LD_SLOW_DRAW_PSO_MISS;
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.pso_lookup_qpc += ld_profile_qpc() - lookup_begin;
     g_ld_profile.total.pso_misses++;
@@ -4954,12 +7412,14 @@ static ID3D12PipelineState* get_pso(
     const LONGLONG decompile_begin = ld_profile_qpc();
 #endif
     rsx_vp_set_branch_base(rsx_dsp_vp_start(&g.rsx));
-    const int vi = masked_layout
+    int vi = masked_layout
         ? rsx_vp_decompile_compact_ex(
             vp_uc, vp_instrs * 16, vtex_mask, masked_layout->mask,
             vs_hlsl, sizeof(vs_hlsl))
         : rsx_vp_decompile_ex(
             vp_uc, vp_instrs * 16, vtex_mask, vs_hlsl, sizeof(vs_hlsl));
+    if (vi>0 && g_ld_pull_active &&
+        !rsx_vertex_pull_wrap(vs_hlsl,sizeof vs_hlsl,masked_layout?masked_layout->mask:0xFFFFu)) vi=-1;
     u32 decompiled_constant_count = 0;
     int fi;
     if (ld_fp_constants_buffered()) {
@@ -5095,8 +7555,18 @@ static ID3D12PipelineState* get_pso(
         }
       } }
     if (vi > 0 && fi > 0)
+    {
+        const u64 slow_build_begin = slow_draw && slow_draw->active
+            ? ld_slow_draw_qpc() : 0;
         pso = build_pso(
-            vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload);
+            vs_hlsl, ps_hlsl, &rs, masked_layout, packed_payload, slow_draw);
+        if (slow_draw && slow_draw->active) {
+            const u64 slow_build_end = ld_slow_draw_qpc();
+            if (slow_build_end >= slow_build_begin)
+                slow_draw->event.build_pso_ticks +=
+                    slow_build_end - slow_build_begin;
+        }
+    }
 
     g.psos[g.n_psos].key = key;
     g.psos[g.n_psos].pso = pso;
@@ -5447,9 +7917,12 @@ static void fetch_batches(void)
         }
 }
 
+#include "rsx_live_geometry_cache.h"
+#include "rsx_live_vertex_workers.h"
 static void fetch_batches_hoisted(
     const rsx_vertex_layout_plan* layout, int packed_payload)
 {
+    if (ld_geom_begin(layout,packed_payload)) return;
 #if defined(YZ_PERF_PROFILE)
     LONGLONG stage_begin = ld_profile_qpc();
 #endif
@@ -5498,6 +7971,15 @@ static void fetch_batches_hoisted(
                 contiguous = guest_ptr(
                     index_array.location, (u32)start64, (u32)bytes64);
             }
+            /* Speculative batch writes are unpublished until every index has
+             * passed restart detection. A restart uses the original cut path;
+             * it overwrites any partial output at the unchanged n_refs. */
+            if ((g_ld_cpu_work & 8192u) && bulk_refs && contiguous &&
+                rsx_vertex_refs_decode_be(contiguous, count, index_array.is_u32,
+                    base_index, restart_enabled, restart_value, dc.refs + dc.n_refs)) {
+                dc.n_refs += count;
+                continue;
+            }
             for (u32 i = 0; i < count && dc.fetch_ok; i++) {
                 const u32 source_offset =
                     index_array.offset + (first + i) * element_size;
@@ -5538,7 +8020,13 @@ static void fetch_batches_hoisted(
     g_ld_profile.total.vertex_refs_qpc += ld_profile_qpc() - stage_begin;
     stage_begin = ld_profile_qpc();
 #endif
-    if (packed_payload && dc.n_refs > 1) {
+    /* Mode 2 trades repeated GPU vertex invocations for no CPU deduplication.
+     * Keep occurrence order and the existing restart/topology machinery. Even
+     * if raw packing later falls back, CPU fetching accepts unremapped refs.
+     * Geometry-cache operation deliberately retains its existing contract. */
+    const int pull_occurrences = g_ld_pull_enabled==2 &&
+        ld_vertex_mask_signature() && !ld_geometry_cache_enabled();
+    if (packed_payload && !pull_occurrences && dc.n_refs > 1) {
         u32 unique_refs = dc.n_refs;
         if (rsx_vertex_remap_build_ex(
                 &dc.ref_remap, dc.refs, dc.n_refs, &unique_refs,
@@ -5567,6 +8055,17 @@ static void fetch_batches_hoisted(
     stage_begin = ld_profile_qpc();
 #endif
     if (packed_payload) {
+        if (g_ld_pull_enabled>0 && ld_vertex_mask_signature() && !ld_geometry_cache_enabled() &&
+            rsx_vertex_pull_pack(&g_ld_pull_payload,&dc.fetch_plan,dc.refs,dc.n_refs,VERT_BUFFER_SIZE)) {
+            g_ld_pull_active=1; dc.n_verts=dc.n_refs;
+            ++g_ld_pull_draws; g_ld_pull_vertices+=dc.n_refs; g_ld_pull_bytes+=g_ld_pull_payload.bytes;
+#if defined(YZ_PERF_PROFILE)
+            g_ld_profile.total.vertex_decode_qpc += ld_profile_qpc()-stage_begin;
+#endif
+            return;
+        }
+        if (g_ld_pull_enabled>0) ++g_ld_pull_bypasses;
+        ld_geom_prepare();
         const u64 required = (u64)dc.n_refs * layout->stride;
         if (!reserve_compact_vertices(required)) {
             dc.fetch_ok = 0;
@@ -5577,8 +8076,9 @@ static void fetch_batches_hoisted(
         if (!scalar) {
             dc.fetch_ok = ld_vertex_cache_enabled()
                 ? rsx_vertex_fetch_cached(&g_ld_vertex_cache,&dc.fetch_plan,dc.refs,dc.n_refs,dc.compact_verts)
-                : rsx_vertex_fetch_many_ex(&dc.fetch_plan,dc.refs,dc.n_refs,dc.compact_verts,
-                    (g_ld_cpu_work & 256u) != 0);
+                : ld_vertex_fetch_parallel(&dc.fetch_plan,dc.refs,dc.n_refs,dc.compact_verts,
+                    ((g_ld_cpu_work & 256u) ? RSX_VERTEX_BATCH_FLOAT_BYTE : 0u) |
+                    ((g_ld_cpu_work & 2048u) ? RSX_VERTEX_BATCH_SINT16 : 0u));
         } else for (u32 i = 0; i < dc.n_refs; i++) {
             u8* destination = layout->stride
                 ? dc.compact_verts + (u64)i * layout->stride : NULL;
@@ -5619,6 +8119,7 @@ static void fetch_batches_hoisted(
     g_ld_profile.total.vertex_decode_qpc += ld_profile_qpc() - stage_begin;
 #endif
     dc.n_verts = dc.n_refs;
+    if (packed_payload) ld_geom_finish();
 }
 
 static const float* dc_vertex_attr(
@@ -5627,6 +8128,14 @@ static const float* dc_vertex_attr(
     if (!ld_vertex_compact_payload())
         return dc.verts[vertex].a[attr];
     const s8 slot = dc.layout.slot_by_attr[attr];
+    if (g_ld_pull_active && slot>=0 && vertex<dc.n_verts) {
+        float decoded[16*4];
+        if (rsx_vertex_fetch_one(&dc.fetch_plan,&dc.refs[vertex],(u8*)decoded)) {
+            memcpy(fallback,decoded+(u32)slot*4,16); return fallback;
+        }
+        memcpy(fallback,dc.fetch_plan.attr[attr].default_value,16);
+        return fallback;
+    }
     if (slot >= 0 && vertex < dc.n_verts)
         return (const float*)(
             dc.compact_verts + (u64)vertex * dc.layout.stride +
@@ -5646,6 +8155,8 @@ static const float* dc_vertex_attr_canonical(
     if (!ld_vertex_compact_payload())
         return dc.verts[vertex].a[attr];
     const s8 slot = dc.layout.slot_by_attr[attr];
+    if (g_ld_pull_active && slot>=0 && vertex<dc.n_verts)
+        return dc_vertex_attr(vertex,attr,fallback);
     if (slot >= 0 && vertex < dc.n_verts)
         return (const float*)(
             dc.compact_verts + (u64)vertex * dc.layout.stride +
@@ -5821,32 +8332,62 @@ static void ld_profile_present(u32 frame)
     const int compile_free =
         LD_PROFILE_DELTA(vs_compile_calls) == 0 &&
         LD_PROFILE_DELTA(ps_compile_calls) == 0;
-    /* Optional full-run CSV: buffered writes, no per-frame stderr flush or
-     * adapter queries. Keep frame intervals separate from overlapping CPU
-     * scopes (draw_cpu includes vertex packing and some flushes). */
-    static FILE* csv;
+    /* Bounded in-memory CSV, saved on normal close. No file I/O or duplicate
+     * stderr/adapter reports in CSV mode. Scopes still overlap. */
+    rsx_profile_buffer* csv=&g_ld_profile_csv;
     static int csv_initialized;
     if (!csv_initialized) {
         csv_initialized = 1;
         const char* output = getenv("RSX_PROFILE_CSV");
         if (output && *output) {
-            csv = fopen(output, "wb");
-            if (csv) fprintf(csv, "frame,qpc,dt_ms,draw_cpu_ms,vertex_pack_ms,"
+            if (!rsx_profile_buffer_init(csv,output,"frame,qpc,dt_ms,draw_cpu_ms,vertex_pack_ms,"
                 "flush_ms,fence_wait_ms,decompile_ms,vs_compile_ms,ps_compile_ms,"
                 "create_pso_ms,texture_decode_ms,draws,vertices,texture_upload_bytes,"
                 "evictions,pso_misses,ref_flushes,gpu_ms,texture_hash_ms,texture_hash_bytes,pso_prepare_ms,"
                 "pso_lookup_ms,vertex_refs_ms,vertex_remap_ms,vertex_plan_ms,vertex_decode_ms,cpu_work,"
-                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses,topology_index_ms\n");
+                "blit_cpu_ms,blit_requested_pixels,blit_row_pixels,qpc_frequency,draw_begin_qpc,draw_end_qpc,frame_limit_ms,vp_prepare_ms,fp_prepare_ms,vp_cache_hits,vp_cache_misses,topology_index_ms,"
+                "texture_watch_ms,texture_watch_queries,texture_watch_dirty_pages,texture_watch_skip_bytes,texture_watch_skips,texture_watch_audits,texture_watch_races,texture_watch_failures,vertex_cache,vertex_cache_hits,vertex_cache_misses,vertex_cache_bypasses,vertex_cache_compared_bytes,vertex_cache_storage_bytes,geometry_cache,geometry_cache_hits,geometry_cache_misses,geometry_cache_bypasses,geometry_cache_queries,geometry_cache_dirty_pages,geometry_cache_storage_bytes,geometry_cache_audits,geometry_cache_races,geometry_cache_failures,geometry_cache_query_ms,geometry_cache_begin_ms,geometry_cache_store_ms,geometry_cache_copy_ms,geometry_cache_hit_vertices,geometry_cache_hit_refs,vertex_workers,vertex_worker_draws,vertex_worker_vertices,vertex_worker_large_draws,vertex_worker_large_vertices,vertex_worker_parallel_draws,vertex_worker_parallel_vertices,vertex_worker_jobs,vertex_worker_bypasses,vertex_worker_audits,vertex_worker_races,vertex_worker_failures,vertex_worker_wait_ms,shader_disk_load_ms,shader_disk_store_ms,shader_blob_create_ms,shader_disk_load_calls,shader_disk_store_calls,vs_blob_lookup_ms,ps_blob_lookup_ms,shader_disk_load_open_ms,shader_disk_load_read_ms,shader_disk_load_close_ms,shader_disk_load_progress_ms,shader_disk_load_other_ms,shader_disk_load_open_calls,shader_disk_load_read_calls,shader_disk_load_close_calls,shader_disk_load_progress_writes,texture_decode_calls,texture_decode_miss_calls,texture_decode_refresh_calls,texture_decode_retry_calls,texture_decode_create_ms,texture_decode_create_calls,texture_decode_create_max_ms,texture_decode_create_max_width,texture_decode_create_max_height,texture_decode_create_max_format,texture_decode_create_max_mips,texture_decode_create_max_array_size,texture_decode_create_max_kind,texture_decode_upload_memcpy_ms,texture_decode_upload_rows,texture_decode_copy_record_ms,texture_decode_copy_regions,texture_decode_barrier_record_ms,texture_decode_barriers,texture_decode_other_ms\n",32768,2048))
+                fprintf(stderr,"[profile-buffer] renderer allocation failed\n");
         }
     }
-    if (csv) {
+    if (csv->rows) {
         extern void cellGcmGetBlitProfile(u64*,u64*,u64*);
         static u64 previous_ticks,previous_pixels,previous_row_pixels;
         u64 blit_ticks,blit_pixels,blit_row_pixels;
         cellGcmGetBlitProfile(&blit_ticks,&blit_pixels,&blit_row_pixels);
         static u64 previous_limit_ticks;
-        fprintf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu,%.6f\n", frame, now, frame_ms,
+        static u64 previous_watch_queries, previous_watch_dirty_pages, previous_watch_skip_bytes;
+        static u64 previous_watch_skips, previous_watch_audits, previous_watch_races, previous_watch_failures;
+        static u64 previous_vertex_hits, previous_vertex_misses, previous_vertex_bypasses, previous_vertex_compared;
+        static u64 previous_geom_hits, previous_geom_misses, previous_geom_bypasses, previous_geom_queries;
+        static u64 previous_geom_dirty, previous_geom_audits, previous_geom_races, previous_geom_failures, previous_geom_query_ticks;
+        static u64 previous_geom_begin_ticks, previous_geom_store_ticks, previous_geom_copy_ticks, previous_geom_hit_vertices, previous_geom_hit_refs;
+        static ld_vertex_worker_stats previous_workers;
+        static u64 previous_worker_wait_ticks;
+        const u64 shader_load_ticks = LD_PROFILE_DELTA(shader_disk_load_qpc);
+        const u64 shader_load_subphase_ticks =
+            LD_PROFILE_DELTA(shader_disk_load_open_qpc) +
+            LD_PROFILE_DELTA(shader_disk_load_read_qpc) +
+            LD_PROFILE_DELTA(shader_disk_load_close_qpc) +
+            LD_PROFILE_DELTA(shader_disk_load_progress_qpc) +
+            LD_PROFILE_DELTA(shader_blob_create_qpc);
+        const u64 shader_load_other_ticks =
+            shader_load_ticks > shader_load_subphase_ticks
+                ? shader_load_ticks - shader_load_subphase_ticks : 0;
+        const u64 texture_decode_ticks = LD_PROFILE_DELTA(texture_decode_qpc);
+        const u64 texture_decode_subphase_ticks =
+            LD_PROFILE_DELTA(texture_decode_create_qpc) +
+            LD_PROFILE_DELTA(texture_decode_upload_memcpy_qpc) +
+            LD_PROFILE_DELTA(texture_decode_copy_record_qpc) +
+            LD_PROFILE_DELTA(texture_decode_barrier_record_qpc);
+        const u64 texture_decode_other_ticks =
+            texture_decode_ticks > texture_decode_subphase_ticks
+                ? texture_decode_ticks - texture_decode_subphase_ticks : 0;
+        rsx_profile_buffer_printf(csv, "%u,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
+            "%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%llu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%llu,%llu,%lld,%lld,%lld,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%.6f,%.6f,"
+            "%.6f,%.6f,%.6f,%.6f,%.6f,%llu,%llu,%llu,%llu,"
+            "%llu,%llu,%llu,%llu,%.6f,%llu,%.6f,%u,%u,%u,%u,%u,%u,"
+            "%.6f,%llu,%.6f,%llu,%.6f,%llu,%.6f\n", frame, now, frame_ms,
             ld_profile_ticks_ms(LD_PROFILE_DELTA(sink_end_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(vertex_fetch_pack_qpc)),
             ld_profile_ticks_ms(LD_PROFILE_DELTA(flush_qpc)),
@@ -5880,11 +8421,106 @@ static void ld_profile_present(u32 frame)
             ld_profile_ticks_ms(LD_PROFILE_DELTA(fp_prepare_qpc)),
             (unsigned long long)LD_PROFILE_DELTA(vp_cache_hits),
             (unsigned long long)LD_PROFILE_DELTA(vp_cache_misses),
-            ld_profile_ticks_ms(LD_PROFILE_DELTA(topology_index_qpc)));
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(topology_index_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(texture_watch_qpc)),
+            (unsigned long long)(g_texture_watch_queries-previous_watch_queries),
+            (unsigned long long)(g_texture_watch_dirty_pages-previous_watch_dirty_pages),
+            (unsigned long long)(g_texture_watch_skip_bytes-previous_watch_skip_bytes),
+            (unsigned long long)(g_texture_watch_skips-previous_watch_skips),
+            (unsigned long long)(g_texture_watch_audits-previous_watch_audits),
+            (unsigned long long)(g_texture_watch_races-previous_watch_races),
+            (unsigned long long)(g_texture_watch_failures-previous_watch_failures),
+            (unsigned)ld_vertex_cache_enabled(),
+            (unsigned long long)(g_ld_vertex_cache.hits-previous_vertex_hits),
+            (unsigned long long)(g_ld_vertex_cache.misses-previous_vertex_misses),
+            (unsigned long long)(g_ld_vertex_cache.bypasses-previous_vertex_bypasses),
+            (unsigned long long)(g_ld_vertex_cache.compared_bytes-previous_vertex_compared),
+            (unsigned long long)g_ld_vertex_cache.bytes,
+            (unsigned)ld_geometry_cache_enabled(),
+            (unsigned long long)(g_geom_stats.hits-previous_geom_hits),
+            (unsigned long long)(g_geom_stats.misses-previous_geom_misses),
+            (unsigned long long)(g_geom_stats.bypasses-previous_geom_bypasses),
+            (unsigned long long)(g_geom_stats.queries-previous_geom_queries),
+            (unsigned long long)(g_geom_stats.dirty_pages-previous_geom_dirty),
+            (unsigned long long)g_geom_stats.bytes,
+            (unsigned long long)(g_geom_stats.audits-previous_geom_audits),
+            (unsigned long long)(g_geom_stats.races-previous_geom_races),
+            (unsigned long long)(g_geom_stats.failures-previous_geom_failures),
+            ld_profile_ticks_ms(g_geom_query_ticks-previous_geom_query_ticks),
+            ld_profile_ticks_ms(g_geom_begin_ticks-previous_geom_begin_ticks),
+            ld_profile_ticks_ms(g_geom_store_ticks-previous_geom_store_ticks),
+            ld_profile_ticks_ms(g_geom_copy_ticks-previous_geom_copy_ticks),
+            (unsigned long long)(g_geom_stats.hit_vertices-previous_geom_hit_vertices),
+            (unsigned long long)(g_geom_stats.hit_refs-previous_geom_hit_refs),
+            (unsigned)ld_vertex_worker_count(),
+            (unsigned long long)(g_vertex_worker_stats.draws-previous_workers.draws),
+            (unsigned long long)(g_vertex_worker_stats.vertices-previous_workers.vertices),
+            (unsigned long long)(g_vertex_worker_stats.large_draws-previous_workers.large_draws),
+            (unsigned long long)(g_vertex_worker_stats.large_vertices-previous_workers.large_vertices),
+            (unsigned long long)(g_vertex_worker_stats.parallel_draws-previous_workers.parallel_draws),
+            (unsigned long long)(g_vertex_worker_stats.parallel_vertices-previous_workers.parallel_vertices),
+            (unsigned long long)(g_vertex_worker_stats.jobs-previous_workers.jobs),
+            (unsigned long long)(g_vertex_worker_stats.bypasses-previous_workers.bypasses),
+            (unsigned long long)(g_vertex_worker_stats.audits-previous_workers.audits),
+            (unsigned long long)(g_vertex_worker_stats.races-previous_workers.races),
+            (unsigned long long)(g_vertex_worker_stats.failures-previous_workers.failures),
+            ld_profile_ticks_ms(g_vertex_worker_wait_ticks-previous_worker_wait_ticks),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_disk_load_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_disk_store_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_blob_create_qpc)),
+            (unsigned long long)LD_PROFILE_DELTA(shader_disk_load_calls),
+            (unsigned long long)LD_PROFILE_DELTA(shader_disk_store_calls),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(vs_blob_lookup_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(ps_blob_lookup_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_disk_load_open_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_disk_load_read_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_disk_load_close_qpc)),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(shader_disk_load_progress_qpc)),
+            ld_profile_ticks_ms(shader_load_other_ticks),
+            (unsigned long long)LD_PROFILE_DELTA(shader_disk_load_open_calls),
+            (unsigned long long)LD_PROFILE_DELTA(shader_disk_load_read_calls),
+            (unsigned long long)LD_PROFILE_DELTA(shader_disk_load_close_calls),
+            (unsigned long long)LD_PROFILE_DELTA(shader_disk_load_progress_writes),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_calls),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_miss_calls),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_refresh_calls),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_retry_calls),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(texture_decode_create_qpc)),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_create_calls),
+            ld_profile_ticks_ms(g_ld_profile.frame_texture_create_max_qpc),
+            g_ld_profile.frame_texture_create_max_width,
+            g_ld_profile.frame_texture_create_max_height,
+            g_ld_profile.frame_texture_create_max_format,
+            g_ld_profile.frame_texture_create_max_mips,
+            g_ld_profile.frame_texture_create_max_array_size,
+            g_ld_profile.frame_texture_create_max_kind,
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(texture_decode_upload_memcpy_qpc)),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_upload_rows),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(texture_decode_copy_record_qpc)),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_copy_regions),
+            ld_profile_ticks_ms(LD_PROFILE_DELTA(texture_decode_barrier_record_qpc)),
+            (unsigned long long)LD_PROFILE_DELTA(texture_decode_barriers),
+            ld_profile_ticks_ms(texture_decode_other_ticks));
+        previous_workers=g_vertex_worker_stats;
+        previous_worker_wait_ticks=g_vertex_worker_wait_ticks;
+        previous_geom_hits=g_geom_stats.hits; previous_geom_misses=g_geom_stats.misses;
+        previous_geom_bypasses=g_geom_stats.bypasses; previous_geom_queries=g_geom_stats.queries;
+        previous_geom_dirty=g_geom_stats.dirty_pages; previous_geom_audits=g_geom_stats.audits;
+        previous_geom_races=g_geom_stats.races; previous_geom_failures=g_geom_stats.failures;
+        previous_geom_query_ticks=g_geom_query_ticks;
+        previous_geom_begin_ticks=g_geom_begin_ticks; previous_geom_store_ticks=g_geom_store_ticks;
+        previous_geom_copy_ticks=g_geom_copy_ticks; previous_geom_hit_vertices=g_geom_stats.hit_vertices;
+        previous_geom_hit_refs=g_geom_stats.hit_refs;
+        previous_vertex_hits=g_ld_vertex_cache.hits; previous_vertex_misses=g_ld_vertex_cache.misses;
+        previous_vertex_bypasses=g_ld_vertex_cache.bypasses; previous_vertex_compared=g_ld_vertex_cache.compared_bytes;
+        previous_watch_queries=g_texture_watch_queries; previous_watch_dirty_pages=g_texture_watch_dirty_pages;
+        previous_watch_skip_bytes=g_texture_watch_skip_bytes; previous_watch_skips=g_texture_watch_skips;
+        previous_watch_audits=g_texture_watch_audits; previous_watch_races=g_texture_watch_races;
+        previous_watch_failures=g_texture_watch_failures;
         previous_limit_ticks=g_ld_frame_limit_wait_ticks;
         previous_ticks=blit_ticks; previous_pixels=blit_pixels; previous_row_pixels=blit_row_pixels;
-        if ((frame & 63u) == 0) fflush(csv);
     }
+    ld_pull_profile(frame,now);
     g_ld_profile.measured_frames++;
     g_ld_profile.total_frame_ms += frame_ms;
     if (compile_free) {
@@ -5912,7 +8548,7 @@ static void ld_profile_present(u32 frame)
             flush_reason[LD_FLUSH_PIXEL_CONSTANT_RING]) != 0 ||
         LD_PROFILE_DELTA(ps_constant_capacity_failures) != 0;
 
-    if (emit) {
+    if (emit && !csv->rows) {
         DXGI_QUERY_VIDEO_MEMORY_INFO memory = {0};
         if (g_ld_profile.adapter)
             g_ld_profile.adapter->lpVtbl->QueryVideoMemoryInfo(
@@ -6144,6 +8780,13 @@ static void ld_profile_present(u32 frame)
     g_ld_profile.frame_upload_high = 0;
     g_ld_profile.frame_vb_high = 0;
     g_ld_profile.frame_retired_high = 0;
+    g_ld_profile.frame_texture_create_max_qpc = 0;
+    g_ld_profile.frame_texture_create_max_width = 0;
+    g_ld_profile.frame_texture_create_max_height = 0;
+    g_ld_profile.frame_texture_create_max_format = 0;
+    g_ld_profile.frame_texture_create_max_mips = 0;
+    g_ld_profile.frame_texture_create_max_array_size = 0;
+    g_ld_profile.frame_texture_create_max_kind = 0;
     g_ld_profile.frame_used_attribute_max = 0;
 #undef LD_PROFILE_DELTA
 }
@@ -7324,8 +9967,10 @@ static void write_topology_indices(u32 prim, u32* indices)
     }
 }
 
-static void sink_end_impl(void* user, const rsx_dispatch* r)
+static void sink_end_impl(void* user, const rsx_dispatch* r,
+                          ld_slow_draw_scope* slow_draw)
 {
+    g_ld_pull_active=0;
     (void)user; (void)r;
     if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) return;
     if (!dc.n_packets) { g_ld_stats.groups_empty++; return; }
@@ -7369,6 +10014,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         }
     }
     const u32 prim = g.rsx.current_primitive;
+    if (slow_draw && slow_draw->active) {
+        slow_draw->event.primitive = prim;
+        slow_draw->event.packets = dc.n_packets;
+        slow_draw->event.vertices = dc.n_verts;
+        slow_draw->event.source_refs = dc.n_source_refs;
+    }
     rsx_vertex_layout_plan used_layout;
     ld_current_vertex_layout(&used_layout);
 #if defined(YZ_PERF_PROFILE)
@@ -7412,15 +10063,20 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g_ld_stats.group_drop_degenerate++;
         return;
     }
+    if (slow_draw && slow_draw->active) {
+        slow_draw->event.source_refs = dc.n_source_refs;
+        slow_draw->event.vertices = dc.n_verts;
+        slow_draw->event.topology_count = n_tri;
+    }
 
     live_a010_geom_trace(prim, n_tri);
 
     const u32 vertex_stride =
         ld_vertex_compact_payload() ? used_layout.stride : VERT_STRIDE;
     const u32 uploaded_vertices = indexed ? dc.n_verts : n_tri;
-    const void* vertex_data = ld_vertex_compact_payload()
+    const void* vertex_data = g_ld_pull_active ? (const void*)g_ld_pull_payload.data : ld_vertex_compact_payload()
         ? (const void*)dc.compact_verts : (const void*)dc.verts;
-    const u64 draw_vb_bytes = (u64)uploaded_vertices * vertex_stride;
+    const u64 draw_vb_bytes = g_ld_pull_active ? g_ld_pull_payload.bytes : (u64)uploaded_vertices * vertex_stride;
     const u64 draw_ib_bytes = indexed ? (u64)n_tri * sizeof(u32) : 0;
     const u64 vb_capacity = VERT_BUFFER_SIZE;
     if (draw_vb_bytes > vb_capacity || draw_ib_bytes > INDEX_BUFFER_SIZE) {
@@ -7460,12 +10116,20 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
 #endif
     }
 
+    ld_slow_draw_advance(slow_draw, LD_SLOW_DRAW_PIPELINE_CONSTANTS);
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG pso_begin=ld_profile_qpc();
 #endif
+    const u64 slow_pso_begin = slow_draw && slow_draw->active
+        ? ld_slow_draw_qpc() : 0;
     ID3D12PipelineState* pso = get_pso(
         ld_vertex_mask_signature() ? &used_layout : NULL,
-        ld_vertex_compact_payload());
+        ld_vertex_compact_payload(), slow_draw);
+    if (slow_draw && slow_draw->active) {
+        const u64 slow_pso_end = ld_slow_draw_qpc();
+        if (slow_pso_end >= slow_pso_begin)
+            slow_draw->event.get_pso_ticks = slow_pso_end - slow_pso_begin;
+    }
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.pso_prepare_qpc+=ld_profile_qpc()-pso_begin;
 #endif
@@ -7511,7 +10175,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         return;
     }
 
-    const u32 target = current_surface();
+    ld_slow_draw_advance(slow_draw, LD_SLOW_DRAW_RESOURCE_RESOLUTION);
+    const u32 target = slow_draw && slow_draw->active
+        ? current_surface_slow_draw(slow_draw) : current_surface();
     if (target == LD_INVALID_SURFACE) {
         live_draw_csv_emit(prim, n_tri, "drop_surface");
         g_ld_stats.group_drop_surface++;
@@ -7733,11 +10399,16 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         rsx_dsp_get_surface(&g.rsx, &msf);
         const u32 want = ld_rt_count(msf.color_target);
         for (u32 r = 1; r < want; r++) {
-            const u32 s = surface_get(msf.color_location[r], msf.color_offset[r],
-                                      msf.clip_w, msf.clip_h,
-                                      msf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
-                                          ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                          : DXGI_FORMAT_R8G8B8A8_UNORM);
+            const DXGI_FORMAT mrt_format =
+                msf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+                    ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                    : DXGI_FORMAT_R8G8B8A8_UNORM;
+            const u32 s = slow_draw && slow_draw->active
+                ? surface_get_slow_draw(slow_draw,
+                    msf.color_location[r], msf.color_offset[r],
+                    msf.clip_w, msf.clip_h, mrt_format)
+                : surface_get(msf.color_location[r], msf.color_offset[r],
+                    msf.clip_w, msf.clip_h, mrt_format);
             if (s == LD_INVALID_SURFACE || s == target) break;
             mrt[n_mrt++] = s;
         }
@@ -7754,6 +10425,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     const u32 current_zslot = g.depth
         ? zdepth_get(sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h)
         : 0;
+#if defined(YZ_PERF_PROFILE)
+    if (slow_draw && slow_draw->active)
+        slow_draw->event.zslot = current_zslot;
+#endif
     u32 slots[SRV_TABLE_SIZE], smp_slots[SMP_TABLE_SIZE];
     u32 surf_used[SRV_TABLE_SIZE], n_surf_used = 0;
     u32 zdepth_used[SRV_TABLE_SIZE], n_zdepth_used = 0;
@@ -8001,7 +10676,18 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                     if (g.zdepths[i].location == t.location &&
                         g.zdepths[i].offset == t.offset &&
                         current_zslot != 1 + i) {
-                        if (zdepth_snapshot(1 + i))
+                        int snapshot_ok;
+                        if (slow_draw && slow_draw->active) {
+                            const u64 resource_begin = ld_slow_resource_begin(slow_draw);
+                            snapshot_ok = zdepth_snapshot(1 + i);
+                            ld_slow_resource_finish(slow_draw, LD_SLOW_RESOURCE_DEPTH,
+                                resource_begin, g.zdepths[i].location,
+                                g.zdepths[i].offset, 0, g.zdepths[i].snapshot_w,
+                                g.zdepths[i].snapshot_h, 1 + i);
+                        } else {
+                            snapshot_ok = zdepth_snapshot(1 + i);
+                        }
+                        if (snapshot_ok)
                             sampled_depth = (int)i;
                         else {
                             g_ld_zdepth_srv_reject_no_write++;
@@ -8069,13 +10755,36 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                 if (!seen && n_zdepth_used < SRV_TABLE_SIZE)
                     zdepth_used[n_zdepth_used++] = (u32)sampled_depth;
             } else {
-                slots[u] = texture_srv_slot(&t);
+                int packed_depth = -1;
+                if (texture_base_fmt == RSX_TEX_FMT_A8R8G8B8 && (t.format & TEX_FMT_LINEAR))
+                    for (u32 i = 0; i < g.n_zdepths; ++i)
+                        if (g.zdepths[i].location == t.location &&
+                            g.zdepths[i].offset == t.offset && g.zdepths[i].pitch == t.pitch &&
+                            current_zslot != 1 + i &&
+                            zdepth_pack(i, t.width, t.height)) { packed_depth = (int)i; break; }
+                if (packed_depth >= 0) {
+                    slots[u] = SRV_PACKED_DEPTH_BASE + packed_depth;
+                } else if (slow_draw && slow_draw->active) {
+                    const u64 resource_begin = ld_slow_resource_begin(slow_draw);
+                    ld_slow_texture_detail texture_detail;
+                    memset(&texture_detail, 0, sizeof(texture_detail));
+                    slots[u] = texture_srv_slot_scoped(&t, slow_draw, &texture_detail);
+                    ld_slow_texture_resource_finish(slow_draw, resource_begin,
+                        &t, u, &texture_detail);
+                } else {
+                    slots[u] = texture_srv_slot(&t);
+                }
                 if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
             }
         }
     }
 
     const u32 vtex_mask = vertex_texture_mask();
+    if (slow_draw && slow_draw->active) {
+        slow_draw->event.target = target;
+        slow_draw->event.texture_mask = texture_mask;
+        slow_draw->event.vertex_texture_mask = vtex_mask;
+    }
     /* Diagnostic unit mask: isolate texture-dependent fragment calculations. */
     { static u32 white_units = ~0u;
       static u32 white_surface, white_attributes;
@@ -8099,7 +10808,15 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         if (!((vtex_mask >> u) & 1u)) continue;
         rsx_dsp_vertex_texture vt;
         rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
-        vtex_slots[u] = vertex_texture_srv_slot(&vt);
+        if (slow_draw && slow_draw->active) {
+            const u64 resource_begin = ld_slow_resource_begin(slow_draw);
+            vtex_slots[u] = vertex_texture_srv_slot(&vt);
+            ld_slow_resource_finish(slow_draw, LD_SLOW_RESOURCE_VERTEX_TEXTURE,
+                resource_begin, vt.location, vt.offset, vt.format,
+                vt.width, vt.height, u);
+        } else {
+            vtex_slots[u] = vertex_texture_srv_slot(&vt);
+        }
         if (vtex_slots[u] != SRV_WHITE)
             g_ld_vtex_binds++;
         else
@@ -8118,6 +10835,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g.smp_ring_used = 0;
     }
 
+    ld_slow_draw_advance(slow_draw, LD_SLOW_DRAW_COMMAND_RECORDING);
     D3D12_RESOURCE_BARRIER bar = {0};
     bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -8199,6 +10917,9 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             isfinite(units)?units:0,0,isfinite(factor)?factor:0);
     }
     g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.rootsig_x);
+    if (g_ld_pull_active)
+        g.list->lpVtbl->SetGraphicsRootShaderResourceView(g.list,5,
+            g.vb->lpVtbl->GetGPUVirtualAddress(g.vb)+g.vb_used);
     g.list->lpVtbl->SetGraphicsRootConstantBufferView(
         g.list, 0, g.cb->lpVtbl->GetGPUVirtualAddress(g.cb) + g.cb_used);
     if (ld_fp_constants_buffered())
@@ -8313,6 +11034,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         z->draws++;
         if (depth_state.depth_test) z->depth_test_draws++;
         if (depth_state.depth_write) z->depth_write_draws++;
+        if (depth_state.depth_write || depth_state.stencil_enable) ++z->generation;
         if (depth_state.depth_test && depth_state.depth_write)
             z->depth_both_draws++;
         /* A write-enable bit alone does not prove that this draw produced a
@@ -8386,11 +11108,19 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const LONGLONG begin = ld_profile_qpc();
     if (!g_ld_profile.first_draw_qpc) g_ld_profile.first_draw_qpc=begin;
 #endif
-    sink_end_impl(user, r);
+    ld_slow_draw_scope slow_draw;
+    ld_slow_draw_scope* slow_draw_ptr = NULL;
+    if (g_ld_slow_draw.enabled) {
+        ld_slow_draw_begin(&slow_draw);
+        slow_draw_ptr = &slow_draw;
+    }
+    sink_end_impl(user, r, slow_draw_ptr);
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.last_draw_qpc=ld_profile_qpc();
-    g_ld_profile.total.sink_end_qpc += (u64)(g_ld_profile.last_draw_qpc - begin);
+    g_ld_profile.total.sink_end_qpc +=
+        (u64)(g_ld_profile.last_draw_qpc - begin);
 #endif
+    if (slow_draw_ptr) ld_slow_draw_finish(slow_draw_ptr);
 }
 
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
@@ -8483,6 +11213,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
                 clear_flags, cd, (UINT8)(zs & 0xFFu), 1, &clear_rect);
         }
         if (zslot) {
+            ++g.zdepths[zslot - 1].generation;
             g.zdepths[zslot - 1].cleared = 1;
             if (mask & RSX_CLEAR_DEPTH) {
                 g.zdepths[zslot - 1].had_write = 0;
@@ -8531,7 +11262,7 @@ static int make_root_signature(void)
     vrange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     vrange.NumDescriptors = RSX_DSP_NUM_VERTEX_TEXTURES;
     vrange.BaseShaderRegister = 16;
-    D3D12_ROOT_PARAMETER xp[5] = {0};
+    D3D12_ROOT_PARAMETER xp[6] = {0};
     xp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     xp[0].Descriptor.ShaderRegister = 0;
     xp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -8550,6 +11281,9 @@ static int make_root_signature(void)
     xp[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     xp[4].Descriptor.ShaderRegister = 1;
     xp[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    xp[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    xp[5].Descriptor.ShaderRegister = 20;
+    xp[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     D3D12_STATIC_SAMPLER_DESC vsmp[RSX_DSP_NUM_VERTEX_TEXTURES] = {0};
     for (u32 i = 0; i < RSX_DSP_NUM_VERTEX_TEXTURES; i++) {
         vsmp[i].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -8561,7 +11295,7 @@ static int make_root_signature(void)
         vsmp[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     }
     D3D12_ROOT_SIGNATURE_DESC rsd = {0};
-    rsd.NumParameters = 5; rsd.pParameters = xp;
+    rsd.NumParameters = 6; rsd.pParameters = xp;
     rsd.NumStaticSamplers = RSX_DSP_NUM_VERTEX_TEXTURES;
     rsd.pStaticSamplers = vsmp;
     rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -8576,9 +11310,9 @@ static int make_root_signature(void)
     return SUCCEEDED(hr) ? 0 : -1;
 }
 
-static int make_depth_snapshot_pipeline(void)
+static int make_depth_copy_pipeline(int packed)
 {
-    static const char source[] =
+    static const char scalar_source[] =
         "Texture2D<float> depth_source : register(t0);\n"
         "RWTexture2D<float> depth_destination : register(u0);\n"
         "[numthreads(8, 8, 1)]\n"
@@ -8589,10 +11323,25 @@ static int make_depth_snapshot_pipeline(void)
         "        depth_destination[id.xy] = "
         "depth_source.Load(int3(id.xy, 0));\n"
         "}\n";
+    static const char packed_source[] =
+        "Texture2D<float> depths : register(t0);\n"
+        "Texture2D<uint2> stencils : register(t1);\n"
+        "RWTexture2D<float4> destination : register(u0);\n"
+        "cbuffer Mapping : register(b0) { float2 source_scale; };\n"
+        "[numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {\n"
+        " uint w,h,sw,sh; destination.GetDimensions(w,h); depths.GetDimensions(sw,sh);\n"
+        " if (id.x>=w || id.y>=h) return;\n"
+        " uint2 p=uint2((float2(id.xy)+0.5)*source_scale);\n"
+        " float d=1; uint s=0;\n"
+        " if (p.x<sw && p.y<sh) { d=depths.Load(int3(p,0)); s=stencils.Load(int3(p,0)).y; }\n"
+        " uint z=(uint)round(saturate(d)*16777215.0);\n"
+        " destination[id.xy]=float4((z>>8)&255,z&255,s&255,(z>>16)&255)/255.0;\n"
+        "}\n";
+    const char* source = packed ? packed_source : scalar_source;
     ID3DBlob* shader = NULL;
     ID3DBlob* errors = NULL;
     HRESULT hr = D3DCompile(
-        source, sizeof(source) - 1u, "depth_snapshot_compute", NULL, NULL,
+        source, strlen(source), "depth_snapshot_compute", NULL, NULL,
         "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
         &shader, &errors);
     if (FAILED(hr)) {
@@ -8609,12 +11358,12 @@ static int make_depth_snapshot_pipeline(void)
 
     D3D12_DESCRIPTOR_RANGE ranges[2] = {0};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 1;
+    ranges[0].NumDescriptors = packed ? 2 : 1;
     ranges[0].BaseShaderRegister = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     ranges[1].NumDescriptors = 1;
     ranges[1].BaseShaderRegister = 0;
-    D3D12_ROOT_PARAMETER parameters[2] = {0};
+    D3D12_ROOT_PARAMETER parameters[3] = {0};
     for (u32 i = 0; i < 2; ++i) {
         parameters[i].ParameterType =
             D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -8623,7 +11372,10 @@ static int make_depth_snapshot_pipeline(void)
         parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
     D3D12_ROOT_SIGNATURE_DESC description = {0};
-    description.NumParameters = 2;
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[2].Constants.Num32BitValues = 2;
+    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    description.NumParameters = packed ? 3 : 2;
     description.pParameters = parameters;
     ID3DBlob* serialized = NULL;
     ID3DBlob* signature_errors = NULL;
@@ -8649,7 +11401,7 @@ static int make_depth_snapshot_pipeline(void)
     hr = g.dev->lpVtbl->CreateRootSignature(
         g.dev, 0, serialized->lpVtbl->GetBufferPointer(serialized),
         serialized->lpVtbl->GetBufferSize(serialized),
-        &IID_ID3D12RootSignature, (void**)&g.depth_snapshot_rootsig);
+        &IID_ID3D12RootSignature, (void**)(packed ? &g.depth_pack_rootsig : &g.depth_snapshot_rootsig));
     serialized->lpVtbl->Release(serialized);
     if (FAILED(hr)) {
         shader->lpVtbl->Release(shader);
@@ -8657,14 +11409,19 @@ static int make_depth_snapshot_pipeline(void)
     }
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline = {0};
-    pipeline.pRootSignature = g.depth_snapshot_rootsig;
+    pipeline.pRootSignature = packed ? g.depth_pack_rootsig : g.depth_snapshot_rootsig;
     pipeline.CS.pShaderBytecode = shader->lpVtbl->GetBufferPointer(shader);
     pipeline.CS.BytecodeLength = shader->lpVtbl->GetBufferSize(shader);
     hr = g.dev->lpVtbl->CreateComputePipelineState(
         g.dev, &pipeline, &IID_ID3D12PipelineState,
-        (void**)&g.depth_snapshot_pso);
+        (void**)(packed ? &g.depth_pack_pso : &g.depth_snapshot_pso));
     shader->lpVtbl->Release(shader);
     return SUCCEEDED(hr) ? 0 : -1;
+}
+
+static int make_depth_snapshot_pipeline(void)
+{
+    return make_depth_copy_pipeline(0) || make_depth_copy_pipeline(1) ? -1 : 0;
 }
 
 int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
@@ -8672,6 +11429,15 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 {
     if (!rsx_live_draw_enabled()) return 0;
     if (g.ready) return 0;
+    free(g_shader_bundle_bytes);
+    g_shader_bundle_bytes = NULL;
+    memset(&g_shader_bundle, 0, sizeof(g_shader_bundle));
+    InterlockedExchange(&g_shader_bundle_dump_state, 0);
+    InterlockedExchange64(&g_shader_bundle_hits, 0);
+    InterlockedExchange64(&g_shader_bundle_misses, 0);
+    InterlockedExchange64(&g_shader_bundle_fallbacks, 0);
+    InterlockedExchange64(&g_shader_bundle_saved_bytes, 0);
+    InterlockedExchange(&g_shader_bundle_saved_entries, 0);
     for (unsigned i=0;i<sizeof(rsx_graphics_options)/sizeof(rsx_graphics_options[0]);++i) {
         const rsx_graphics_option* o=&rsx_graphics_options[i];
         const char* value=getenv(o->environment);
@@ -8695,6 +11461,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     ld_present_measure_init();
 #if defined(YZ_PERF_PROFILE)
     memset(&g_ld_profile, 0, sizeof(g_ld_profile));
+    memset(&g_ld_slow_draw, 0, sizeof(g_ld_slow_draw));
     {
         LARGE_INTEGER frequency;
         QueryPerformanceFrequency(&frequency);
@@ -9025,6 +11792,8 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     sink.flip = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
 
+    ld_slow_draw_configure();
+    shader_bundle_load_initial();
     g.ready = 1;
     g.enabled = 1;
     return 0;
@@ -9133,6 +11902,22 @@ void rsx_live_draw_method(u32 method, u32 arg)
         if (!g_ld_movie_track_rsx) return;
     }
     rsx_dispatch_method(&g.rsx, method, arg);
+}
+
+void rsx_live_draw_vp_burst_32(const u32 words[32])
+{
+    /* Preserve the per-method movie/debug serialization and movie suppression
+     * paths. The ordinary ready path has no side effects between consecutive
+     * VP instruction words, so it can update the 32-word burst in one call. */
+    if (ld_movie_composite_ui_enabled() || g_ld_debug_layer_enabled ||
+        g_ld_movie_mode) {
+        for (u32 i = 0; i < 32; ++i)
+            rsx_live_draw_method(0x0B80u + i * 4u, words[i]);
+        return;
+    }
+
+    if (!g.ready) return;
+    rsx_vp_burst_dispatch_32(&g.rsx, 0, 0x0B80u, words);
 }
 
 void rsx_live_draw_set_movie_mode(int on)
@@ -9300,9 +12085,24 @@ double rsx_live_draw_get_present_fps(void)
         : 0.0;
 }
 
+static void ld_report_counters(void);
+
 void rsx_live_draw_dump_present_samples(void)
 {
+    /* Haze exits after this diagnostic dump without renderer teardown. */
+    if (g.ready) ld_report_counters();
+    ld_texture_diag_dump();
+    ld_slow_flush_dump();
+    ld_texture_content_summary();
+    ld_slow_draw_dump();
+#if defined(YZ_PERF_PROFILE)
+    ld_profile_buffers_dump();
+#endif
+    ld_pull_summary();
     ld_present_measure_dump();
+    ld_texture_watch_summary();
+    ld_geometry_cache_summary();
+    ld_vertex_worker_summary();
 }
 
 /* Present a host-decoded RGBA8 frame to the window: copy it straight into the
@@ -9747,9 +12547,54 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
     fflush(stderr);
 }
 
+/* Routine counters are emitted by exit dumps and shutdown. Renderer diagnostics
+ * may also report during frames; ordinary presentation must not contend
+ * on the shared CRT stderr lock for a periodic status line. */
+static void ld_report_counters(void)
+{
+    fprintf(stderr,
+            "[live-draw] frame %u packets[seen=%llu queued=%llu movie=%llu qfull=%llu] "
+            "groups[seen=%llu exec=%llu empty=%llu drop{fetch=%llu degen=%llu prim=%llu "
+            "alloc=%llu pso=%llu ring=%llu surface=%llu}] clears[guest=%llu badsurf=%llu implicitZ=%llu] "
+            "textures[cached=%u/%u full=%llu decodefail=%llu depthSRV=%llu rejectZ=%llu] "
+            "vtex[cached=%u enabled=%llu binds=%llu uploads=%llu refresh=%llu "
+            "unsupported=%llu missingTXL=%llu] divider=%llu "
+            "balance[p=%s g=%s] binds[white=%llu real=%llu surf=%llu] "
+            "probe_skip_sampling=%llu (cumulative)\n",
+            g_ld_frames,
+            g_ld_stats.packets_seen, g_ld_stats.packets_queued,
+            g_ld_stats.packets_movie, g_ld_stats.packets_queue_full,
+            g_ld_stats.groups_seen, g_ld_stats.groups_executed,
+            g_ld_stats.groups_empty, g_ld_stats.group_drop_fetch,
+            g_ld_stats.group_drop_degenerate, g_ld_stats.group_drop_primitive,
+            g_ld_stats.group_drop_alloc, g_ld_stats.group_drop_pso,
+            g_ld_stats.group_drop_ring, g_ld_stats.group_drop_surface,
+            g_ld_stats.clears, g_ld_stats.clear_drop_surface,
+            g_ld_stats.implicit_depth_clears,
+            g.n_textures, MAX_TEXTURES,
+            (unsigned long long)g_ld_texture_cache_full,
+            (unsigned long long)g_ld_texture_decode_fail,
+            (unsigned long long)g_ld_zdepth_srv_binds,
+            (unsigned long long)g_ld_zdepth_srv_reject_no_write,
+            g.n_vtex,
+            (unsigned long long)g_ld_vtex_enabled,
+            (unsigned long long)g_ld_vtex_binds,
+            (unsigned long long)g_ld_vtex_uploads,
+            (unsigned long long)g_ld_vtex_refreshes,
+            (unsigned long long)g_ld_vtex_unsupported,
+            (unsigned long long)g_ld_vtex_missing_for_txl,
+            (unsigned long long)g_ld_divider_fetches,
+            g_ld_stats.packets_seen == g_ld_stats.packets_queued +
+                g_ld_stats.packets_movie + g_ld_stats.packets_queue_full ? "ok" : "BAD",
+            g_ld_stats.groups_seen == ld_groups_accounted() ? "ok" : "BAD",
+            g_ld_bind_white, g_ld_bind_real, g_ld_bind_surf,
+            g_ld_stats.groups_probe_skipped);
+}
+
 void rsx_live_draw_present(u32 buffer_id)
 {
     if (!g.ready) return;
+    ld_pull_update();
     if (!ld_refresh_display_state()) return;
     if (g_ld_frames%60==0) {
         static const char* clear_control=(const char*)-1;
@@ -9769,7 +12614,7 @@ void rsx_live_draw_present(u32 buffer_id)
         if (work_control) {
             FILE* file=fopen(work_control,"r"); unsigned flags;
             if (file) {
-                if (fscanf(file,"%u",&flags)==1 && flags<=2047 && flags!=g_ld_cpu_work) {
+                if (fscanf(file,"%u",&flags)==1 && flags<=16383 && flags!=g_ld_cpu_work) {
                     g_ld_cpu_work=flags;
                     fprintf(stderr,"[cpu-work] frame=%u flags=%u\n",g_ld_frames,flags);
                 }
@@ -9841,6 +12686,24 @@ void rsx_live_draw_present(u32 buffer_id)
             }
         }
         static const char* control=(const char*)-1;
+        static const char* geometry_control=(const char*)-1;
+        static const char* worker_control=(const char*)-1;
+        if (worker_control==(const char*)-1) worker_control=getenv("RSX_VERTEX_WORKERS_FILE");
+        if (worker_control) {
+            FILE* file=fopen(worker_control,"r"); unsigned workers;
+            if (file) {
+                if (fscanf(file,"%u",&workers)==1 && workers<=3) g_ld_vertex_workers=(int)workers;
+                fclose(file);
+            }
+        }
+        if (geometry_control==(const char*)-1) geometry_control=getenv("RSX_GEOMETRY_CACHE_FILE");
+        if (geometry_control) {
+            FILE* file=fopen(geometry_control,"r"); unsigned enabled;
+            if (file) {
+                if (fscanf(file,"%u",&enabled)==1 && enabled<=1) g_ld_geometry_cache_enabled=(int)enabled;
+                fclose(file);
+            }
+        }
         if (control==(const char*)-1) control=getenv("RSX_VERTEX_CACHE_FILE");
         if (control) {
             FILE* file=fopen(control,"r"); unsigned enabled;
@@ -10471,47 +13334,9 @@ void rsx_live_draw_present(u32 buffer_id)
         }
     }
 #endif
-    /* First 32 frames verbatim, then every 32nd: keeps the log bounded while
-     * making the TRUE frame count measurable from the log. (The old hard cap
-     * at 32 made "stalls at frame ~32" unfalsifiable from the .err alone.) */
-    if (g_ld_frames <= 32 || (g_ld_frames & 31) == 0)
-        fprintf(stderr,
-                "[live-draw] frame %u packets[seen=%llu queued=%llu movie=%llu qfull=%llu] "
-                "groups[seen=%llu exec=%llu empty=%llu drop{fetch=%llu degen=%llu prim=%llu "
-                "alloc=%llu pso=%llu ring=%llu surface=%llu}] clears[guest=%llu badsurf=%llu implicitZ=%llu] "
-                "textures[cached=%u/%u full=%llu decodefail=%llu depthSRV=%llu rejectZ=%llu] "
-                "vtex[cached=%u enabled=%llu binds=%llu uploads=%llu refresh=%llu "
-                "unsupported=%llu missingTXL=%llu] divider=%llu "
-                "balance[p=%s g=%s] binds[white=%llu real=%llu surf=%llu] "
-                "probe_skip_sampling=%llu (cumulative)\n",
-                g_ld_frames,
-                g_ld_stats.packets_seen, g_ld_stats.packets_queued,
-                g_ld_stats.packets_movie, g_ld_stats.packets_queue_full,
-                g_ld_stats.groups_seen, g_ld_stats.groups_executed,
-                g_ld_stats.groups_empty, g_ld_stats.group_drop_fetch,
-                g_ld_stats.group_drop_degenerate, g_ld_stats.group_drop_primitive,
-                g_ld_stats.group_drop_alloc, g_ld_stats.group_drop_pso,
-                g_ld_stats.group_drop_ring, g_ld_stats.group_drop_surface,
-                g_ld_stats.clears, g_ld_stats.clear_drop_surface,
-                g_ld_stats.implicit_depth_clears,
-                g.n_textures, MAX_TEXTURES,
-                (unsigned long long)g_ld_texture_cache_full,
-                (unsigned long long)g_ld_texture_decode_fail,
-                (unsigned long long)g_ld_zdepth_srv_binds,
-                (unsigned long long)g_ld_zdepth_srv_reject_no_write,
-                g.n_vtex,
-                (unsigned long long)g_ld_vtex_enabled,
-                (unsigned long long)g_ld_vtex_binds,
-                (unsigned long long)g_ld_vtex_uploads,
-                (unsigned long long)g_ld_vtex_refreshes,
-                (unsigned long long)g_ld_vtex_unsupported,
-                (unsigned long long)g_ld_vtex_missing_for_txl,
-                (unsigned long long)g_ld_divider_fetches,
-                g_ld_stats.packets_seen == g_ld_stats.packets_queued +
-                    g_ld_stats.packets_movie + g_ld_stats.packets_queue_full ? "ok" : "BAD",
-                g_ld_stats.groups_seen == ld_groups_accounted() ? "ok" : "BAD",
-                g_ld_bind_white, g_ld_bind_real, g_ld_bind_surf,
-                g_ld_stats.groups_probe_skipped);
+    if (LD_DIAG_ENABLED("RSX_LIVE_FEED_DBG") &&
+        (g_ld_frames <= 32 || (g_ld_frames & 31) == 0))
+        ld_report_counters();
     /* [fps] heartbeat: direct frame-rate logging, one line per ~5s wall.
      * Exists because pace repeatedly had to be inferred from frame-counter
      * arithmetic and log ordering, and two such inferences were wrong in one
@@ -10834,6 +13659,7 @@ void rsx_live_draw_present(u32 buffer_id)
                   } }
                 (void)hi; (void)rbase;
             } }
+          if (LD_DIAG_ENABLED("RSX_LIVE_FEED_DBG"))
           fprintf(stderr, "[fps] %.1f (frames %u..%u over %.1fs)\n",
                   (g_ld_frames - fps_f0) * 1000.0 / (double)(now - fps_t0),
                   fps_f0, g_ld_frames, (now - fps_t0) / 1000.0);
@@ -10972,13 +13798,51 @@ void rsx_live_draw_present(u32 buffer_id)
 
 void rsx_live_draw_shutdown(void)
 {
-    if (!g.ready) { ld_texture_content_clear(); return; }
+    if (!g.ready) {
+        ld_texture_diag_dump();
+        ld_slow_flush_dump();
+        ld_slow_draw_dump();
+        free(g_ld_slow_draw.events);
+        memset(&g_ld_slow_draw, 0, sizeof(g_ld_slow_draw));
+        ld_texture_content_clear();
+        free(g_shader_bundle_bytes);
+        g_shader_bundle_bytes = NULL;
+        memset(&g_shader_bundle, 0, sizeof(g_shader_bundle));
+        return;
+    }
+    ld_report_counters();
+    ld_texture_diag_dump();
+    ld_slow_flush_dump();
+    ld_slow_draw_dump();
+#if defined(YZ_PERF_PROFILE)
+    ld_profile_buffers_dump();
+    rsx_profile_buffer_destroy(&g_ld_profile_csv);
+    rsx_profile_buffer_destroy(&g_ld_geometry_csv);
+    rsx_profile_buffer_destroy(&g_ld_texture_misses_csv);
+    rsx_profile_buffer_destroy(&g_ld_texture_content_csv);
+#endif
+    free(g_ld_slow_draw.events);
+    memset(&g_ld_slow_draw, 0, sizeof(g_ld_slow_draw));
+    ld_vertex_worker_summary();
+    ld_vertex_workers_clear();
+    ld_geometry_cache_summary();
+    ld_geometry_cache_clear();
+    if (g_texture_watch.base) {
+        ld_texture_watch_summary();
+        rsx_texture_write_watch_destroy(&g_texture_watch);
+    }
     rsx_vertex_payload_cache_clear(&g_ld_vertex_cache);
     ld_vertex_diag_emit("shutdown", 1);
+    ld_pull_summary();
+    free(g_ld_pull_payload.data);
+    memset(&g_ld_pull_payload,0,sizeof g_ld_pull_payload);
+    g_ld_pull_active=0;
     ld_present_measure_dump();
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
+    rsx_live_draw_dump_shader_cache();
+    ld_texture_content_summary();
     ld_texture_content_clear();
     rsx_frame_limiter_destroy(&g_ld_frame_limiter);
 #if defined(YZ_PERF_PROFILE)
@@ -11185,6 +14049,9 @@ void rsx_live_draw_shutdown(void)
     for (u32 i = 0; i < g.n_psos; i++) if (g.psos[i].pso) g.psos[i].pso->lpVtbl->Release(g.psos[i].pso);
     shader_blob_cache_release(&g.vs_blobs);
     shader_blob_cache_release(&g.ps_blobs);
+    free(g_shader_bundle_bytes);
+    g_shader_bundle_bytes = NULL;
+    memset(&g_shader_bundle, 0, sizeof(g_shader_bundle));
     for (u32 i = 0; i < g.n_textures; i++) if (g.textures[i].tex) g.textures[i].tex->lpVtbl->Release(g.textures[i].tex);
     for (u32 i = 0; i < g.n_vtex; i++) if (g.vtex[i].tex) g.vtex[i].tex->lpVtbl->Release(g.vtex[i].tex);
     for (u32 i = 0; i < g.n_surfaces; i++) if (g.surfaces[i].tex) g.surfaces[i].tex->lpVtbl->Release(g.surfaces[i].tex);
@@ -11194,6 +14061,7 @@ void rsx_live_draw_shutdown(void)
         if (g.zdepths[i].snapshot)
             g.zdepths[i].snapshot->lpVtbl->Release(
                 g.zdepths[i].snapshot);
+        if (g.zdepths[i].packed) g.zdepths[i].packed->lpVtbl->Release(g.zdepths[i].packed);
     }
     if (g.movie_upload) g.movie_upload->lpVtbl->Release(g.movie_upload);
     if (g.movie_overlay_readback) g.movie_overlay_readback->lpVtbl->Release(g.movie_overlay_readback);
@@ -11204,6 +14072,8 @@ void rsx_live_draw_shutdown(void)
     if (g.ps_cb) g.ps_cb->lpVtbl->Release(g.ps_cb);
     if (g.depth_snapshot_pso)
         g.depth_snapshot_pso->lpVtbl->Release(g.depth_snapshot_pso);
+    if (g.depth_pack_pso) g.depth_pack_pso->lpVtbl->Release(g.depth_pack_pso);
+    if (g.depth_pack_rootsig) g.depth_pack_rootsig->lpVtbl->Release(g.depth_pack_rootsig);
     if (g.depth_snapshot_rootsig)
         g.depth_snapshot_rootsig->lpVtbl->Release(
             g.depth_snapshot_rootsig);

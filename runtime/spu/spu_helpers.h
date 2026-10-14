@@ -180,22 +180,23 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
  *   otherwise           -> concat{a,b}[sel & 0x1F] */
 #if defined(__SSE4_1__)
 #include <smmintrin.h>
-/* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
- * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
- * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
+/* Work in host byte order: each control byte already occupies its output
+ * byte's host position. XOR the selected SPU byte index with 3 to address the
+ * host-order source, avoiding four byte-order shuffles per instruction. */
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
-    const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
     __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
-    A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);
-    const __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0F));
-    const __m128i fromb = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
+    const __m128i idx = _mm_xor_si128(_mm_and_si128(C, _mm_set1_epi8(0x0F)), _mm_set1_epi8(3));
+    /* Only each byte's sign bit controls blendv. Shift selector bit 4 there;
+     * carries across byte boundaries cannot affect that destination bit. */
+    const __m128i fromb = _mm_slli_epi32(C, 3);
     __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), fromb);
     /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
-    const __m128i m80 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0x80)), _mm_set1_epi8((char)0x80));
-    const __m128i mC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xC0)), _mm_set1_epi8((char)0xC0));
-    const __m128i mE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xE0)), _mm_set1_epi8((char)0xE0));
+    /* Signed thresholds classify negative selectors. Positive selectors can
+     * produce any special value because C's own sign bit excludes it. */
+    const __m128i mC0 = _mm_cmpgt_epi8(C, _mm_set1_epi8((char)0xBF));
+    const __m128i mE0 = _mm_cmpgt_epi8(C, _mm_set1_epi8((char)0xDF));
     const __m128i special = _mm_blendv_epi8(mC0, _mm_set1_epi8((char)0x80), mE0);
-    r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
+    r = _mm_blendv_epi8(r, special, C);
     u128 out; memcpy(&out, &r, 16); return out;
 }
 /* The byte loop stays as the reference (tests/test_spu_shufb.c checks both). */

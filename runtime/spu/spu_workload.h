@@ -34,6 +34,56 @@ extern "C" {
 
 typedef void (*spu_lifted_entry_fn)(spu_context*);
 
+/* Optional async-task lifecycle probe. The caller registers this once during
+ * startup, before any async SPU workers are dispatched, and leaves it unchanged
+ * until shutdown. QPC values are host QueryPerformanceCounter ticks. The
+ * callback runs on the submitting or worker thread and must be bounded. */
+typedef struct {
+    uint64_t job_id;
+    int32_t image_id;
+    uint32_t args_ea;
+    uint32_t taskset_ea;
+    uint32_t taskid;
+    uint32_t r3[4];
+    uint32_t have_r3;
+    uint32_t dispatch_cause;
+    uint64_t claim_qpc;
+    uint64_t ready_qpc;
+} spu_async_trace_snapshot;
+
+enum {
+    SPU_TASKSET_DISPATCH_UNKNOWN = 0,
+    SPU_TASKSET_DISPATCH_CREATE = 1,
+    SPU_TASKSET_DISPATCH_TASK_EXIT = 2,
+    SPU_TASKSET_DISPATCH_POLL = 3,
+    SPU_TASKSET_DISPATCH_WAKE = 4
+};
+
+enum {
+    SPU_ASYNC_TRACE_SUBMIT = 1,
+    SPU_ASYNC_TRACE_CREATE_THREAD = 2,
+    SPU_ASYNC_TRACE_WORKER_SETUP = 3,
+    SPU_ASYNC_TRACE_ABI_EXECUTION = 4,
+    SPU_ASYNC_TRACE_POST_EXECUTION = 5,
+    SPU_ASYNC_TRACE_THREAD_CLEANUP = 6,
+    SPU_ASYNC_TRACE_CREATE_THREAD_FAILED = 7,
+    SPU_ASYNC_TRACE_SETUP_FAILED = 8,
+    SPU_ASYNC_TRACE_REUSE_WORKER = 9,
+    SPU_ASYNC_TRACE_DISPATCH_DISCOVERY = 10
+};
+
+typedef void (*spu_async_trace_callback)(unsigned phase,
+                                         const spu_async_trace_snapshot* snapshot,
+                                         uint64_t begin_qpc,
+                                         uint64_t end_qpc);
+
+/* Diagnostic callback registration; setting NULL disables lifecycle probes.
+ * The callback must be installed before workers start and remain immutable. */
+void spu_workload_set_async_trace_callback(spu_async_trace_callback callback);
+/* Diagnostic timestamp at a taskset-ready claim. Returns zero when the
+ * callback is absent or this build has no Windows QPC trace implementation. */
+uint64_t spu_workload_async_trace_mark(void);
+
 /* FNV-1a 64-bit over a byte range. The canonical workload fingerprint; the
  * offline extractor computes the same value so registrations and the images a
  * title passes to cellSpurs line up. */
@@ -51,6 +101,12 @@ void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
  * resolves within the correct image when several share LS addresses. */
 void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
                                int image_id, const char* name);
+
+/* Startup-only opt-in for an exact registered image. The title must audit TLS
+ * isolation across sequential invocations. This caches idle host threads only:
+ * it does not queue jobs or limit active concurrency. Returns 0 on mismatch.
+ * Persistent/unknown images keep the dedicated-thread path by default. */
+int spu_workload_allow_worker_reuse(uint64_t fingerprint, int image_id);
 
 /* Look up a lifted entry by fingerprint; NULL if none registered. */
 spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint);
@@ -128,12 +184,20 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
 /* Explicit identity for SPU-created tasks; avoids racing PPU dispatch globals. */
 int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
                                     uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid);
+int spu_workload_dispatch_async_task_provenance(const uint8_t* image, uint32_t image_size,
+                                                uint32_t args_ea, uint32_t taskset_ea,
+                                                uint32_t taskid, uint32_t dispatch_cause,
+                                                uint64_t claim_qpc, uint64_t ready_qpc);
 int spu_taskset_claim(uint32_t taskset_ea, uint32_t taskid);
 void spu_taskset_release(uint32_t taskset_ea, uint32_t taskid);
 void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t taskid);
 void spu_taskset_start_ready(uint32_t taskset_ea);
+void spu_taskset_start_ready_cause(uint32_t taskset_ea, uint32_t dispatch_cause);
 void spu_taskset_capture_args(uint32_t taskset_ea, uint32_t taskid, uint32_t args[4]);
 void spu_taskset_poll(uint32_t spurs_ea);
+void spu_taskset_poll_cause(uint32_t spurs_ea, uint32_t dispatch_cause);
+void spu_taskset_wake_register(uint32_t spurs_ea, void* event);
+void spu_taskset_wake_unregister(uint32_t spurs_ea);
 
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);

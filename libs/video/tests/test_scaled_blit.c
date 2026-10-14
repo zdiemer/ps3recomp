@@ -27,6 +27,7 @@ void spu_coh_notify_write(uint32_t ea) {
 }
 void ps3_ww_report_inline(uint32_t ea,uint64_t v,int w) { (void)ea;(void)v;(void)w;assert(0); }
 int rsx_live_draw_enabled(void) { return 0; }
+u32 rsx_live_draw_get_frames(void) { return 0; }
 int rsx_live_draw_blit(u32 a,u32 b,u32 c,u32 d,u32 e,u32 f,u32 g,u32 h)
 { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0; }
 int rsx_live_draw_resolve_blit(u32 a,u32 b,u32 c,u32 d,u32 e,u32 f,u32 g,u32 h,u32 i,u32 j,u32 k,u32 l)

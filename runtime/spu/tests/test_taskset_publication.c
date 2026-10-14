@@ -14,17 +14,27 @@ static volatile LONG completed;
 void spu_lockline_lock(void) { assert(!held); AcquireSRWLockExclusive(&lock); held = 1; }
 void spu_lockline_unlock(void) { assert(held); held = 0; ReleaseSRWLockExclusive(&lock); }
 void spu_coh_notify_write(uint32_t ea) { assert(held && ea >= 0x100 && ea < 0x1A00); }
+int spu_coh_watch_taskset(uint32_t ea, uint32_t owner, void* host, void* event,
+                          uint64_t (*qpc)(void))
+{ assert(held); (void)ea; (void)owner; (void)host; (void)event; (void)qpc; return 0; }
+void spu_coh_unwatch_tasksets(uint32_t owner) { assert(held); (void)owner; }
+uint64_t spu_coh_taskset_ready_qpc_locked(uint32_t ea, uint32_t task)
+{ assert(held); (void)ea; (void)task; return 0; }
 int spu_coh_is_reserved(uint32_t ea) { (void)ea; return 1; }
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t ea, uint64_t value, int width)
 { (void)ea; (void)value; (void)width; }
 size_t spu_elf_image_size(const uint8_t* p, size_t max)
 { assert(!held && p == memory + 0x4000 && max >= 16); return 16; }
-int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t size,
-                                     uint32_t context, uint32_t ts, uint32_t task)
+uint64_t spu_workload_async_trace_mark(void) { return 0; }
+int spu_workload_dispatch_async_task_provenance(const uint8_t* image, uint32_t size,
+                                                uint32_t context, uint32_t ts,
+                                                uint32_t task, uint32_t cause,
+                                                uint64_t claim_qpc, uint64_t ready_qpc)
 {
     assert(!held && image == memory + 0x4000 && size == 16);
     assert(context == 0x5000 && ts == 0x100 && task < 128);
+    assert(cause <= SPU_TASKSET_DISPATCH_POLL && claim_qpc == 0 && ready_qpc == 0);
     return 1;
 }
 static DWORD WINAPI producer(LPVOID arg)
