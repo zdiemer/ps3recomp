@@ -20,11 +20,15 @@ void ps3_ww_report_inline(uint32_t ea, uint64_t value, int width)
 { (void)ea; (void)value; (void)width; }
 size_t spu_elf_image_size(const uint8_t* p, size_t max)
 { assert(!held && p == memory + 0x4000 && max >= 16); return 16; }
-int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t size,
-                                     uint32_t context, uint32_t ts, uint32_t task)
+uint64_t spu_workload_async_trace_mark(void) { return 0; }
+int spu_workload_dispatch_async_task_provenance(const uint8_t* image, uint32_t size,
+                                                uint32_t context, uint32_t ts,
+                                                uint32_t task, uint32_t cause,
+                                                uint64_t claim_qpc)
 {
     assert(!held && image == memory + 0x4000 && size == 16);
     assert(context == 0x5000 && ts == 0x100 && task < 128);
+    assert(cause <= SPU_TASKSET_DISPATCH_POLL && claim_qpc == 0);
     return 1;
 }
 static DWORD WINAPI producer(LPVOID arg)

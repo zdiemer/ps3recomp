@@ -46,7 +46,16 @@ typedef struct {
     uint32_t taskid;
     uint32_t r3[4];
     uint32_t have_r3;
+    uint32_t dispatch_cause;
+    uint64_t claim_qpc;
 } spu_async_trace_snapshot;
+
+enum {
+    SPU_TASKSET_DISPATCH_UNKNOWN = 0,
+    SPU_TASKSET_DISPATCH_CREATE = 1,
+    SPU_TASKSET_DISPATCH_TASK_EXIT = 2,
+    SPU_TASKSET_DISPATCH_POLL = 3
+};
 
 enum {
     SPU_ASYNC_TRACE_SUBMIT = 1,
@@ -57,7 +66,8 @@ enum {
     SPU_ASYNC_TRACE_THREAD_CLEANUP = 6,
     SPU_ASYNC_TRACE_CREATE_THREAD_FAILED = 7,
     SPU_ASYNC_TRACE_SETUP_FAILED = 8,
-    SPU_ASYNC_TRACE_REUSE_WORKER = 9
+    SPU_ASYNC_TRACE_REUSE_WORKER = 9,
+    SPU_ASYNC_TRACE_DISPATCH_DISCOVERY = 10
 };
 
 typedef void (*spu_async_trace_callback)(unsigned phase,
@@ -68,6 +78,9 @@ typedef void (*spu_async_trace_callback)(unsigned phase,
 /* Diagnostic callback registration; setting NULL disables lifecycle probes.
  * The callback must be installed before workers start and remain immutable. */
 void spu_workload_set_async_trace_callback(spu_async_trace_callback callback);
+/* Diagnostic timestamp at a taskset-ready claim. Returns zero when the
+ * callback is absent or this build has no Windows QPC trace implementation. */
+uint64_t spu_workload_async_trace_mark(void);
 
 /* FNV-1a 64-bit over a byte range. The canonical workload fingerprint; the
  * offline extractor computes the same value so registrations and the images a
@@ -173,10 +186,15 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
 /* Explicit identity for SPU-created tasks; avoids racing PPU dispatch globals. */
 int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
                                     uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid);
+int spu_workload_dispatch_async_task_provenance(const uint8_t* image, uint32_t image_size,
+                                                uint32_t args_ea, uint32_t taskset_ea,
+                                                uint32_t taskid, uint32_t dispatch_cause,
+                                                uint64_t claim_qpc);
 int spu_taskset_claim(uint32_t taskset_ea, uint32_t taskid);
 void spu_taskset_release(uint32_t taskset_ea, uint32_t taskid);
 void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t taskid);
 void spu_taskset_start_ready(uint32_t taskset_ea);
+void spu_taskset_start_ready_cause(uint32_t taskset_ea, uint32_t dispatch_cause);
 void spu_taskset_capture_args(uint32_t taskset_ea, uint32_t taskid, uint32_t args[4]);
 void spu_taskset_poll(uint32_t spurs_ea);
 

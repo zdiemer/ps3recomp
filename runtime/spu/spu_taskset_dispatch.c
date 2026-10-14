@@ -56,12 +56,13 @@ void spu_taskset_capture_args(uint32_t ea, uint32_t task, uint32_t args[4])
     spu_lockline_unlock();
 }
 
-void spu_taskset_start_ready(uint32_t ea)
+void spu_taskset_start_ready_cause(uint32_t ea, uint32_t dispatch_cause)
 {
     if (!ea) return;
     for (uint32_t task = 0; task < 128; ++task) {
         uint8_t mask = (uint8_t)(0x80u >> (task & 7));
         uint32_t elf = 0, context = 0;
+        uint64_t claim_qpc = 0;
         spu_lockline_lock();
         uint8_t* ts = vm_base + ea;
         uint8_t* run = ts_running(ea);
@@ -71,19 +72,28 @@ void spu_taskset_start_ready(uint32_t ea)
             const uint8_t* ti = ts + CSTS_TASKINFO + 0x30 * task;
             elf = be32(ti + TI_ELF + 4) & ~7u;
             context = be32(ti + TI_CONTEXT + 4) & ~127u;
-            if (elf) run[task / 8] |= mask; /* claim before unlocking/spawning */
+            if (elf) {
+                run[task / 8] |= mask; /* claim before unlocking/spawning */
+                claim_qpc = spu_workload_async_trace_mark();
+            }
         }
         spu_lockline_unlock();
         if (!elf) continue;
         size_t size = spu_elf_image_size(vm_base + elf, 2u * 1024 * 1024);
-        if (!size || !spu_workload_dispatch_async_task(vm_base + elf, (uint32_t)size,
-                                                      context, ea, task)) {
+        if (!size || !spu_workload_dispatch_async_task_provenance(
+                         vm_base + elf, (uint32_t)size, context, ea, task,
+                         dispatch_cause, claim_qpc)) {
             spu_taskset_release(ea, task); /* leave guest ready state for retry */
             continue;
         }
         if (ps3_log_verbose())
             fprintf(stderr, "[taskset] scheduled task %u of 0x%08X elf=0x%08X\n", task, ea, elf);
     }
+}
+
+void spu_taskset_start_ready(uint32_t ea)
+{
+    spu_taskset_start_ready_cause(ea, SPU_TASKSET_DISPATCH_UNKNOWN);
 }
 
 void spu_taskset_task_exited(uint32_t ea, uint32_t task)
@@ -99,7 +109,7 @@ void spu_taskset_task_exited(uint32_t ea, uint32_t task)
     if (run) run[task / 8] &= (uint8_t)~mask;
     spu_coh_notify_write(ea);
     spu_lockline_unlock();
-    spu_taskset_start_ready(ea);
+    spu_taskset_start_ready_cause(ea, SPU_TASKSET_DISPATCH_TASK_EXIT);
 }
 
 void spu_taskset_poll(uint32_t spurs_ea)
@@ -113,5 +123,6 @@ void spu_taskset_poll(uint32_t spurs_ea)
             tasksets[count++] = ea;
     }
     spu_lockline_unlock();
-    for (unsigned i = 0; i < count; ++i) spu_taskset_start_ready(tasksets[i]);
+    for (unsigned i = 0; i < count; ++i)
+        spu_taskset_start_ready_cause(tasksets[i], SPU_TASKSET_DISPATCH_POLL);
 }
