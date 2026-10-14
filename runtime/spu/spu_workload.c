@@ -1339,7 +1339,6 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
         }
     }
     if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
-    taskset_parked_del_locked(taskset_ea, taskId);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
@@ -1354,12 +1353,14 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
         }
     }
     if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
-    taskset_parked_del_locked(taskset_ea, taskId);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
     if (drained) { static int _d = 0; if (_d++ < 24)
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
+    /* The syscall caller removes its parked entry after this returns. Keep
+     * that lifetime: a gated event-flag producer can still latch the next guest
+     * signal while this completed wait is reacquiring the serial token. */
     spu_serial_acquire();       /* resume: re-take the serial lock */
     { extern unsigned long long ps3_ms_now(void);
       s_wait_exit_ms = ps3_ms_now(); }   /* stamp for the next entry's ran= */

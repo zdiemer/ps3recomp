@@ -28,7 +28,11 @@ def harness() -> str:
                       "int spu_workload_dispatch_async_task_provenance(")
     signals = signals.replace('#include "../../libs/spurs/spurs_taskset.h"',
                               '#include "libs/spurs/spurs_taskset.h"')
-    return HARNESS.replace("@@SIGNALS@@", signals).replace("@@ATOMIC@@", atomic)
+    spurs = (ROOT / "libs/spurs/cellSpurs.c").read_text(encoding="utf-8")
+    handoff = between(spurs, "            int woke = spu_taskset_signal_parked_obj(",
+                      "            static int _n = 0;")
+    return (HARNESS.replace("@@SIGNALS@@", signals).replace("@@ATOMIC@@", atomic)
+            .replace("@@EVENTFLAG_HANDOFF@@", handoff))
 
 
 HARNESS = r'''
@@ -46,12 +50,19 @@ static SRWLOCK coherence_lock = SRWLOCK_INIT;
 static _Thread_local int coherence_held;
 static volatile LONG broadcasts, commit_calls, flag_calls, ready_calls;
 static HANDLE wait_entered, signal_lock_entered;
+static HANDLE serial_acquire_entered, serial_acquire_go;
+static volatile LONG pause_serial_acquire;
 static uint64_t now_ms(void) { return GetTickCount64(); }
 unsigned long long ps3_ms_now(void) { return now_ms(); }
 uint32_t g_barrier_sync_watch;
 static volatile unsigned g_spu_putllc_count, g_spu_putllc_sync_hit;
 static void spu_serial_release(void) {}
-static void spu_serial_acquire(void) {}
+static void spu_serial_acquire(void) {
+    if (InterlockedCompareExchange(&pause_serial_acquire, 0, 1) == 1) {
+        SetEvent(serial_acquire_entered);
+        assert(WaitForSingleObject(serial_acquire_go, 2000) == WAIT_OBJECT_0);
+    }
+}
 void spu_lockline_lock(void) {
     assert(!coherence_held);
     AcquireSRWLockExclusive(&coherence_lock); coherence_held = 1;
@@ -174,6 +185,7 @@ static void before_wait(void) {
     signal_spu(TS_A, TASK, MFC_PUTLLUC_CMD);
     assert(broadcasts == 1);
     assert(spu_taskset_wait_signal(TS_A, TASK) == 0);
+    spu_taskset_parked_del(TS_A, TASK);
     assert(!signalled(TS_A, TASK) && !atomic_load(&s_parked_count));
 }
 static void spurious_and_failed(void) {
@@ -211,6 +223,7 @@ static void reuse(void) {
     assert(!signalled(TS_A, TASK) && !signalled(TS_A, OTHER));
     assert(spu_taskset_signal_parked_obj(TS_A, 0x3330) == 1);
     assert(spu_taskset_wait_signal(TS_A, OTHER) == 0);
+    spu_taskset_parked_del(TS_A, OTHER);
     assert(!atomic_load(&s_parked_count) && !signalled(TS_A, OTHER));
     /* Reusing the same task id cannot consume a signal from the completed wait. */
     waiter w; HANDLE th = park(&w, TS_A, OTHER);
@@ -228,13 +241,38 @@ static void last_deletion_overlap(void) {
     taskset_signal_lock(); ResetEvent(signal_lock_entered);
     HANDLE th = CreateThread(NULL, 0, commit_main, NULL, 0, NULL); assert(th);
     /* The notifier saw a nonempty table and is now blocked taking its mutex.
-     * Model WAIT_SIGNAL's actual locked cleanup before it acquires that mutex. */
+     * Model the caller's locked registry cleanup before it acquires that mutex. */
     assert(WaitForSingleObject(signal_lock_entered, 2000) == WAIT_OBJECT_0);
     assert(commit_calls == 1);
     taskset_parked_del_locked(TS_A, TASK);
     assert(!atomic_load(&s_parked_count)); taskset_signal_unlock();
     joined(th, 400);
     assert(broadcasts == 0 && flag_calls == 1 && ready_calls == 1);
+}
+static int eventflag_handoff(uint32_t taskset_ea, uint32_t ea) {
+    /* The actual opt-in EventFlagSet lookup/fallback/latch source. */
+@@EVENTFLAG_HANDOFF@@
+    return woke;
+}
+static void completed_wait_eventflag_signal(void) {
+    reset(); ResetEvent(serial_acquire_entered); ResetEvent(serial_acquire_go);
+    InterlockedExchange(&pause_serial_acquire, 1);
+    waiter w; HANDLE th = park(&w, TS_A, TASK);
+    signal_spu(TS_A, TASK, MFC_PUTLLC_CMD);
+    assert(WaitForSingleObject(serial_acquire_entered, 2000) == WAIT_OBJECT_0);
+    assert(!signalled(TS_A, TASK)); /* first wait consumed its signal */
+    /* Preserve the f15dfce registration lifetime. Removing the entry inside
+     * WAIT_SIGNAL instead returns zero here and takes the unsynchronized
+     * taskset-latch handoff. A next consume/park could then beat latch_wake. */
+    assert(eventflag_handoff(TS_A, 0x1080) == 1);
+    assert(signalled(TS_A, TASK) && !spu_taskset_consume_wake(TS_A));
+    SetEvent(serial_acquire_go); joined(th, 400);
+    assert(!atomic_load(&s_parked_count));
+    /* The next logical wait consumes the second guest signal immediately. */
+    w = (waiter){TS_A, TASK, 0};
+    th = CreateThread(NULL, 0, wait_main, &w, 0, NULL); assert(th);
+    joined(th, 400);
+    assert(!signalled(TS_A, TASK) && !atomic_load(&s_parked_count));
 }
 static HANDLE registry_go;
 static DWORD WINAPI registry_thread(void* p) {
@@ -280,11 +318,15 @@ int main(void) {
     SetEnvironmentVariableA("LBP_SYNC_ACK", NULL);
     wait_entered = CreateEventA(NULL, TRUE, FALSE, NULL); assert(wait_entered);
     signal_lock_entered = CreateEventA(NULL, TRUE, FALSE, NULL); assert(signal_lock_entered);
+    serial_acquire_entered = CreateEventA(NULL, TRUE, FALSE, NULL); assert(serial_acquire_entered);
+    serial_acquire_go = CreateEventA(NULL, TRUE, FALSE, NULL); assert(serial_acquire_go);
     before_wait();
     during_wait(MFC_PUTLLC_CMD); during_wait(MFC_PUTLLUC_CMD);
     during_wait(MFC_PUTQLLUC_CMD);
-    spurious_and_failed(); reuse(); last_deletion_overlap(); concurrent_registry(); fallback();
+    spurious_and_failed(); reuse(); last_deletion_overlap(); completed_wait_eventflag_signal();
+    concurrent_registry(); fallback();
     CloseHandle(wait_entered); CloseHandle(signal_lock_entered);
+    CloseHandle(serial_acquire_entered); CloseHandle(serial_acquire_go);
     puts("SPU signal wake actual-source contract passed"); return 0;
 }
 '''
