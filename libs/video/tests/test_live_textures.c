@@ -716,8 +716,8 @@ static void resolution_tests(void)
         read_subresource(g.surfaces[dest].tex,0,rb,0,DXGI_FORMAT_R8G8B8A8_UNORM,sf->w,sf->h);
         OK(g.list->lpVtbl->Close(g.list)); ID3D12CommandList* lists[]={(ID3D12CommandList*)g.list};
         g.queue->lpVtbl->ExecuteCommandLists(g.queue,1,lists);
-        OK(g.queue->lpVtbl->Signal(g.queue,g.fence,100+mode));
-        OK(g.fence->lpVtbl->SetEventOnCompletion(g.fence,100+mode,g.fence_event));
+        OK(g.queue->lpVtbl->Signal(g.queue,g.fence,100+2*mode));
+        OK(g.fence->lpVtbl->SetEventOnCompletion(g.fence,100+2*mode,g.fence_event));
         assert(WaitForSingleObject(g.fence_event,10000)==WAIT_OBJECT_0);
         u8* bytes; OK(rb->lpVtbl->Map(rb,0,NULL,(void**)&bytes));
         for(u32 y=0;y<sf->h;++y)for(u32 x=0;x<sf->w;++x) {
@@ -747,6 +747,68 @@ static void resolution_tests(void)
             assert(refreshed[2]==(inside?0x7C:0x5A));
         }
         rb->lpVtbl->Unmap(rb,0,NULL);
+        /* A two-sample surface has twice as many raw texels as pixels.
+         * Keep pitch fixed across mode changes: pitch alone cannot tell row
+         * padding from samples, and changing only AA must invalidate a pack. */
+        OK(g.alloc->lpVtbl->Reset(g.alloc)); OK(g.list->lpVtbl->Reset(g.list,g.alloc,NULL));
+        D3D12_RESOURCE_BARRIER restore={0}; restore.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        restore.Transition.pResource=g.zdepths[zslot-1].packed;
+        restore.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        restore.Transition.StateBefore=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        restore.Transition.StateAfter=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        g.list->lpVtbl->ResourceBarrier(g.list,1,&restore);
+        const u32 aa_modes[]={0,3,4,5,0};
+        u32 packed_widths[5],packed_heights[5];
+        for(u32 aa=0;aa<5;++aa) {
+            const u32 rows=aa_modes[aa]>=4 ? 2 : 1;
+            rsx_dispatch_method(&g.rsx,0x0208,8|(2u<<5)|(aa_modes[aa]<<12));
+            rsx_dispatch_method(&g.rsx,0x022C,64);
+            const u64 previous=g.zdepths[zslot-1].generation;
+            assert(zdepth_get(0,0x3000,8,8)==zslot);
+            assert(g.zdepths[zslot-1].generation>previous);
+            /* The consumer has AA disabled; producer metadata must survive. */
+            rsx_dispatch_method(&g.rsx,0x0208,8|(2u<<5));
+            assert(zdepth_pack(zslot-1,17,8*rows)==0);
+            assert(zdepth_pack(zslot-1,16,8*rows+1)==0);
+            assert(zdepth_pack(zslot-1,16,8*rows)==1);
+            zdepth_t* z=&g.zdepths[zslot-1];
+            packed_widths[aa]=z->packed_w; packed_heights[aa]=z->packed_h;
+            assert(z->packed_generation==z->generation);
+            const u32 destination=0x9000+aa*0x1000;
+            assert(ld_blit_gpu(0,0x3000,64,0,destination,64,16,8*rows)==1);
+            int copied=surface_containing(0,destination,64,16,8*rows,&px,&py);
+            assert(copied>=0);
+            packed_bar.Transition.pResource=g.surfaces[copied].tex;
+            g.list->lpVtbl->ResourceBarrier(g.list,1,&packed_bar);
+            read_subresource(g.surfaces[copied].tex,0,rb,aa*131072+65536,
+                DXGI_FORMAT_R8G8B8A8_UNORM,z->packed_w,z->packed_h);
+            copy_source(z->packed);
+            read_subresource(z->packed,0,rb,aa*131072,DXGI_FORMAT_R8G8B8A8_UNORM,z->packed_w,z->packed_h);
+            restore.Transition.pResource=z->packed;
+            g.list->lpVtbl->ResourceBarrier(g.list,1,&restore);
+        }
+        OK(g.list->lpVtbl->Close(g.list));
+        g.queue->lpVtbl->ExecuteCommandLists(g.queue,1,lists);
+        OK(g.queue->lpVtbl->Signal(g.queue,g.fence,101+2*mode));
+        OK(g.fence->lpVtbl->SetEventOnCompletion(g.fence,101+2*mode,g.fence_event));
+        assert(WaitForSingleObject(g.fence_event,10000)==WAIT_OBJECT_0);
+        OK(rb->lpVtbl->Map(rb,0,NULL,(void**)&bytes));
+        for(u32 aa=0;aa<5;++aa) {
+            const u32 pw=packed_widths[aa],ph=packed_heights[aa];
+            for(u32 y=0;y<ph;++y)for(u32 x=0;x<pw;++x) {
+                /* Compare spatial positions against the original depth
+                 * rectangle, including the right half and both 4x rows. */
+                const u32 sx=(2*x+1)*sf->w/(pw*(aa_modes[aa] ? 2 : 1));
+                const u32 sy=(2*y+1)*sf->h/(2*ph);
+                const int inside=sx>=2*sf->w/8 && sx<5*sf->w/8 && sy>=sf->h/8 && sy<5*sf->h/8;
+                const u8* pixel=bytes+aa*131072+y*256+x*4;
+                assert(memcmp(pixel,pixel+65536,4)==0);
+                assert(pixel[0]==(inside?0:255) && pixel[1]==(inside?0:255));
+                assert(pixel[3]==(inside?0x40:255));
+                assert(pixel[2]==(inside?0x7C:sx<sf->w?0x5A:0));
+            }
+        }
+        rb->lpVtbl->Unmap(rb,0,NULL);
         for(u32 i=0;i<g.n_surfaces;++i)g.surfaces[i].tex->lpVtbl->Release(g.surfaces[i].tex);
         for(u32 i=0;i<g.n_zdepths;++i) {
             g.zdepths[i].tex->lpVtbl->Release(g.zdepths[i].tex);
@@ -770,6 +832,7 @@ static void resolution_tests(void)
     puts("Custom resolution GPU readbacks: native, 1.5x, 2x, fractional asymmetric targets and independent shadow atlases; masked scissor clears, guest address bounds, depth dimensions and GPU blits passed.");
     puts("Z16/Z24S8 GPU clears: far depth, partial scissor, unused high Z16 bits, stencil-only depth preservation and legacy negative control passed at six resolutions.");
     puts("Packed Z24S8: actual GPU depth/stencil bytes, live blit, cache refresh and guest bounds passed at six resolutions.");
+    puts("Packed depth sample layout: 1x padding, 2x and both 4x modes, AA-only invalidation and consumer-state independence passed at six resolutions.");
 }
 static void graphics_sampler_tests(void)
 {
