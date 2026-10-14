@@ -86,7 +86,9 @@ static int rsx_vertex_pull_pack(rsx_vertex_pull_payload* out,
 }
 
 /* Shared by the real vertex shader and GPU decoder readback tests. Explicit
- * integer reconstruction matches the CPU's endian and half-denormal policy. */
+ * integer reconstruction matches the CPU's endian and half-denormal policy.
+ * Keep the component loop and scalar stores explicit: dynamic vector writes
+ * expand compiler work without changing the component conversion. */
 static const char rsx_vertex_pull_hlsl[] =
 "ByteAddressBuffer rsx_pull_data:register(t20);\n"
 "uint pull_le32(uint a){uint s=(a&3u)*8u;uint lo=rsx_pull_data.Load(a&~3u);"
@@ -99,14 +101,15 @@ static const char rsx_vertex_pull_hlsl[] =
 "uint n=rsx_pull_data.Load(at+16u);float4 v=float4(0,0,0,1);"
 "if(m.w==6u){uint x=pull_be32(a);int sx=(int)(x<<21)>>21;int sy=(int)(x<<10)>>21;int sz=(int)x>>22;"
 "return float4((float)sx/1023.0,(float)sy/1023.0,(float)sz/511.0,1);}\n"
-"[unroll]for(uint i=0;i<4u;++i){if(i<n){"
-"if(m.w==2u)v[i]=asfloat(pull_be32(a+i*4u));"
+"[loop]for(uint i=0;i<4u;++i){if(i<n){float component;"
+"if(m.w==2u)component=asfloat(pull_be32(a+i*4u));"
 "else if(m.w==3u){uint h=pull_be16(a+i*2u);uint e=(h>>10)&31u;uint f=h&1023u;"
-"uint bits=((h&32768u)<<16)|(e==0u?0u:(e==31u?2139095040u|(f<<13):((e+112u)<<23)|(f<<13)));v[i]=asfloat(bits);}"
-"else if(m.w==4u)v[i]=(float)(pull_le32(a+i)&255u)/255.0;"
-"else if(m.w==7u)v[i]=(float)(pull_le32(a+i)&255u);"
-"else {int s=(int)(pull_be16(a+i*2u)<<16)>>16;v[i]=m.w==1u?(float)s/32767.0:(float)s;}"
-"}}return v;}\n";
+"uint bits=((h&32768u)<<16)|(e==0u?0u:(e==31u?2139095040u|(f<<13):((e+112u)<<23)|(f<<13)));component=asfloat(bits);}"
+"else if(m.w==4u)component=(float)(pull_le32(a+i)&255u)/255.0;"
+"else if(m.w==7u)component=(float)(pull_le32(a+i)&255u);"
+"else {int s=(int)(pull_be16(a+i*2u)<<16)>>16;component=m.w==1u?(float)s/32767.0:(float)s;}"
+"if(i==0u)v.x=component;else if(i==1u)v.y=component;"
+"else if(i==2u)v.z=component;else v.w=component;}}return v;}\n";
 
 static int rsx_vertex_pull_wrap(char* shader,u32 capacity,u32 mask)
 {

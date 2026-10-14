@@ -1,6 +1,8 @@
 // Execute the shared raw-geometry decoder on a GPU and compare actual readback
-// with the existing CPU fetcher. Run WARP for deterministic CI or hardware for
-// the driver used by gameplay. No game data is required.
+// with the existing CPU fetcher: CS/O3 plus the real wrapped VS/flags0 through
+// stream output. Run WARP for deterministic CI or hardware for the driver used
+// by gameplay. This does not measure full-game vertex shader or hardware cost.
+// No game data is required.
 #define NOMINMAX
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -33,14 +35,76 @@ int main(int argc,char**) try {
     ComPtr<ID3D11UnorderedAccessView> uav;checked(device->CreateUnorderedAccessView(output.Get(),&ud,&uav));
     d.Usage=D3D11_USAGE_STAGING;d.BindFlags=0;d.MiscFlags=0;d.StructureByteStride=0;d.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
     ComPtr<ID3D11Buffer> readback;checked(device->CreateBuffer(&d,nullptr,&readback));
-    rsx_vertex_pull_payload packet={};unsigned comparisons=0;
+
+    // Compile the same wrapper and flags used by production vertex shaders.
+    // A passthrough geometry shader makes every decoded VS component available
+    // to stream output without rasterization or interpolation changing it.
+    std::string fields="float4 pos:SV_Position;", inputs;
+    for(unsigned attr=0;attr<8;++attr){
+        fields+="float4 a"+std::to_string(attr)+":TEXCOORD"+std::to_string(attr)+";";
+        inputs+="float4 a"+std::to_string(attr)+":ATTR"+std::to_string(attr)+";";
+    }
+    const std::string output_type="struct VSOutput{"+fields+"};";
+    std::string vertex_source="struct VSInput{"+inputs+"};"+output_type+
+        "VSOutput main(VSInput input) {VSOutput o;o.pos=float4(0,0,0,1);";
+    for(unsigned attr=0;attr<8;++attr)
+        vertex_source+="o.a"+std::to_string(attr)+"=input.a"+std::to_string(attr)+";";
+    vertex_source+="return o;}";
+    std::vector<char> wrapped(16384);
+    memcpy(wrapped.data(),vertex_source.c_str(),vertex_source.size()+1);
+    require(rsx_vertex_pull_wrap(wrapped.data(),(u32)wrapped.size(),255),"wrap executed vertex entry");
+    ComPtr<ID3DBlob> vertex_code,geometry_code;
+    error.Reset();
+    hr=D3DCompile(wrapped.data(),strlen(wrapped.data()),"pull-vs-execute",nullptr,nullptr,
+        "main","vs_5_0",0,0,&vertex_code,&error);
+    if(error)std::cerr.write((char*)error->GetBufferPointer(),error->GetBufferSize());checked(hr);
+    ComPtr<ID3D11VertexShader> vertex_shader;
+    checked(device->CreateVertexShader(vertex_code->GetBufferPointer(),vertex_code->GetBufferSize(),nullptr,&vertex_shader));
+    const std::string geometry_source=output_type+
+        "[maxvertexcount(1)]void main(point VSOutput input[1],inout PointStream<VSOutput> output){output.Append(input[0]);}";
+    error.Reset();
+    hr=D3DCompile(geometry_source.data(),geometry_source.size(),"pull-vs-stream",nullptr,nullptr,
+        "main","gs_5_0",0,0,&geometry_code,&error);
+    if(error)std::cerr.write((char*)error->GetBufferPointer(),error->GetBufferSize());checked(hr);
+    D3D11_SO_DECLARATION_ENTRY declaration[8]={};
+    for(unsigned attr=0;attr<8;++attr){
+        declaration[attr].SemanticName="TEXCOORD";
+        declaration[attr].SemanticIndex=attr;
+        declaration[attr].ComponentCount=4;
+    }
+    const UINT stream_stride=8*16;
+    ComPtr<ID3D11GeometryShader> geometry_shader;
+    checked(device->CreateGeometryShaderWithStreamOutput(geometry_code->GetBufferPointer(),
+        geometry_code->GetBufferSize(),declaration,8,&stream_stride,1,
+        D3D11_SO_NO_RASTERIZED_STREAM,nullptr,&geometry_shader));
+    d={};d.ByteWidth=128*stream_stride;d.Usage=D3D11_USAGE_DEFAULT;d.BindFlags=D3D11_BIND_STREAM_OUTPUT;
+    ComPtr<ID3D11Buffer> vertex_output;checked(device->CreateBuffer(&d,nullptr,&vertex_output));
+    rsx_vertex_pull_payload packet={};unsigned comparisons=0,vertex_comparisons=0;
     for(unsigned size=1;size<=4;++size)for(unsigned alignment=0;alignment<4;++alignment)
     for(unsigned variant=0;variant<4;++variant){
         std::vector<u8> bytes(128*160+32);u32 random=0x31415926u+size+alignment+variant;
         for(auto& b:bytes){random^=random<<13;random^=random>>17;random^=random<<5;b=(u8)random;}
-        // Include half zeros, subnormals, infinities and NaNs in both signs.
-        const u16 halves[]={0,0x8000,1,0x3ff,0x7c00,0xfc00,0x7e01,0xfe01};
-        for(u32 i=0;i<8;++i){bytes[i*160+36+alignment]=(u8)(halves[i]>>8);bytes[i*160+37+alignment]=(u8)halves[i];}
+        // Put edge values in every component, exercising each scalar store
+        // and the i<n guard for all sizes. Preserve the CPU's half-subnormal
+        // policy; NaN payload identity is deliberately not required below.
+        const u16 halves[]={0,0x8000,1,0x8001,0x3ff,0x83ff,0x400,0x8400,
+            0x7bff,0xfbff,0x3c00,0xbc00,0x7c00,0xfc00,0x7e01,0xfe01};
+        const u32 floats[]={0,0x80000000u,0x00800000u,0x7f7fffffu,
+            0x7f800000u,0xff800000u,0x7fc00001u,0xffc00001u};
+        const u16 shorts[]={0x8000,0x8001,0xffff,0,1,0x7ffe,0x7fff,0x1234};
+        const u8 octets[]={0,1,127,128,254,255,17,239};
+        for(u32 i=0;i<16;++i)for(u32 component=0;component<4;++component){
+            const u32 word=floats[(i+component)%8];
+            for(u32 b=0;b<4;++b)bytes[i*160+18+alignment+component*4+b]=(u8)(word>>(24-b*8));
+            const u16 half=halves[(i+component)%16],integer=shorts[(i+component)%8];
+            bytes[i*160+36+alignment+component*2]=(u8)(half>>8);
+            bytes[i*160+37+alignment+component*2]=(u8)half;
+            for(u32 attr: {0u,4u}){
+                bytes[i*160+attr*18+alignment+component*2]=(u8)(integer>>8);
+                bytes[i*160+attr*18+alignment+component*2+1]=(u8)integer;
+            }
+            for(u32 attr: {3u,6u})bytes[i*160+attr*18+alignment+component]=octets[(i+component)%8];
+        }
         rsx_vertex_fetch_plan plan={};rsx_vertex_layout_plan_init(&plan.layout,255);
         rsx_vertex_ref refs[128];
         const u32 first=variant==1?37:0;
@@ -67,17 +131,32 @@ int main(int argc,char**) try {
         ID3D11ShaderResourceView* srvs[]={srv.Get()};ID3D11UnorderedAccessView* uavs[]={uav.Get()};
         context->CSSetShader(shader.Get(),nullptr,0);context->CSSetShaderResources(20,1,srvs);context->CSSetUnorderedAccessViews(0,1,uavs,nullptr);context->Dispatch(2,1,1);
         context->CopyResource(readback.Get(),output.Get());D3D11_MAPPED_SUBRESOURCE mapped={};checked(context->Map(readback.Get(),0,D3D11_MAP_READ,0,&mapped));
-        bool pass=true;
-        for(u32 i=0;i<128;++i){float expected[32];require(rsx_vertex_fetch_one(&plan,&refs[i],(u8*)expected)!=0,"CPU reference fetch");
-            for(u32 lane=0;lane<32;++lane){float actual=((float*)mapped.pData)[i*32+lane],value=expected[lane];
-                const u32 type=plan.attr[lane/4].desc.type;
-                const bool normalized=type==1 || type==4 || type==6;
-                const bool equal=!memcmp(&actual,&value,4) || (std::isnan(actual)&&std::isnan(value)) ||
-                    (normalized&&std::isfinite(actual)&&std::isfinite(value)&&std::abs(actual-value)<=std::max(1.f,std::abs(value))*0.000001f);
-                if(!equal&&pass)std::cerr<<"size="<<size<<" alignment="<<alignment<<" variant="<<variant<<" vertex="<<i<<" lane="<<lane<<" actual="<<actual<<" expected="<<value<<"\n";
-                pass&=equal;++comparisons;
-            }}
-        context->Unmap(readback.Get(),0);require(pass,"GPU raw vertex decode mismatch");
+        const auto compare=[&](const float* values,const char* stage,unsigned& count){
+            bool pass=true;
+            for(u32 i=0;i<128;++i){float expected[32];require(rsx_vertex_fetch_one(&plan,&refs[i],(u8*)expected)!=0,"CPU reference fetch");
+                for(u32 lane=0;lane<32;++lane){float actual=values[i*32+lane],value=expected[lane];
+                    const u32 type=plan.attr[lane/4].desc.type;
+                    const bool normalized=type==1 || type==4 || type==6;
+                    const bool equal=!memcmp(&actual,&value,4) || (std::isnan(actual)&&std::isnan(value)) ||
+                        (normalized&&std::isfinite(actual)&&std::isfinite(value)&&std::abs(actual-value)<=std::max(1.f,std::abs(value))*0.000001f);
+                    if(!equal&&pass)std::cerr<<stage<<" size="<<size<<" alignment="<<alignment<<" variant="<<variant<<" vertex="<<i<<" lane="<<lane<<" actual="<<actual<<" expected="<<value<<"\n";
+                    pass&=equal;++count;
+                }}
+            return pass;
+        };
+        bool pass=compare((const float*)mapped.pData,"CS/O3",comparisons);
+        context->Unmap(readback.Get(),0);require(pass,"CS raw vertex decode mismatch");
+
+        ID3D11Buffer* stream_targets[]={vertex_output.Get()};const UINT stream_offset=0;
+        context->IASetInputLayout(nullptr);context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+        context->VSSetShader(vertex_shader.Get(),nullptr,0);context->VSSetShaderResources(20,1,srvs);
+        context->GSSetShader(geometry_shader.Get(),nullptr,0);
+        context->SOSetTargets(1,stream_targets,&stream_offset);context->Draw(128,0);
+        context->SOSetTargets(0,nullptr,nullptr);context->GSSetShader(nullptr,nullptr,0);
+        context->CopyResource(readback.Get(),vertex_output.Get());
+        checked(context->Map(readback.Get(),0,D3D11_MAP_READ,0,&mapped));
+        pass=compare((const float*)mapped.pData,"wrapped VS/flags0",vertex_comparisons);
+        context->Unmap(readback.Get(),0);require(pass,"wrapped VS raw vertex decode mismatch");
         auto unsupported=plan;unsupported.attr[0].desc.frequency=2;
         require(!rsx_vertex_pull_pack(&packet,&unsupported,refs,128,1<<20),"frequency fallback");
         unsupported=plan;unsupported.attr[0].stable_base=nullptr;
@@ -90,6 +169,6 @@ int main(int argc,char**) try {
     require(rsx_vertex_pull_wrap(vs,sizeof vs,9),"wrap real vertex entry");
     code.Reset();error.Reset();hr=D3DCompile(vs,strlen(vs),"pull-vs",nullptr,nullptr,"main","vs_5_0",0,0,&code,&error);
     if(error)std::cerr.write((char*)error->GetBufferPointer(),error->GetBufferSize());checked(hr);
-    free(packet.data);std::cout<<"PASS: "<<comparisons<<" GPU vertex lanes, formats 1..7, sizes 1..4, byte alignment, index wrap, defaults, snapshots, fallbacks and VS compilation\n";
+    free(packet.data);std::cout<<"PASS: "<<comparisons<<" CS/O3 lanes and "<<vertex_comparisons<<" wrapped VS/flags0 stream-output lanes, formats 1..7, sizes 1..4, byte alignment, index wrap, defaults, snapshots, fallbacks and VS compilation\n";
     return 0;
 }catch(const std::exception& error){std::cerr<<error.what()<<"\n";return 1;}
