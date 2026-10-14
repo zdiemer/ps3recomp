@@ -51,6 +51,7 @@ static int test_dispatch(void)
         for (u32 load = 0; load < RSX_DSP_VP_INSTR; ++load) {
             rsx_dispatch generic, fast;
             rsx_dispatch_init(&generic, NULL);
+            generic.vp_metadata_dirty = 0; /* exercise changed/no-room writes */
             generic.regs[0x1E9Cu >> 2] = load;
             generic.in_begin_end = (int)((pattern + load) & 1u);
             generic.current_primitive = 0xA500u + pattern;
@@ -77,6 +78,7 @@ static int test_dispatch(void)
         for (u32 c = 0; c < sizeof(near_boundary) / sizeof(near_boundary[0]); ++c) {
             rsx_dispatch generic, fast;
             rsx_dispatch_init(&generic, NULL);
+            generic.vp_metadata_dirty = 0;
             generic.regs[0x1E9Cu >> 2] = near_boundary[c];
             generic.in_begin_end = (int)((pattern + c) & 1u);
             for (u32 i = 0; i < RSX_DSP_NUM_REGS; ++i) {

@@ -146,6 +146,7 @@ static void mark_class(rsx_dispatch* rsx, u32 method, u32 count, u8 klass)
 void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
 {
     memset(rsx, 0, sizeof(*rsx));
+    rsx->vp_metadata_dirty = 1;
     if (sink)
         rsx->sink = *sink;
 
@@ -247,6 +248,8 @@ void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u3
 {
     if (count > RSX_DSP_VP_WORDS)
         count = RSX_DSP_VP_WORDS;
+    if (count && memcmp(rsx->vp, words, count * sizeof(u32)) != 0)
+        rsx->vp_metadata_dirty = 1;
     memcpy(rsx->vp, words, count * sizeof(u32));
 }
 
@@ -335,8 +338,10 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         const u32 lane = ((method - M_VP_UPLOAD_INST) >> 2) & 3;
         u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
         const u32 pos = *load * 4 + lane;
-        if (pos < RSX_DSP_VP_WORDS)
+        if (pos < RSX_DSP_VP_WORDS && rsx->vp[pos] != arg) {
             rsx->vp[pos] = arg;
+            rsx->vp_metadata_dirty = 1;
+        }
         if (lane == 3)
             (*load)++;
         return;

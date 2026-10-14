@@ -1,4 +1,6 @@
 #include "rsx_vp_program_cache.h"
+#include "rsx_dispatch.h"
+#include "rsx_commands.h"
 #include <string.h>
 
 static u64 vp_hash(const u8* code, u32 bytes)
@@ -56,4 +58,27 @@ int rsx_vp_program_cache_get(rsx_vp_program_cache* cache,
         entry->info = *out;
     }
     return 0;
+}
+
+int rsx_vp_mirror_cache_get(rsx_vp_mirror_cache* memo,
+    rsx_vp_program_cache* cache, rsx_dispatch* rsx, rsx_vp_program_info* out)
+{
+    /* Same live register as rsx_dsp_vp_start; no guest pointer or renderer
+     * dependency is part of the memo identity. */
+    const u32 start = rsx->regs[NV4097_SET_TRANSFORM_PROGRAM_START >> 2];
+    if (memo->valid && !rsx->vp_metadata_dirty && memo->start == start) {
+        *out = memo->info;
+        return 2;
+    }
+    int hit = 0;
+    memset(out, 0, sizeof(*out));
+    out->input_mask = 0xFFFFu;
+    if (start < RSX_DSP_VP_INSTR)
+        hit = rsx_vp_program_cache_get(cache, (const u8*)(rsx->vp + start * 4u),
+            (RSX_DSP_VP_INSTR - start) * 16u, out);
+    memo->info = *out;
+    memo->start = start;
+    memo->valid = 1;
+    rsx->vp_metadata_dirty = 0;
+    return hit;
 }

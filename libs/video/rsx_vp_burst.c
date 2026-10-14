@@ -24,8 +24,10 @@ int rsx_vp_burst_dispatch_32(rsx_dispatch *rsx, u32 subchannel, u32 method,
 
         const u32 lane = i & 3u;
         const u32 pos = load * 4u + lane;
-        if (pos < RSX_DSP_VP_WORDS)
+        if (pos < RSX_DSP_VP_WORDS && rsx->vp[pos] != words[i]) {
             rsx->vp[pos] = words[i];
+            rsx->vp_metadata_dirty = 1;
+        }
         if (lane == 3u)
             ++load;
     }

@@ -241,6 +241,7 @@ static unsigned g_ld_window_position = 1;
 /* Correct Z16 clear packing; the file control permits native A/B validation. */
 static unsigned g_ld_depth_clear = 1;
 static rsx_vp_program_cache g_ld_vp_program_cache;
+static rsx_vp_mirror_cache g_ld_vp_mirror_cache;
 static int g_ld_vertex_cache_enabled=-1;
 static int ld_vertex_cache_enabled(void)
 {
@@ -6815,13 +6816,14 @@ static u32 vp_txl_unit_mask(const u8* ucode, u32 instrs)
     return mask;
 }
 
-static void ld_vp_cached_info(const u8* code, u32 bytes, rsx_vp_program_info* out)
+static void ld_vp_cached_info(rsx_vp_program_info* out)
 {
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG begin = ld_profile_qpc();
     const int hit =
 #endif
-        rsx_vp_program_cache_get(&g_ld_vp_program_cache, code, bytes, out);
+        rsx_vp_mirror_cache_get(&g_ld_vp_mirror_cache, &g_ld_vp_program_cache,
+            &g.rsx, out);
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.vp_prepare_qpc += ld_profile_qpc() - begin;
     if (hit) g_ld_profile.total.vp_cache_hits++;
@@ -7130,7 +7132,7 @@ static int ld_current_vertex_layout(rsx_vertex_layout_plan* layout)
     const u8* vp_uc = (const u8*)(g.rsx.vp + start * 4);
     if (g_ld_cpu_work & 512u) {
         rsx_vp_program_info info;
-        ld_vp_cached_info(vp_uc, (RSX_DSP_VP_INSTR - start) * 16, &info);
+        ld_vp_cached_info(&info);
         ld_layout_plan_get(info.input_mask, layout);
         return info.instructions != 0;
     }
@@ -7174,7 +7176,7 @@ static ID3D12PipelineState* get_pso(
     rsx_vp_program_info vp_info;
     const int cache_vp = (g_ld_cpu_work & 512u) != 0;
     if (cache_vp)
-        ld_vp_cached_info(vp_uc, (RSX_DSP_VP_INSTR - start) * 16, &vp_info);
+        ld_vp_cached_info(&vp_info);
     const u32 vp_instrs = cache_vp ? vp_info.instructions :
         ld_vp_program_size(vp_uc, (RSX_DSP_VP_INSTR - start) * 16);
     if (!vp_instrs) { LD_PSO_BAIL("vertex program has zero instructions"); return NULL; }
