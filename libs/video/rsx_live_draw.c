@@ -1289,6 +1289,16 @@ typedef struct {
     u64 resource_create_ticks;
     u32 resource_create_calls;
     u32 outcome, decode_attempted, decode_succeeded, watch_skipped, cache_full;
+    /* Predicate inputs are sampled before optional validation can reject a skip. */
+    u32 skip_evaluated, skip_override_changed, skip_watch_valid;
+    u32 skip_entry_valid, skip_stamp_match, skip_hash_kind_match;
+    /* rejection bits: override=1, watch=2, baseline=4, stamp=8, hash kind=16 */
+    u32 skip_validation, skip_rejection_mask;
+    /* 0=parallel FNV, 1=XXH3, 2=legacy serial FNV. */
+    u32 source_span, mipmaps, hash_kind;
+    /* QueryThreadCycleTime counts are raw and intentionally not converted. */
+    u64 hash_cycle_delta;
+    u32 hash_cycle_attempts, hash_cycle_successes, hash_cycle_failures;
 } ld_slow_texture_detail;
 
 typedef struct {
@@ -1414,6 +1424,31 @@ static void ld_slow_texture_phase_end(ld_slow_draw_scope* scope,
     if (!scope || !scope->active || !detail || !ticks) return;
     const u64 end = ld_slow_draw_qpc();
     if (end >= begin) *ticks += end - begin;
+}
+
+static int ld_slow_texture_hash_cycles_begin(ld_slow_texture_detail* detail,
+    u64* begin)
+{
+    if (!detail) return 0;
+    ++detail->hash_cycle_attempts;
+    if (!QueryThreadCycleTime(GetCurrentThread(), begin)) {
+        ++detail->hash_cycle_failures;
+        return 0;
+    }
+    return 1;
+}
+
+static void ld_slow_texture_hash_cycles_end(ld_slow_texture_detail* detail,
+    u64 begin, int begin_valid)
+{
+    if (!detail || !begin_valid) return;
+    u64 end = 0;
+    if (!QueryThreadCycleTime(GetCurrentThread(), &end) || end < begin) {
+        ++detail->hash_cycle_failures;
+        return;
+    }
+    detail->hash_cycle_delta += end - begin;
+    ++detail->hash_cycle_successes;
 }
 
 static void ld_slow_texture_resource_create(ld_slow_texture_detail* detail,
@@ -1547,7 +1582,12 @@ static void ld_slow_draw_dump(void)
         "texture_slot_lookup_ms,texture_slot_watch_ms,texture_slot_hash_ms,texture_slot_decode_ms,"
         "texture_slot_srv_ms,texture_slot_retire_ms,texture_slot_log_ms,texture_slot_residual_ms,"
         "texture_resource_create_ms,texture_resource_create_calls,"
-        "resource_residual_ms\n");
+        "resource_residual_ms,texture_skip_evaluated,texture_skip_override_changed,"
+        "texture_skip_watch_valid,texture_skip_entry_valid,texture_skip_stamp_match,"
+        "texture_skip_hash_kind_match,texture_skip_validation,texture_skip_rejection_mask,"
+        "texture_source_span,texture_mipmaps,texture_hash_kind,texture_hash_cycle_attempts,"
+        "texture_hash_cycle_successes,texture_hash_cycle_failures,"
+        "texture_hash_cycle_valid,texture_hash_cycle_delta_not_ms\n");
     const u64 first = (g_ld_slow_draw.next + LD_SLOW_DRAW_CAP -
         g_ld_slow_draw.recorded) % LD_SLOW_DRAW_CAP;
     const double scale = g_ld_slow_draw.qpc_frequency
@@ -1593,7 +1633,8 @@ static void ld_slow_draw_dump(void)
             ? resource_ticks - nested_resource_ticks : 0;
         const ld_slow_texture_detail* td =
             &e->resource[LD_SLOW_RESOURCE_TEXTURE].texture_detail;
-        fprintf(csv, ",%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f\n",
+        fprintf(csv, ",%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f"
+                     ",%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%llu\n",
             td->outcome, td->decode_attempted, td->decode_succeeded,
             td->watch_skipped, td->cache_full,
             td->lookup_ticks * scale, td->watch_ticks * scale,
@@ -1601,7 +1642,14 @@ static void ld_slow_draw_dump(void)
             td->srv_ticks * scale, td->retire_ticks * scale,
             td->log_ticks * scale, td->residual_ticks * scale,
             td->resource_create_ticks * scale, td->resource_create_calls,
-            residual_ticks * scale);
+            residual_ticks * scale,
+            td->skip_evaluated, td->skip_override_changed, td->skip_watch_valid,
+            td->skip_entry_valid, td->skip_stamp_match, td->skip_hash_kind_match,
+            td->skip_validation, td->skip_rejection_mask, td->source_span,
+            td->mipmaps, td->hash_kind, td->hash_cycle_attempts,
+            td->hash_cycle_successes, td->hash_cycle_failures,
+            td->hash_cycle_attempts != 0 && td->hash_cycle_failures == 0,
+            (unsigned long long)td->hash_cycle_delta);
     }
     fclose(csv);
     ReleaseSRWLockExclusive(&g_ld_slow_draw_lock);
@@ -3395,7 +3443,10 @@ static u32 texture_source_span(const rsx_dsp_texture* t)
 }
 
 #include "rsx_texture_hash.h"
-static u64 texture_content_hash_kind(const rsx_dsp_texture* t, int* readable, unsigned kind)
+static int texture_legacy_hash_enabled(void);
+static unsigned texture_hash_algorithm_kind(void);
+static u64 texture_content_hash_kind_scoped(const rsx_dsp_texture* t, int* readable,
+    unsigned kind, ld_slow_texture_detail* slow_detail)
 {
 #if defined(YZ_PERF_PROFILE)
     const LONGLONG hash_begin = ld_profile_qpc();
@@ -3432,11 +3483,13 @@ static u64 texture_content_hash_kind(const rsx_dsp_texture* t, int* readable, un
           tsn++;
       } }
 
+    u64 hash_cycles_begin = 0;
+    const int hash_cycles_valid =
+        ld_slow_texture_hash_cycles_begin(slow_detail, &hash_cycles_begin);
     /* One hash per cached texture per presented frame.  Word-at-a-time FNV is
      * deliberately cheap; this is a mutation detector, not a content ID. */
     u64 hash = 1469598103934665603ull;
-    static int legacy_hash = -1;
-    if (legacy_hash < 0) legacy_hash = getenv("RSX_LEGACY_TEXTURE_HASH") != NULL;
+    const int legacy_hash = texture_legacy_hash_enabled();
     if (kind == 1) hash = rsx_texture_hash_xxh3(src, span);
     else if (!legacy_hash) hash = rsx_texture_hash(src, span);
     else {
@@ -3452,12 +3505,19 @@ static u64 texture_content_hash_kind(const rsx_dsp_texture* t, int* readable, un
         hash *= 1099511628211ull;
     }
     }
+    ld_slow_texture_hash_cycles_end(slow_detail, hash_cycles_begin,
+        hash_cycles_valid);
     *readable = 1;
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.texture_hash_bytes += span;
     g_ld_profile.total.texture_hash_qpc += ld_profile_qpc() - hash_begin;
 #endif
     return hash;
+}
+static u64 texture_content_hash_kind(const rsx_dsp_texture* t, int* readable,
+    unsigned kind)
+{
+    return texture_content_hash_kind_scoped(t, readable, kind, NULL);
 }
 
 static unsigned texture_hash_kind(void) { return (g_ld_cpu_work >> 2) & 1u; }
@@ -3487,23 +3547,46 @@ static int texture_watch_stamp(const rsx_dsp_texture* t, u64* stamp, u32* bytes)
 #endif
     return ok;
 }
+static u64 texture_content_hash_scoped(const rsx_dsp_texture* t, int* readable,
+    ld_slow_texture_detail* slow_detail)
+{
+    return texture_content_hash_kind_scoped(t, readable, texture_hash_kind(), slow_detail);
+}
 static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
 {
-    return texture_content_hash_kind(t, readable, texture_hash_kind());
+    return texture_content_hash_scoped(t, readable, NULL);
 }
-static int texture_cached_content_changed(
-    texcache_t* entry, const rsx_dsp_texture* t, u64 hash, int* readable)
+static int texture_legacy_hash_enabled(void)
+{
+    static int legacy_hash = -1;
+    if (legacy_hash < 0) legacy_hash = getenv("RSX_LEGACY_TEXTURE_HASH") != NULL;
+    return legacy_hash;
+}
+static unsigned texture_hash_algorithm_kind(void)
+{
+    const unsigned kind = texture_hash_kind();
+    return kind == 1u ? 1u : (texture_legacy_hash_enabled() ? 2u : 0u);
+}
+static int texture_cached_content_changed_scoped(
+    texcache_t* entry, const rsx_dsp_texture* t, u64 hash, int* readable,
+    ld_slow_texture_detail* slow_detail)
 {
     if (!*readable) return 0;
     if (entry->content_hash_kind == texture_hash_kind())
         return hash != entry->content_hash;
     /* A benchmark toggle must not trigger fake uploads or conceal mutation. */
-    const u64 old_hash = texture_content_hash_kind(t, readable, entry->content_hash_kind);
+    const u64 old_hash = texture_content_hash_kind_scoped(t, readable,
+        entry->content_hash_kind, slow_detail);
     if (!*readable) return 0;
     if (old_hash != entry->content_hash) return 1;
     entry->content_hash = hash;
     entry->content_hash_kind = texture_hash_kind();
     return 0;
+}
+static int texture_cached_content_changed(
+    texcache_t* entry, const rsx_dsp_texture* t, u64 hash, int* readable)
+{
+    return texture_cached_content_changed_scoped(entry, t, hash, readable, NULL);
 }
 
 static ID3D12Resource* decode_guest_texture_scoped(const rsx_dsp_texture* t,
@@ -3950,6 +4033,11 @@ static u32 texture_srv_slot_scoped(const rsx_dsp_texture* t,
     ld_slow_draw_scope* slow_scope, ld_slow_texture_detail* slow_detail)
 {
     const u32 remap = t->remap & 0xFFFF;
+    if (slow_detail) {
+        slow_detail->source_span = texture_source_span(t);
+        slow_detail->mipmaps = t->mipmaps;
+        slow_detail->hash_kind = texture_hash_algorithm_kind();
+    }
     static int refresh_enabled = -1;
     if (refresh_enabled < 0)
         refresh_enabled = getenv("RSX_NO_TEX_REFRESH") ? 0 : 1;
@@ -3980,7 +4068,7 @@ static u32 texture_srv_slot_scoped(const rsx_dsp_texture* t,
                 entry->override_revision=override_revision;
                 int readable=0;
                 phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
-                entry->content_hash=texture_content_hash(t,&readable);
+                entry->content_hash=texture_content_hash_scoped(t,&readable,slow_detail);
                 ld_slow_texture_phase_end(slow_scope, slow_detail,
                     slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
                 entry->content_hash_kind=texture_hash_kind();
@@ -4009,9 +4097,29 @@ static u32 texture_srv_slot_scoped(const rsx_dsp_texture* t,
                 const char* option = getenv("RSX_TEXTURE_WRITE_WATCH_VALIDATE");
                 validate = option && *option == '1';
             }
+            if (slow_detail) {
+                const int entry_valid = entry->write_watch_valid != 0;
+                const int stamp_match = entry->write_watch_stamp == watch_stamp;
+                const int hash_kind_match =
+                    entry->content_hash_kind == texture_hash_kind();
+                slow_detail->skip_evaluated = 1;
+                slow_detail->skip_override_changed = override_changed != 0;
+                slow_detail->skip_watch_valid = watch_valid != 0;
+                slow_detail->skip_entry_valid = entry_valid;
+                slow_detail->skip_stamp_match = stamp_match;
+                slow_detail->skip_hash_kind_match = hash_kind_match;
+                slow_detail->skip_validation = validate != 0;
+                slow_detail->skip_rejection_mask =
+                    (override_changed ? 1u : 0u) |
+                    (!watch_valid ? 2u : 0u) |
+                    (!entry_valid ? 4u : 0u) |
+                    (!stamp_match ? 8u : 0u) |
+                    (!hash_kind_match ? 16u : 0u);
+            }
             int readable = skip && !validate;
             phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
-            const u64 hash = readable ? entry->content_hash : texture_content_hash(t, &readable);
+            const u64 hash = readable ? entry->content_hash :
+                texture_content_hash_scoped(t, &readable, slow_detail);
             ld_slow_texture_phase_end(slow_scope, slow_detail,
                 slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
             if (skip && validate) {
@@ -4043,7 +4151,8 @@ static u32 texture_srv_slot_scoped(const rsx_dsp_texture* t,
             /* A failed decode must not stamp old GPU contents as current. */
             entry->write_watch_valid = 0;
             phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
-            const int hash_changed = texture_cached_content_changed(entry,t,hash,&readable);
+            const int hash_changed = texture_cached_content_changed_scoped(
+                entry,t,hash,&readable,slow_detail);
             ld_slow_texture_phase_end(slow_scope, slow_detail,
                 slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
@@ -4056,7 +4165,7 @@ static u32 texture_srv_slot_scoped(const rsx_dsp_texture* t,
               if (race && readable) {
                   int r2 = 0;
                   phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
-                  const u64 again = texture_content_hash(t, &r2);
+                  const u64 again = texture_content_hash_scoped(t, &r2, slow_detail);
                   ld_slow_texture_phase_end(slow_scope, slow_detail,
                       slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
                   static unsigned long long checks = 0, torn = 0;
@@ -4203,7 +4312,7 @@ static u32 texture_srv_slot_scoped(const rsx_dsp_texture* t,
     {
         int readable = 0;
         phase_begin = ld_slow_texture_phase_begin(slow_scope, slow_detail);
-        replacement.content_hash = texture_content_hash(t, &readable);
+        replacement.content_hash = texture_content_hash_scoped(t, &readable, slow_detail);
         ld_slow_texture_phase_end(slow_scope, slow_detail,
             slow_detail ? &slow_detail->hash_ticks : NULL, phase_begin);
         replacement.content_hash_kind = texture_hash_kind();
