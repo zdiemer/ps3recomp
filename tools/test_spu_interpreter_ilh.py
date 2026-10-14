@@ -20,10 +20,10 @@ def main() -> int:
     binary = args.output_dir / "spu-interpreter-ilh.exe"
     source = ROOT / "runtime" / "spu"
     subprocess.run(
-        [str(args.compiler), "/nologo", "/std:c11", "/O1", "/UNDEBUG",
+        [str(args.compiler), "/nologo", "/std:c11", "/O1", "/UNDEBUG", "/D_CRT_SECURE_NO_WARNINGS",
          f"/I{ROOT / 'include'}", f"/I{source}",
          str(source / "tests" / "test_spu_interpreter_ilh.c"),
-         str(source / "spu_interp.c"), f"/Fe:{binary}"],
+         str(source / "spu_interp.c"), f"/Fo:{args.output_dir.resolve()}\\", f"/Fe:{binary}"],
         check=True,
     )
     subprocess.run([str(binary)], check=True, timeout=10)
