@@ -997,7 +997,8 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             /* The scheduler may already have run a newly published task.
              * Schedule its current ready state; launching this saved ELF again
              * can race task-ID reuse and run it with the next task's arguments. */
-            if (elf) spu_taskset_start_ready(taskset_ea);
+            if (elf) spu_taskset_start_ready_cause(taskset_ea,
+                                                   SPU_TASKSET_DISPATCH_CREATE);
             return CELL_OK;
         }
     }

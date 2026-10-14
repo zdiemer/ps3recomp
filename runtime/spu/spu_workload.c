@@ -255,6 +255,12 @@ static uint64_t spu_async_trace_qpc(void)
     return (uint64_t)now.QuadPart;
 }
 
+uint64_t spu_workload_async_trace_mark(void)
+{
+    /* The trace callback is startup-only and immutable after workers begin. */
+    return s_async_trace_callback ? spu_async_trace_qpc() : 0;
+}
+
 static void spu_async_trace_emit(unsigned phase,
                                  const spu_async_trace_snapshot* snapshot,
                                  uint64_t begin_qpc, uint64_t end_qpc)
@@ -267,6 +273,11 @@ static void spu_async_trace_emit(unsigned phase,
 void spu_workload_set_async_trace_callback(spu_async_trace_callback callback)
 {
     (void)callback;
+}
+
+uint64_t spu_workload_async_trace_mark(void)
+{
+    return 0;
 }
 #endif
 
@@ -1274,9 +1285,15 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     return 0;
 }
 
-int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
-                                    uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid)
+int spu_workload_dispatch_async_task_provenance(const uint8_t* image, uint32_t image_size,
+                                                uint32_t args_ea, uint32_t taskset_ea,
+                                                uint32_t taskid, uint32_t dispatch_cause,
+                                                uint64_t claim_qpc)
 {
+#if !defined(_WIN32) || !defined(YZ_PERF_PROFILE)
+    (void)dispatch_cause;
+    (void)claim_qpc;
+#endif
     if (!image || image_size == 0) return 0;
 
     uint64_t fp = spu_workload_fingerprint(image, image_size);
@@ -1400,9 +1417,14 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
         snapshot->taskset_ea = j->taskset_ea;
         snapshot->taskid = j->taskid;
         snapshot->have_r3 = (uint32_t)(j->have_r3 != 0);
+        snapshot->dispatch_cause = dispatch_cause;
+        snapshot->claim_qpc = claim_qpc;
         if (j->have_r3) memcpy(snapshot->r3, j->r3, sizeof(snapshot->r3));
         uint64_t submit_qpc = spu_async_trace_qpc();
         spu_async_trace_emit(SPU_ASYNC_TRACE_SUBMIT, snapshot, submit_qpc, submit_qpc);
+        if (claim_qpc)
+            spu_async_trace_emit(SPU_ASYNC_TRACE_DISPATCH_DISCOVERY, snapshot,
+                                 claim_qpc, submit_qpc);
     }
     const spu_async_trace_snapshot trace_snapshot = j->trace_snapshot;
     const uint64_t trace_create_begin_qpc = j->trace_snapshot.job_id
@@ -1469,6 +1491,14 @@ int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
     pthread_detach(th);
 #endif
     return 1;
+}
+
+int spu_workload_dispatch_async_task(const uint8_t* image, uint32_t image_size,
+                                    uint32_t args_ea, uint32_t taskset_ea, uint32_t taskid)
+{
+    return spu_workload_dispatch_async_task_provenance(image, image_size, args_ea,
+                                                       taskset_ea, taskid,
+                                                       SPU_TASKSET_DISPATCH_UNKNOWN, 0);
 }
 
 /* Legacy PPU entry point: capture the caller's identity before spawning. The
