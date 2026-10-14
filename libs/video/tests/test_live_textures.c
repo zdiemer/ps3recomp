@@ -1,5 +1,6 @@
 /* Exercise the live uploader with synthetic guest bytes and a real WARP GPU. */
 #include <assert.h>
+#include <io.h>
 #include "../rsx_live_draw.c"
 #define OK(x) do { HRESULT hr_ = (x); assert(SUCCEEDED(hr_)); } while (0)
 static u8 guest[2048];
@@ -9,6 +10,40 @@ static u32 geometry_source_shift;
 static int geometry_late_index_write;
 static DWORD resolver_owner_tid;
 static volatile LONG resolver_worker_calls;
+static FILE* texture_diag_capture;
+static int texture_diag_saved_stderr = -1;
+static void texture_diag_capture_begin(void)
+{
+    texture_diag_capture = tmpfile();
+    assert(texture_diag_capture);
+    fflush(stderr);
+    texture_diag_saved_stderr = _dup(_fileno(stderr));
+    assert(texture_diag_saved_stderr >= 0);
+    assert(_dup2(_fileno(texture_diag_capture), _fileno(stderr)) == 0);
+}
+static char* texture_diag_capture_read(void)
+{
+    assert(texture_diag_capture);
+    fflush(stderr);
+    assert(fseek(texture_diag_capture, 0, SEEK_END) == 0);
+    long length = ftell(texture_diag_capture);
+    assert(length >= 0 && length < 4 * 1024 * 1024);
+    assert(fseek(texture_diag_capture, 0, SEEK_SET) == 0);
+    char* contents = (char*)malloc((size_t)length + 1);
+    assert(contents);
+    assert(fread(contents, 1, (size_t)length, texture_diag_capture) == (size_t)length);
+    contents[length] = 0;
+    return contents;
+}
+static void texture_diag_capture_end(void)
+{
+    fflush(stderr);
+    assert(_dup2(texture_diag_saved_stderr, _fileno(stderr)) == 0);
+    _close(texture_diag_saved_stderr);
+    texture_diag_saved_stderr = -1;
+    fclose(texture_diag_capture);
+    texture_diag_capture = NULL;
+}
 uint8_t* vm_base = guest;
 uint32_t vm_read32(uint64_t address)
 {
@@ -1534,6 +1569,7 @@ static void texture_content_cache_tests(ID3D12Resource* readback)
 
 int main(void)
 {
+    texture_diag_capture_begin();
     shadow_sampler_tests();
     graphics_sampler_tests();
     cache_tests();
@@ -1596,6 +1632,38 @@ int main(void)
     texture_content_cache_gpu_tests(readback);
     override_tests(readback,0);
     override_tests(readback,1);
+    assert(g_ld_texture_diag.records > 0 && g_ld_texture_diag.overwritten == 0);
+    assert(g_ld_texture_diag.dumped == 0);
+    char* before_diag_dump = texture_diag_capture_read();
+    assert(!strstr(before_diag_dump, "[texture-cache] FULL"));
+    assert(!strstr(before_diag_dump, "[texture-cache] decode failed"));
+    assert(!strstr(before_diag_dump, "[tex-refresh]"));
+    free(before_diag_dump);
+    ld_texture_diag_dump();
+    assert(g_ld_texture_diag.dumped == 1);
+    char* after_diag_dump = texture_diag_capture_read();
+    const char* full_line = strstr(after_diag_dump, "[texture-cache] FULL");
+    const char* failure_line = strstr(after_diag_dump, "[texture-cache] decode failed");
+    const char* refresh_line = strstr(after_diag_dump, "[tex-refresh]");
+    assert(strstr(after_diag_dump, "[texture-diagnostic-summary]"));
+    assert(full_line && failure_line && refresh_line);
+    assert(full_line < failure_line && failure_line < refresh_line);
+    assert(strstr(full_line, "frame=") && strstr(failure_line, "pitch=") &&
+           strstr(refresh_line, "n="));
+    char expected_diag_summary[256];
+    snprintf(expected_diag_summary, sizeof(expected_diag_summary),
+        "[texture-diagnostic-summary] full=%llu decode_failures=%llu refreshes=%llu "
+        "records=%llu retained=%u overwritten=%llu capacity=%u",
+        (unsigned long long)g_ld_texture_cache_full,
+        (unsigned long long)g_ld_texture_decode_fail,
+        (unsigned long long)g_ld_texture_refresh_count,
+        (unsigned long long)g_ld_texture_diag.records,
+        g_ld_texture_diag.retained,
+        (unsigned long long)g_ld_texture_diag.overwritten,
+        LD_TEXTURE_DIAG_CAP);
+    assert(strstr(after_diag_dump, expected_diag_summary));
+    free(after_diag_dump);
+    texture_diag_capture_end();
     bias_tests();
     resolution_tests();
     postprocess_tests();
