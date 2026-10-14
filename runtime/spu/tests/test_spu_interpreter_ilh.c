@@ -19,8 +19,10 @@ void spu_ls_watch_slow(uint32_t l, int w, const uint8_t* p, uint32_t pc, uint32_
 }
 
 static void be32(uint8_t* p, uint32_t value) {
-    p[0] = value >> 24; p[1] = value >> 16; p[2] = value >> 8; p[3] = value;
+    p[0] = (uint8_t)(value >> 24); p[1] = (uint8_t)(value >> 16);
+    p[2] = (uint8_t)(value >> 8); p[3] = (uint8_t)value;
 }
+
 static spu_context ctx;
 static int run(const char* name, uint32_t opcode, uint32_t want, u128 lifted) {
     memset(&ctx, 0, sizeof(ctx));
