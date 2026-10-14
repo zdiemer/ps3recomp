@@ -198,6 +198,9 @@ void spu_taskset_poll(uint32_t spurs_ea);
 void spu_taskset_poll_cause(uint32_t spurs_ea, uint32_t dispatch_cause);
 void spu_taskset_wake_register(uint32_t spurs_ea, void* event);
 void spu_taskset_wake_unregister(uint32_t spurs_ea);
+/* Opt-in, bounded taskset ready-scan diagnostic dump. No-op unless enabled at
+ * runtime in a YZ_PERF_PROFILE Windows build. Call from orderly shutdown. */
+void spu_taskset_scan_profile_dump(void);
 
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
