@@ -13,7 +13,7 @@ void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t ea, uint64_t v, int w) { (void)ea; (void)v; (void)w; }
 static DWORD WINAPI recycle(void* unused) { (void)unused; cellGcm_fifo_recycle(0x100); return 0; }
 static DWORD WINAPI wait_ack(void* value) {
-    gcm_fifo_wait_for_ea((u32)(uintptr_t)value); return 0;
+    gcm_fifo_wait_for_ea((u32)(uintptr_t)value, NULL); return 0;
 }
 static void wait_put(u32 value) {
     ULONGLONG deadline = GetTickCount64() + 5000;
