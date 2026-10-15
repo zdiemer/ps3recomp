@@ -36,6 +36,14 @@ typedef struct replay_color_readback {
     UINT64 total_bytes;
 } replay_color_readback;
 
+typedef struct replay_texture_snapshot {
+    ID3D12Resource* source;
+    ID3D12Resource* clone;
+    D3D12_RESOURCE_STATES source_state;
+    uint64_t generation;
+    uint64_t allocation_bytes;
+} replay_texture_snapshot;
+
 struct rsx_native_replay_pass {
     ID3D12Device* device;
     replay_state state;
@@ -74,6 +82,11 @@ struct rsx_native_replay_pass {
     D3D12_GPU_DESCRIPTOR_HANDLE sampler_tables[
         RSX_NATIVE_REPLAY_MAX_SAMPLER_TABLES];
     uint32_t sampler_count;
+
+    replay_texture_snapshot* snapshots;
+    uint32_t snapshot_count;
+    uint64_t snapshot_bytes;
+    uint64_t snapshot_reuses;
 
     ID3D12Resource* upload;
     ID3D12Resource* readback[RSX_NATIVE_REPLAY_MAX_COLOR_TARGETS];
@@ -157,6 +170,124 @@ static int replay_same_sampler_table(
     return 1;
 }
 
+static int replay_snapshot_state_supported(D3D12_RESOURCE_STATES state)
+{
+    const D3D12_RESOURCE_STATES supported =
+        (D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    return state != 0 && (state & ~supported) == 0;
+}
+
+static int replay_snapshot_format_supported(DXGI_FORMAT format)
+{
+    return format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+        format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        format == DXGI_FORMAT_R32_FLOAT;
+}
+
+static int replay_snapshot_view_supported(
+    ID3D12Resource* resource,
+    const D3D12_SHADER_RESOURCE_VIEW_DESC* view)
+{
+    D3D12_RESOURCE_DESC desc;
+    UINT mapping;
+    uint32_t component;
+    if (!resource || !view || !replay_snapshot_format_supported(view->Format) ||
+        view->ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D ||
+        view->Texture2D.MostDetailedMip != 0 ||
+        view->Texture2D.MipLevels != 1 ||
+        view->Texture2D.PlaneSlice != 0 ||
+        view->Texture2D.ResourceMinLODClamp != 0.0f)
+        return 0;
+    resource->lpVtbl->GetDesc(resource, &desc);
+    if (view->Format != desc.Format ||
+        (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+        return 0;
+    mapping = view->Shader4ComponentMapping;
+    if (!(mapping & D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES) ||
+        (mapping & ~0x1fffu))
+        return 0;
+    for (component = 0; component < 4; ++component) {
+        const D3D12_SHADER_COMPONENT_MAPPING value =
+            D3D12_DECODE_SHADER_4_COMPONENT_MAPPING(component, mapping);
+        if (value > D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1)
+            return 0;
+    }
+    return 1;
+}
+
+static replay_texture_snapshot* replay_find_snapshot(
+    rsx_native_replay_pass* pass,
+    ID3D12Resource* source,
+    uint64_t generation)
+{
+    uint32_t i;
+    for (i = 0; i < pass->snapshot_count; ++i) {
+        replay_texture_snapshot* snapshot = &pass->snapshots[i];
+        if (snapshot->source == source && snapshot->generation == generation)
+            return snapshot;
+    }
+    return NULL;
+}
+
+static replay_texture_snapshot* replay_create_snapshot(
+    rsx_native_replay_pass* pass,
+    ID3D12GraphicsCommandList* list,
+    ID3D12Resource* source,
+    const rsx_native_replay_srv_snapshot* metadata)
+{
+    replay_texture_snapshot* snapshot;
+    D3D12_RESOURCE_DESC desc;
+    D3D12_RESOURCE_ALLOCATION_INFO allocation;
+    D3D12_HEAP_PROPERTIES heap;
+    ID3D12Resource* clone = NULL;
+    if (pass->snapshot_count >= RSX_NATIVE_REPLAY_MAX_SNAPSHOTS)
+        return NULL;
+    source->lpVtbl->GetDesc(source, &desc);
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        desc.Width > RSX_NATIVE_REPLAY_MAX_DIMENSION ||
+        desc.Height > RSX_NATIVE_REPLAY_MAX_DIMENSION ||
+        desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
+        desc.SampleDesc.Count != 1 ||
+        desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN ||
+        (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+        return NULL;
+    (void)pass->device->lpVtbl->GetResourceAllocationInfo(
+        pass->device, &allocation, 0, 1, &desc);
+    if (!allocation.SizeInBytes || allocation.SizeInBytes == UINT64_MAX ||
+        allocation.SizeInBytes >
+            RSX_NATIVE_REPLAY_MAX_ALLOCATION - pass->owned_gpu_bytes)
+        return NULL;
+    memset(&heap, 0, sizeof(heap));
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (FAILED(pass->device->lpVtbl->CreateCommittedResource(
+            pass->device, &heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource,
+            (void**)&clone)))
+        return NULL;
+
+    snapshot = &pass->snapshots[pass->snapshot_count];
+    memset(snapshot, 0, sizeof(*snapshot));
+    source->lpVtbl->AddRef(source);
+    snapshot->source = source;
+    snapshot->clone = clone;
+    snapshot->source_state = metadata->source_state;
+    snapshot->generation = metadata->generation;
+    snapshot->allocation_bytes = allocation.SizeInBytes;
+    ++pass->snapshot_count;
+    pass->snapshot_bytes += allocation.SizeInBytes;
+    pass->owned_gpu_bytes += allocation.SizeInBytes;
+
+    replay_transition(list, source, metadata->source_state,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->lpVtbl->CopyResource(list, clone, source);
+    replay_transition(list, source, D3D12_RESOURCE_STATE_COPY_SOURCE,
+        metadata->source_state);
+    replay_transition(list, clone, D3D12_RESOURCE_STATE_COPY_DEST,
+        metadata->source_state);
+    return snapshot;
+}
+
 static void replay_copy_descriptor_table(
     ID3D12Device* device,
     ID3D12DescriptorHeap* heap,
@@ -211,6 +342,44 @@ static int replay_copy_sampler_table(
     return 1;
 }
 
+static int replay_snapshot_table_slots(
+    rsx_native_replay_pass* pass,
+    ID3D12GraphicsCommandList* list,
+    UINT descriptor_base,
+    uint32_t resource_slot_base,
+    ID3D12Resource* const sampled_resources[RSX_NATIVE_REPLAY_MAX_SAMPLED_RESOURCES],
+    const rsx_native_replay_srv_snapshot snapshots[RSX_NATIVE_REPLAY_MAX_SAMPLED_RESOURCES])
+{
+    uint32_t slot;
+    if (!snapshots)
+        return 1;
+    for (slot = 0; slot < RSX_NATIVE_REPLAY_TABLE_SIZE; ++slot) {
+        const uint32_t resource_slot = resource_slot_base + slot;
+        const rsx_native_replay_srv_snapshot* metadata = &snapshots[resource_slot];
+        replay_texture_snapshot* snapshot;
+        D3D12_CPU_DESCRIPTOR_HANDLE destination;
+        if (!metadata->enabled)
+            continue;
+        snapshot = replay_find_snapshot(
+            pass, sampled_resources[resource_slot], metadata->generation);
+        if (snapshot) {
+            if (snapshot->source_state != metadata->source_state)
+                return replay_fail(pass, "snapshot_version_state_changed");
+            ++pass->snapshot_reuses;
+        } else {
+            snapshot = replay_create_snapshot(
+                pass, list, sampled_resources[resource_slot], metadata);
+            if (!snapshot)
+                return replay_fail(pass, "snapshot_clone_failed_or_limit");
+        }
+        destination = replay_cpu_handle(
+            pass->srv_heap, pass->srv_step, descriptor_base + slot);
+        pass->device->lpVtbl->CreateShaderResourceView(
+            pass->device, snapshot->clone, &metadata->view, destination);
+    }
+    return 1;
+}
+
 rsx_native_replay_pass* rsx_native_replay_pass_create(
     ID3D12Device* device,
     uint32_t max_draws,
@@ -239,7 +408,9 @@ rsx_native_replay_pass* rsx_native_replay_pass_create(
     }
     pass->sampled_refs = (ID3D12Resource**)calloc(
         pass->sampled_ref_capacity, sizeof(*pass->sampled_refs));
-    if (!pass->draws || !pass->sampled_refs ||
+    pass->snapshots = (replay_texture_snapshot*)calloc(
+        RSX_NATIVE_REPLAY_MAX_SNAPSHOTS, sizeof(*pass->snapshots));
+    if (!pass->draws || !pass->sampled_refs || !pass->snapshots ||
         !rsx_native_draw_payload_init(&pass->payload, max_payload_bytes, max_draws) ||
         !replay_make_heap(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             (UINT)srv_count, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
@@ -392,22 +563,24 @@ int rsx_native_replay_pass_begin(
     return 1;
 }
 
-int rsx_native_replay_pass_capture(
+int rsx_native_replay_pass_capture_with_snapshots(
     rsx_native_replay_pass* pass,
     const rsx_native_draw_packet* packet,
     const rsx_native_draw_payload_input* input,
     const D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu[RSX_NATIVE_REPLAY_TABLE_SIZE],
     const D3D12_CPU_DESCRIPTOR_HANDLE sampler_cpu[RSX_NATIVE_REPLAY_TABLE_SIZE],
     const D3D12_CPU_DESCRIPTOR_HANDLE vtex_cpu[RSX_NATIVE_REPLAY_TABLE_SIZE],
-    ID3D12Resource* const sampled_resources[RSX_NATIVE_REPLAY_MAX_SAMPLED_RESOURCES])
+    ID3D12Resource* const sampled_resources[RSX_NATIVE_REPLAY_MAX_SAMPLED_RESOURCES],
+    const rsx_native_replay_srv_snapshot snapshots[RSX_NATIVE_REPLAY_MAX_SAMPLED_RESOURCES])
 {
     replay_draw* draw;
     D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu;
     uint32_t i;
     if (!pass || pass->state != REPLAY_CAPTURING || !packet || !input ||
+        !packet->list ||
         !srv_cpu || !sampler_cpu || !sampled_resources ||
         pass->payload.record_count >= pass->max_draws ||
-        packet->transition_count != 0 ||
+        packet->transition_count > RSX_NATIVE_DRAW_MAX_TRANSITIONS ||
         packet->render_target_count != pass->color_count ||
         !packet->pipeline_state || !packet->root_signature ||
         (!!packet->has_depth_stencil != !!pass->original_depth) ||
@@ -425,6 +598,67 @@ int rsx_native_replay_pass_capture(
             packet->index_buffer.SizeInBytes > input->index.size) ||
         !input->vertex_constants.size)
         return replay_fail(pass, "invalid_draw_or_packet_signature");
+    if (packet->has_vertex_texture_table == 0 && snapshots) {
+        for (i = RSX_NATIVE_REPLAY_TABLE_SIZE;
+             i < RSX_NATIVE_REPLAY_MAX_SAMPLED_RESOURCES; ++i)
+            if (snapshots[i].enabled)
+                return replay_fail(pass, "vertex_snapshot_without_vtex_table");
+    }
+    if (snapshots) {
+        for (i = 0; i < RSX_NATIVE_REPLAY_MAX_SAMPLED_RESOURCES; ++i) {
+            if (snapshots[i].enabled != 0 && snapshots[i].enabled != 1)
+                return replay_fail(pass, "invalid_snapshot_enabled_flag");
+            if (!snapshots[i].enabled) continue;
+            if (!sampled_resources[i] ||
+                !replay_snapshot_state_supported(snapshots[i].source_state) ||
+                !replay_snapshot_view_supported(
+                    sampled_resources[i], &snapshots[i].view))
+                return replay_fail(pass, "invalid_snapshot_metadata");
+            if (i < RSX_NATIVE_REPLAY_TABLE_SIZE &&
+                !(snapshots[i].source_state & D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
+                return replay_fail(pass, "pixel_snapshot_not_pixel_readable");
+            if (i >= RSX_NATIVE_REPLAY_TABLE_SIZE &&
+                !(snapshots[i].source_state & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+                return replay_fail(pass, "vertex_snapshot_not_nonpixel_readable");
+            {
+                uint32_t prior_slot;
+                for (prior_slot = 0; prior_slot < i; ++prior_slot) {
+                    if (snapshots[prior_slot].enabled &&
+                        sampled_resources[prior_slot] == sampled_resources[i] &&
+                        snapshots[prior_slot].generation == snapshots[i].generation &&
+                        snapshots[prior_slot].source_state != snapshots[i].source_state)
+                        return replay_fail(pass, "snapshot_version_state_changed");
+                }
+            }
+            {
+                replay_texture_snapshot* prior = replay_find_snapshot(
+                    pass, sampled_resources[i], snapshots[i].generation);
+                if (prior && prior->source_state != snapshots[i].source_state)
+                    return replay_fail(pass, "snapshot_version_state_changed");
+            }
+        }
+    }
+    for (i = 0; i < packet->transition_count; ++i) {
+        uint32_t j;
+        int covered = 0;
+        ID3D12Resource* transition = packet->transition_resources[i];
+        if (!transition)
+            return replay_fail(pass, "null_transition_resource");
+        for (j = 0; j < i; ++j)
+            if (packet->transition_resources[j] == transition)
+                return replay_fail(pass, "duplicate_transition_resource");
+        if (snapshots) {
+            for (j = 0; j < RSX_NATIVE_REPLAY_MAX_SAMPLED_RESOURCES; ++j) {
+                if (snapshots[j].enabled && sampled_resources[j] == transition &&
+                    snapshots[j].source_state == D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+                    covered = 1;
+                    break;
+                }
+            }
+        }
+        if (!covered)
+            return replay_fail(pass, "transition_missing_snapshot");
+    }
     if (!pass->source_signature_set) {
         for (i = 0; i < pass->color_count; ++i)
             pass->source_rtv[i] = packet->render_targets[i];
@@ -454,6 +688,9 @@ int rsx_native_replay_pass_capture(
     draw = &pass->draws[pass->payload.record_count - 1u];
     memset(draw, 0, sizeof(*draw));
     draw->packet = *packet;
+    draw->packet.transition_count = 0;
+    memset(draw->packet.transition_resources, 0,
+        sizeof(draw->packet.transition_resources));
     packet->pipeline_state->lpVtbl->AddRef(packet->pipeline_state);
     packet->root_signature->lpVtbl->AddRef(packet->root_signature);
 
@@ -466,13 +703,22 @@ int rsx_native_replay_pass_capture(
         pass->device, pass->srv_heap, pass->srv_step, pass->srv_used,
         srv_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     draw->srv_table = srv_gpu;
+    if (!replay_snapshot_table_slots(
+            pass, packet->list, pass->srv_used, 0,
+            sampled_resources, snapshots))
+        return 0;
     pass->srv_used += RSX_NATIVE_REPLAY_TABLE_SIZE;
     if (packet->has_vertex_texture_table) {
+        const uint32_t vtex_base = pass->srv_used;
         draw->vtex_table = replay_gpu_handle(
-            pass->srv_heap, pass->srv_step, pass->srv_used);
+            pass->srv_heap, pass->srv_step, vtex_base);
         replay_copy_descriptor_table(
-            pass->device, pass->srv_heap, pass->srv_step, pass->srv_used,
+            pass->device, pass->srv_heap, pass->srv_step, vtex_base,
             vtex_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        if (!replay_snapshot_table_slots(
+                pass, packet->list, vtex_base, RSX_NATIVE_REPLAY_TABLE_SIZE,
+                sampled_resources, snapshots))
+            return 0;
         pass->srv_used += RSX_NATIVE_REPLAY_TABLE_SIZE;
     }
     if (!replay_copy_sampler_table(pass, sampler_cpu, &draw->sampler_table))
@@ -487,6 +733,20 @@ int rsx_native_replay_pass_capture(
         pass->sampled_refs[pass->sampled_ref_count++] = resource;
     }
     return 1;
+}
+
+int rsx_native_replay_pass_capture(
+    rsx_native_replay_pass* pass,
+    const rsx_native_draw_packet* packet,
+    const rsx_native_draw_payload_input* input,
+    const D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu[RSX_NATIVE_REPLAY_TABLE_SIZE],
+    const D3D12_CPU_DESCRIPTOR_HANDLE sampler_cpu[RSX_NATIVE_REPLAY_TABLE_SIZE],
+    const D3D12_CPU_DESCRIPTOR_HANDLE vtex_cpu[RSX_NATIVE_REPLAY_TABLE_SIZE],
+    ID3D12Resource* const sampled_resources[RSX_NATIVE_REPLAY_MAX_SAMPLED_RESOURCES])
+{
+    return rsx_native_replay_pass_capture_with_snapshots(
+        pass, packet, input, srv_cpu, sampler_cpu, vtex_cpu,
+        sampled_resources, NULL);
 }
 
 int rsx_native_replay_pass_record(
@@ -733,6 +993,24 @@ uint32_t rsx_native_replay_pass_draw_count(
     return pass ? pass->payload.record_count : 0;
 }
 
+uint32_t rsx_native_replay_pass_snapshot_count(
+    const rsx_native_replay_pass* pass)
+{
+    return pass ? pass->snapshot_count : 0;
+}
+
+uint64_t rsx_native_replay_pass_snapshot_bytes(
+    const rsx_native_replay_pass* pass)
+{
+    return pass ? pass->snapshot_bytes : 0;
+}
+
+uint64_t rsx_native_replay_pass_snapshot_reuses(
+    const rsx_native_replay_pass* pass)
+{
+    return pass ? pass->snapshot_reuses : 0;
+}
+
 const char* rsx_native_replay_pass_error(
     const rsx_native_replay_pass* pass)
 {
@@ -752,6 +1030,12 @@ void rsx_native_replay_pass_destroy(rsx_native_replay_pass* pass)
     for (i = 0; i < pass->sampled_ref_count; ++i)
         if (pass->sampled_refs[i])
             pass->sampled_refs[i]->lpVtbl->Release(pass->sampled_refs[i]);
+    for (i = 0; i < pass->snapshot_count; ++i) {
+        if (pass->snapshots[i].source)
+            pass->snapshots[i].source->lpVtbl->Release(pass->snapshots[i].source);
+        if (pass->snapshots[i].clone)
+            pass->snapshots[i].clone->lpVtbl->Release(pass->snapshots[i].clone);
+    }
     for (i = 0; i < RSX_NATIVE_REPLAY_MAX_COLOR_TARGETS; ++i) {
         if (pass->original_color[i]) pass->original_color[i]->lpVtbl->Release(pass->original_color[i]);
         if (pass->replay_color[i]) pass->replay_color[i]->lpVtbl->Release(pass->replay_color[i]);
@@ -768,6 +1052,7 @@ void rsx_native_replay_pass_destroy(rsx_native_replay_pass* pass)
     rsx_native_draw_payload_destroy(&pass->payload);
     free(pass->draws);
     free(pass->sampled_refs);
+    free(pass->snapshots);
     free(pass);
 }
 

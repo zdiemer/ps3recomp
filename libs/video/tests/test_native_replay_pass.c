@@ -24,7 +24,28 @@
     fprintf(stderr,"line %d HRESULT 0x%08lX\n",__LINE__,(unsigned long)h_); abort(); } } while (0)
 #define RELEASE(object) do { if (object) { (object)->lpVtbl->Release(object); (object)=NULL; } } while (0)
 #define SRV_TABLE_SIZE 16u
+/* Observe the public packet boundary while retaining the exact production
+ * helper bodies and real D3D12 recording. Replay must never transition the
+ * original sampled resources after switching descriptors to owned clones. */
+#define rsx_native_draw_packet_begin fixture_actual_packet_begin
+#define rsx_native_draw_packet_end fixture_actual_packet_end
 #include "native_draw_packet_actual.inc"
+#undef rsx_native_draw_packet_begin
+#undef rsx_native_draw_packet_end
+static int checking_replay_packets;
+static unsigned checked_replay_packets;
+static void check_scrubbed_transitions(const rsx_native_draw_packet* packet) {
+    assert(packet && packet->transition_count == 0);
+    for (unsigned i = 0; i < RSX_NATIVE_DRAW_MAX_TRANSITIONS; ++i) assert(packet->transition_resources[i] == NULL);
+}
+void rsx_native_draw_packet_begin(const rsx_native_draw_packet* packet) {
+    if (checking_replay_packets) { check_scrubbed_transitions(packet); ++checked_replay_packets; }
+    fixture_actual_packet_begin(packet);
+}
+void rsx_native_draw_packet_end(const rsx_native_draw_packet* packet) {
+    if (checking_replay_packets) check_scrubbed_transitions(packet);
+    fixture_actual_packet_end(packet);
+}
 
 typedef struct gpu_context {
     ID3D12Device* device;
@@ -100,7 +121,7 @@ static void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource
     barrier.Transition.StateBefore = before; barrier.Transition.StateAfter = after;
     list->lpVtbl->ResourceBarrier(list,1,&barrier);
 }
-static void create_scene(gpu_context* g, scene* s, int depth_enabled, int pull_enabled) {
+static void create_scene(gpu_context* g, scene* s, int depth_enabled, int pull_enabled, int sample_texture) {
     memset(s,0,sizeof(*s));
     ID3D12Device* device = g->device;
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -180,9 +201,11 @@ static void create_scene(gpu_context* g, scene* s, int depth_enabled, int pull_e
     const char* vertex_source = "cbuffer C:register(b0){float4 color;} struct O{float4 p:SV_Position;float4 c:COLOR0;}; O main(uint id:SV_VertexID){O o;float2 p=float2((id<<1)&2,id&2);o.p=float4(p*2-1,0.5,1);o.c=color;return o;}";
     const char* pull_source = "cbuffer C:register(b0){float4 color;} StructuredBuffer<float2> positions:register(t20); struct O{float4 p:SV_Position;float4 c:COLOR0;}; O main(uint id:SV_VertexID){O o;o.p=float4(positions[id],0.5,1);o.c=color;return o;}";
     const char* pixel_source = "float4 main(float4 p:SV_Position,float4 c:COLOR0):SV_Target{return c;}";
+    const char* sampled_pixel_source = "Texture2D<float4> tex:register(t0);SamplerState smp:register(s0);float4 main(float4 p:SV_Position,float4 c:COLOR0):SV_Target{return tex.SampleLevel(smp,float2(0.5,0.5),0);}";
     const char* selected_vertex = pull_enabled ? pull_source : vertex_source;
     OK(D3DCompile(selected_vertex,strlen(selected_vertex),NULL,NULL,NULL,"main","vs_5_0",0,0,&vs,NULL));
-    OK(D3DCompile(pixel_source,strlen(pixel_source),NULL,NULL,NULL,"main","ps_5_0",0,0,&ps,NULL));
+    const char* selected_pixel = sample_texture ? sampled_pixel_source : pixel_source;
+    OK(D3DCompile(selected_pixel,strlen(selected_pixel),NULL,NULL,NULL,"main","ps_5_0",0,0,&ps,NULL));
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {0}; pso.pRootSignature = s->root;
     pso.VS.pShaderBytecode = vs->lpVtbl->GetBufferPointer(vs); pso.VS.BytecodeLength = vs->lpVtbl->GetBufferSize(vs);
     pso.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps); pso.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
@@ -259,7 +282,7 @@ static void verify_original(scene* s, UINT draws) {
     D3D12_RANGE no_write = {0,0}; s->original_readback->lpVtbl->Unmap(s->original_readback,0,&no_write);
 }
 static void exercise(gpu_context* g, int depth_enabled, UINT draws, int rejection, int pull_enabled) {
-    scene s; create_scene(g,&s,depth_enabled,pull_enabled);
+    scene s; create_scene(g,&s,depth_enabled,pull_enabled,0);
     const FLOAT blue[4] = {0,0,1,1};
     g->list->lpVtbl->ClearRenderTargetView(g->list,s.rtv,blue,0,NULL);
     int implicit_clear = depth_enabled && draws == 1;
@@ -321,7 +344,9 @@ static void exercise(gpu_context* g, int depth_enabled, UINT draws, int rejectio
         }
         assert(rsx_native_replay_pass_draw_count(pass) == draws);
         reset_list(g);
+        checking_replay_packets = 1; checked_replay_packets = 0;
         assert(rsx_native_replay_pass_record(pass,g->list,NULL));
+        checking_replay_packets = 0; assert(checked_replay_packets == draws);
         assert(rsx_native_replay_pass_record_compare(pass,g->list));
         submit_wait(g);
         rsx_native_replay_compare_result result;
@@ -335,6 +360,154 @@ static void exercise(gpu_context* g, int depth_enabled, UINT draws, int rejectio
     UINT64 completed = g->fence->lpVtbl->GetCompletedValue(g->fence);
     assert(completed != UINT64_MAX && completed >= g->fence_value);
     rsx_native_replay_pass_destroy(pass); destroy_scene(&s); reset_list(g);
+}
+static ID3D12Resource* sampled_texture(ID3D12Device* device, DXGI_FORMAT format) {
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {0}; desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = desc.Height = 4; desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Format = format; desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ID3D12Resource* resource = NULL;
+    OK(device->lpVtbl->CreateCommittedResource(device,&hp,D3D12_HEAP_FLAG_NONE,&desc,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,NULL,&IID_ID3D12Resource,(void**)&resource));
+    return resource;
+}
+static void verify_sampled_original(scene* s, int r32) {
+    D3D12_RANGE range = {0,8192}; const unsigned char* bytes = NULL;
+    OK(s->original_readback->lpVtbl->Map(s->original_readback,0,&range,(void**)&bytes));
+    for (UINT y = 0; y < 32; ++y) for (UINT x = 0; x < 32; ++x) {
+        unsigned char wanted[4] = {0,0,255,255};
+        if (y >= 4 && y < 28 && x >= 4 && x < 28) {
+            if (r32) wanted[0] = wanted[1] = wanted[2] = x < 20 ? 64 : 191;
+            else { wanted[0] = x < 20 ? 255 : 0; wanted[1] = x < 20 ? 0 : 255; wanted[2] = 0; }
+        }
+        assert(!memcmp(bytes+(SIZE_T)y*256+x*4,wanted,4));
+    }
+    D3D12_RANGE no_write = {0,0}; s->original_readback->lpVtbl->Unmap(s->original_readback,0,&no_write);
+}
+/* For the rejected-format case only, count snapshot commands at the actual
+ * capture list boundary. Any unexpected commands are forwarded to real WARP;
+ * this does not replace resource, device, descriptor or positive-path work. */
+static ID3D12GraphicsCommandList* proxy_target;
+static unsigned proxy_barriers, proxy_copies;
+static void STDMETHODCALLTYPE proxy_barrier(ID3D12GraphicsCommandList* self, UINT count,
+                                            const D3D12_RESOURCE_BARRIER* barriers) {
+    (void)self; ++proxy_barriers;
+    proxy_target->lpVtbl->ResourceBarrier(proxy_target,count,barriers);
+}
+static void STDMETHODCALLTYPE proxy_copy(ID3D12GraphicsCommandList* self,
+                                         ID3D12Resource* destination, ID3D12Resource* source) {
+    (void)self; ++proxy_copies;
+    proxy_target->lpVtbl->CopyResource(proxy_target,destination,source);
+}
+static void exercise_sampled_versions(gpu_context* g, int r32, int rejection) {
+    scene s; create_scene(g,&s,0,0,1);
+    DXGI_FORMAT format = rejection == 4 ? DXGI_FORMAT_R32_TYPELESS :
+        r32 ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+    ID3D12Resource* texture = sampled_texture(g->device,format);
+    ID3D12Resource* extra = rejection == 1 ? sampled_texture(g->device,format) : NULL;
+    ID3D12DescriptorHeap* rtv_heap = heap(g->device,D3D12_DESCRIPTOR_HEAP_TYPE_RTV,2,0);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv, extra_rtv;
+    rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(rtv_heap,&rtv);
+    extra_rtv.ptr = rtv.ptr+g->device->lpVtbl->GetDescriptorHandleIncrementSize(g->device,D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_RENDER_TARGET_VIEW_DESC typed_rtv = {0};
+    typed_rtv.Format = DXGI_FORMAT_R32_FLOAT; typed_rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    g->device->lpVtbl->CreateRenderTargetView(g->device,texture,format == DXGI_FORMAT_R32_TYPELESS ? &typed_rtv : NULL,rtv);
+    if (extra) g->device->lpVtbl->CreateRenderTargetView(g->device,extra,NULL,extra_rtv);
+    const FLOAT blue[4] = {0,0,1,1}, first[4] = {r32 ? .25f : 1.0f,0,0,1};
+    const FLOAT second[4] = {r32 ? .75f : 0.0f,1,0,1}, replacement[4] = {1,1,0,1};
+    g->list->lpVtbl->ClearRenderTargetView(g->list,s.rtv,blue,0,NULL);
+    g->list->lpVtbl->ClearRenderTargetView(g->list,rtv,first,0,NULL);
+    if (extra) g->list->lpVtbl->ClearRenderTargetView(g->list,extra_rtv,first,0,NULL);
+    rsx_native_replay_pass* pass = rsx_native_replay_pass_create(g->device,3,4096); assert(pass);
+    ID3D12Resource* colors[4] = {s.color,NULL,NULL,NULL};
+    assert(rsx_native_replay_pass_begin(pass,g->list,colors,1,NULL,NULL));
+    ID3D12Resource* sampled[32] = {0}; sampled[0] = rejection == 2 ? s.color : texture;
+    rsx_native_replay_srv_snapshot snapshots[32]; memset(snapshots,0,sizeof(snapshots));
+    snapshots[0].enabled = 1; snapshots[0].generation = 1;
+    snapshots[0].source_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    snapshots[0].view.Format = rejection == 2 ? DXGI_FORMAT_R8G8B8A8_UNORM :
+        format == DXGI_FORMAT_R32_TYPELESS ? DXGI_FORMAT_R32_FLOAT : format;
+    snapshots[0].view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    snapshots[0].view.Texture2D.MipLevels = 1;
+    snapshots[0].view.Shader4ComponentMapping = r32 ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+        D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+        D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+        D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+        D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1) : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    g->device->lpVtbl->CreateShaderResourceView(g->device,sampled[0],&snapshots[0].view,s.srvs[0]);
+    D3D12_CPU_DESCRIPTOR_HANDLE live_srv;
+    s.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s.srv_heap,&live_srv);
+    g->device->lpVtbl->CopyDescriptorsSimple(g->device,1,live_srv,s.srvs[0],D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    unsigned char constants[256] = {0}; void* mapped = NULL; D3D12_RANGE no_read = {0,0};
+    OK(s.constants->lpVtbl->Map(s.constants,0,&no_read,&mapped)); memcpy(mapped,constants,sizeof(constants));
+    D3D12_RANGE written = {0,sizeof(constants)}; s.constants->lpVtbl->Unmap(s.constants,0,&written);
+    UINT draws = rejection ? 1 : 3;
+    for (UINT i = 0; i < draws; ++i) {
+        if (i == 2) {
+            /* Prior packets restored RT state. This update is ordered after
+             * their draws/copies and creates a new version of the same object. */
+            g->list->lpVtbl->ClearRenderTargetView(g->list,rtv,second,0,NULL);
+            snapshots[0].generation = 2;
+        }
+        rsx_native_draw_packet packet; fill_packet(g,&s,&packet,0,0);
+        packet.scissor.left = 4+(LONG)i*8; packet.scissor.right = packet.scissor.left+8;
+        packet.transition_count = 1; packet.transition_resources[0] = sampled[0];
+        if (extra) { packet.transition_count = 2; packet.transition_resources[1] = extra; }
+        rsx_native_draw_payload_input input = {0}; input.draw_ordinal = i+501;
+        input.vertex_constants.data = constants; input.vertex_constants.size = sizeof(constants);
+        /* Match production: the packet begins before capture/bind, putting
+         * sampled RT resources into the source state declared by metadata. */
+        rsx_native_draw_packet_begin(&packet); rsx_native_draw_packet_targets(&packet);
+        if (rejection >= 3) {
+            ID3D12GraphicsCommandListVtbl vtable; memset(&vtable,0,sizeof(vtable));
+            vtable.ResourceBarrier = proxy_barrier; vtable.CopyResource = proxy_copy;
+            ID3D12GraphicsCommandList proxy = {&vtable};
+            proxy_target = g->list; proxy_barriers = proxy_copies = 0;
+            packet.list = &proxy;
+            snapshots[0].view.Format = rejection == 4 ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_R8G8B8A8_UNORM;
+            assert(!rsx_native_replay_pass_capture_with_snapshots(pass,&packet,&input,
+                s.srvs,s.samplers,NULL,sampled,snapshots));
+            assert(proxy_barriers == 0 && proxy_copies == 0);
+            packet.list = g->list;
+        } else {
+            int captured = rsx_native_replay_pass_capture_with_snapshots(pass,&packet,&input,
+                s.srvs,s.samplers,NULL,sampled,snapshots);
+            assert(captured == !rejection);
+        }
+        if (rejection) {
+            assert(rsx_native_replay_pass_draw_count(pass) == 0);
+            assert(rsx_native_replay_pass_snapshot_count(pass) == 0);
+            assert(rsx_native_replay_pass_snapshot_bytes(pass) == 0);
+            const char* error = rsx_native_replay_pass_error(pass); assert(error && *error);
+            if (rejection == 1) assert(strstr(error,"transition_missing_snapshot"));
+            if (rejection == 2) assert(strstr(error,"sampled_color_output_alias"));
+        } else {
+            rsx_native_draw_packet_bind(&packet); rsx_native_draw_packet_draw(&packet);
+        }
+        rsx_native_draw_packet_end(&packet);
+    }
+    if (!rejection) original_readback(g,&s);
+    submit_wait(g);
+    if (!rejection) {
+        verify_sampled_original(&s,r32);
+        assert(rsx_native_replay_pass_snapshot_count(pass) == 2);
+        assert(rsx_native_replay_pass_snapshot_reuses(pass) == 1);
+        assert(rsx_native_replay_pass_snapshot_bytes(pass) > 0);
+        reset_list(g);
+        /* Original contents now disagree with both captured versions. */
+        g->list->lpVtbl->ClearRenderTargetView(g->list,rtv,replacement,0,NULL);
+        checking_replay_packets = 1; checked_replay_packets = 0;
+        assert(rsx_native_replay_pass_record(pass,g->list,NULL));
+        checking_replay_packets = 0; assert(checked_replay_packets == 3);
+        assert(rsx_native_replay_pass_record_compare(pass,g->list)); submit_wait(g);
+        rsx_native_replay_compare_result result; assert(rsx_native_replay_pass_compare(pass,&result));
+        assert(result.compared_targets == 1 && result.compared_bytes == 4096 && result.mismatch_bytes == 0);
+        printf("WARP sampled versions format=%s draws=3 snapshots=2 reuses=1 compared=4096 mismatches=0 original-overwrite and scrubbed-transitions passed\n",r32 ? "R32_RRR1" : "RGBA8");
+    } else printf("WARP snapshot rejection=%d passed; zero snapshots published\n",rejection);
+    UINT64 completed = g->fence->lpVtbl->GetCompletedValue(g->fence);
+    assert(completed != UINT64_MAX && completed >= g->fence_value);
+    rsx_native_replay_pass_destroy(pass); RELEASE(texture); RELEASE(extra); RELEASE(rtv_heap);
+    destroy_scene(&s); reset_list(g);
 }
 int main(void) {
     ID3D12Debug* debug = NULL;
@@ -356,6 +529,9 @@ int main(void) {
     for (int depth = 0; depth < 2; ++depth) for (UINT draws = 1; draws <= 2; ++draws) exercise(&g,depth,draws,0,0);
     exercise(&g,0,1,1,0); exercise(&g,0,1,2,0);
     exercise(&g,0,1,0,1); exercise(&g,0,2,0,1); exercise(&g,0,1,3,1);
+    exercise_sampled_versions(&g,0,0); exercise_sampled_versions(&g,1,0);
+    exercise_sampled_versions(&g,0,1); exercise_sampled_versions(&g,0,2);
+    exercise_sampled_versions(&g,1,3); exercise_sampled_versions(&g,1,4);
     /* Last reset left an empty list recording; close it without submitting. */
     OK(g.list->lpVtbl->Close(g.list));
     ID3D12InfoQueue* info = NULL;
@@ -376,6 +552,6 @@ int main(void) {
     }
     CloseHandle(g.event); RELEASE(g.list); RELEASE(g.allocator); RELEASE(g.queue); RELEASE(g.fence);
     RELEASE(g.device); RELEASE(warp); RELEASE(factory);
-    puts("actual-source native replay WARP integration passed; descriptor contents and depth bytes are not directly compared");
+    puts("actual-source native replay WARP integration passed; sampled descriptor swizzle/color versions verified, depth bytes not directly compared");
     return 0;
 }

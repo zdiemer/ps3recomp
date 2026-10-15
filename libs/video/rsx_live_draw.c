@@ -410,6 +410,7 @@ typedef struct {
     u32 guest_w, guest_h; /* identity and guest address arithmetic */
     DXGI_FORMAT fmt;
     ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
+    u64 native_content_epoch, native_feedback_epoch;
 #if !defined(YZ_PERF_CLEAN)
     u32 resource_serial;
     u32 last_write_generation;
@@ -449,6 +450,7 @@ typedef struct {
     ID3D12Resource* packed;
     u32 packed_w, packed_h, packed_guest_w, packed_guest_h;
     u64 generation, packed_generation;
+    u64 native_snapshot_epoch, native_packed_epoch;
 } zdepth_t;
 typedef struct {
     u32 location, offset, format, width, height, pitch, remap;
@@ -692,6 +694,7 @@ static void ld_surface_note_write(u32 target, u32 kind)
     if (target >= MAX_SURFACES)
         return;
     surface_t* surface = &g.surfaces[target];
+    ++surface->native_content_epoch;
     const u32 generation = ++g_ld_surface_generation;
     surface->last_write_generation = generation;
     surface->last_write_kind = kind;
@@ -720,7 +723,11 @@ static void ld_surface_note_write(u32 target, u32 kind)
     }
 }
 #else
-#define ld_surface_note_write(target, kind) ((void)0)
+static void ld_native_surface_note_write(u32 target)
+{
+    if (target < MAX_SURFACES) ++g.surfaces[target].native_content_epoch;
+}
+#define ld_surface_note_write(target, kind) ld_native_surface_note_write(target)
 #endif
 
 #define LD_LAYOUT_CACHE_CAP 256u
@@ -5001,6 +5008,7 @@ static u32 surface_feedback_srv(u32 slot)
     g.list->lpVtbl->ResourceBarrier(g.list, fresh ? 1 : 2, b);
     ld_native_pass_mutation("CopyResource");
     g.list->lpVtbl->CopyResource(g.list, s->fb_tex, s->tex);
+    ++s->native_feedback_epoch;
     b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -5555,6 +5563,7 @@ static int zdepth_snapshot(u32 slot)
     g.list->lpVtbl->ResourceBarrier(g.list, 2, done);
     z->snapshot_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     z->snapshot_valid = 1;
+    ++z->native_snapshot_epoch;
     z->had_write = 0;
     return 1;
 }
@@ -5667,6 +5676,7 @@ static int zdepth_pack(u32 index, u32 guest_w, u32 guest_h)
     ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 2, bars);
     z->packed_generation = z->generation;
+    ++z->native_packed_epoch;
     return 1;
 }
 
@@ -9846,7 +9856,8 @@ void rsx_native_draw_packet_end(const rsx_native_draw_packet* packet)
 /* END RSX NATIVE DRAW PACKET RECORDERS */
 
 /* Bounded offscreen replay experiment. Only draws since an observed clear are
- * eligible, with immutable decoded/white/vertex textures. Every uncaptured
+ * eligible. Decoded textures are retained; mutable SRVs are versioned copies.
+ * Every uncaptured
  * command emitter invalidates the pass BEFORE mutation. Invalid resources
  * stay alive until the existing successful flush completion path retires them.
  * This is a pass/color oracle, never a whole-frame benchmark. */
@@ -9865,9 +9876,10 @@ static struct {
 static void ld_native_pass_mutation(const char* reason)
 {
     if (g_ld_native_pass.phase != LD_NATIVE_PASS_CAPTURE) return;
-    fprintf(stderr, "[native-pass] reject attempt=%u draws=%u reason=%s\n",
+    fprintf(stderr, "[native-pass] reject attempt=%u draws=%u reason=%s snapshots=%u\n",
         g_ld_native_pass.attempts,
-        rsx_native_replay_pass_draw_count(g_ld_native_pass.pass), reason);
+        rsx_native_replay_pass_draw_count(g_ld_native_pass.pass), reason,
+        rsx_native_replay_pass_snapshot_count(g_ld_native_pass.pass));
     ++g_ld_native_pass.rejected;
     g_ld_native_pass.phase = LD_NATIVE_PASS_INVALID;
     g_ld_native_pass.clear_candidate = 0;
@@ -9901,21 +9913,29 @@ static void ld_native_pass_finish(const char* boundary)
     if (ok && g.ready) ok = rsx_native_replay_pass_compare(g_ld_native_pass.pass, &result);
     else ok = 0;
     fprintf(stderr, "[native-pass] compared=%d boundary=%s draws=%u targets=%u "
-        "bytes=%llu mismatch=%llu depth_compared=0 full_frame=0 error=%s\n",
+        "bytes=%llu mismatch=%llu snapshots=%u snapshot_bytes=%llu snapshot_reuses=%llu "
+        "depth_compared=0 full_frame=0 error=%s\n",
         ok, boundary, draws, result.compared_targets,
         (unsigned long long)result.compared_bytes,
         (unsigned long long)result.mismatch_bytes,
+        rsx_native_replay_pass_snapshot_count(g_ld_native_pass.pass),
+        (unsigned long long)rsx_native_replay_pass_snapshot_bytes(g_ld_native_pass.pass),
+        (unsigned long long)rsx_native_replay_pass_snapshot_reuses(g_ld_native_pass.pass),
         rsx_native_replay_pass_error(g_ld_native_pass.pass));
     FILE* file = fopen(g_ld_native_pass.path, "wbx");
     if (file) {
         const int written = fprintf(file,
             "{\"frame\":%u,\"attempts\":%u,\"rejected\":%u,\"draws\":%u,"
             "\"comparison_completed\":%s,\"color_targets\":%u,\"compared_bytes\":%llu,"
-            "\"mismatch_bytes\":%llu,\"depth_compared\":false,\"full_frame\":false}\n",
+            "\"mismatch_bytes\":%llu,\"snapshots\":%u,\"snapshot_bytes\":%llu,"
+            "\"snapshot_reuses\":%llu,\"depth_compared\":false,\"full_frame\":false}\n",
             g_ld_frames, g_ld_native_pass.attempts, g_ld_native_pass.rejected,
             draws, ok ? "true" : "false", result.compared_targets,
             (unsigned long long)result.compared_bytes,
-            (unsigned long long)result.mismatch_bytes);
+            (unsigned long long)result.mismatch_bytes,
+            rsx_native_replay_pass_snapshot_count(g_ld_native_pass.pass),
+            (unsigned long long)rsx_native_replay_pass_snapshot_bytes(g_ld_native_pass.pass),
+            (unsigned long long)rsx_native_replay_pass_snapshot_reuses(g_ld_native_pass.pass));
         const int close_result = fclose(file);
         if (written < 0 || close_result != 0)
             fprintf(stderr, "[native-pass] report_write_failed path=%s\n", g_ld_native_pass.path);
@@ -9973,14 +9993,68 @@ static void ld_native_pass_before_draw(void)
     }
 }
 
-static ID3D12Resource* ld_native_pass_immutable_texture(u32 slot)
+/* Metadata describes the state at capture, AFTER packet_begin has changed
+ * sampled color surfaces to PSR. Mutable contents receive independent copies;
+ * CPU descriptor handles alone cannot retain these resource versions. */
+static ID3D12Resource* ld_native_pass_sampled_resource(
+    u32 slot, rsx_native_replay_srv_snapshot* snapshot)
 {
+    memset(snapshot, 0, sizeof(*snapshot));
     if (slot == SRV_WHITE) return g.white_tex;
     if (slot >= SRV_TEXTURE_BASE && slot < SRV_TEXTURE_BASE + g.n_textures)
         return g.textures[slot - SRV_TEXTURE_BASE].tex;
     if (slot >= SRV_VTEX_BASE && slot < SRV_VTEX_BASE + g.n_vtex)
         return g.vtex[slot - SRV_VTEX_BASE].tex;
-    return NULL;
+    ID3D12Resource* resource = NULL;
+    int scalar_depth = 0;
+    if (slot >= SRV_SURFACE_BASE && slot < SRV_SURFACE_BASE + g.n_surfaces) {
+        const surface_t* surface = &g.surfaces[slot - SRV_SURFACE_BASE];
+        resource = surface->tex;
+        snapshot->generation = surface->native_content_epoch;
+    } else if (slot >= SRV_ZDEPTH_BASE && slot < SRV_ZDEPTH_BASE + g.n_zdepths) {
+        const zdepth_t* z = &g.zdepths[slot - SRV_ZDEPTH_BASE];
+        if (!z->snapshot_valid || z->snapshot_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+            return NULL;
+        resource = z->snapshot;
+        snapshot->generation = z->native_snapshot_epoch;
+        scalar_depth = 1;
+    } else if (slot >= SRV_FEEDBACK_BASE && slot < SRV_FEEDBACK_BASE + g.n_surfaces) {
+        const surface_t* surface = &g.surfaces[slot - SRV_FEEDBACK_BASE];
+        resource = surface->fb_tex;
+        snapshot->generation = surface->native_feedback_epoch;
+    } else if (slot >= SRV_PACKED_DEPTH_BASE && slot < SRV_PACKED_DEPTH_BASE + g.n_zdepths) {
+        const zdepth_t* z = &g.zdepths[slot - SRV_PACKED_DEPTH_BASE];
+        resource = z->packed;
+        snapshot->generation = z->native_packed_epoch;
+    }
+    if (!resource) return NULL;
+    D3D12_RESOURCE_DESC desc;
+    resource->lpVtbl->GetDesc(resource, &desc);
+    {
+        static u32 logged_slots[16], logged_count;
+        u32 i;
+        for (i = 0; i < logged_count; ++i) if (logged_slots[i] == slot) break;
+        if (i == logged_count && logged_count < 16u) {
+            logged_slots[logged_count++] = slot;
+            fprintf(stderr, "[native-pass] sampled_version slot=%u size=%llux%u "
+                "format=%u epoch=%llu scalar_depth=%d\n", slot,
+                (unsigned long long)desc.Width, desc.Height, (u32)desc.Format,
+                (unsigned long long)snapshot->generation, scalar_depth);
+        }
+    }
+    snapshot->enabled = 1;
+    snapshot->source_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    snapshot->view.Format = desc.Format;
+    snapshot->view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    snapshot->view.Texture2D.MipLevels = 1;
+    snapshot->view.Shader4ComponentMapping = scalar_depth
+        ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+            D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+            D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+            D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+            D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1)
+        : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    return resource;
 }
 
 static void ld_native_pass_begin_draw(const rsx_native_draw_packet* packet,
@@ -9990,18 +10064,20 @@ static void ld_native_pass_begin_draw(const rsx_native_draw_packet* packet,
         !(g_ld_native_pass.phase == LD_NATIVE_PASS_ARMED && g_ld_native_pass.clear_candidate)) return;
     g_ld_native_pass.clear_candidate = 0;
     for (u32 i = 0; i < SRV_TABLE_SIZE; ++i) {
-        if (!ld_native_pass_immutable_texture(slots[i]) ||
-            (vtex_mask && !ld_native_pass_immutable_texture(vtex_slots[i]))) {
+        rsx_native_replay_srv_snapshot metadata;
+        if (!ld_native_pass_sampled_resource(slots[i], &metadata) ||
+            (vtex_mask && !ld_native_pass_sampled_resource(vtex_slots[i], &metadata))) {
             ++g_ld_native_pass.skipped_mutable;
-            ld_native_pass_mutation("mutable_sampled_resource");
+            if (g_ld_native_pass.skipped_mutable <= 8u)
+                fprintf(stderr, "[native-pass] unsupported_srv pixel_slot=%u vertex_slot=%u unit=%u\n",
+                    slots[i], vtex_mask ? vtex_slots[i] : 0u, i);
+            ld_native_pass_mutation("unsupported_sampled_resource");
             return;
         }
     }
-    if (packet->transition_count) {
-        ++g_ld_native_pass.skipped_transition;
-        ld_native_pass_mutation("sampled_surface_transition");
-        return;
-    }
+    /* The capture module validates that every source transition is covered
+     * by an owned snapshot, then strips original-resource transitions from
+     * the replay packet. Unknown transitions still fail closed there. */
     if (g_ld_native_pass.phase == LD_NATIVE_PASS_CAPTURE) return;
     ID3D12Resource* colors[4] = {0};
     for (u32 i = 0; i < packet->render_target_count; ++i) colors[i] = g.surfaces[mrt[i]].tex;
@@ -10043,12 +10119,13 @@ static void ld_native_pass_capture_draw(const rsx_native_draw_packet* packet,
     if (g_ld_native_pass.phase != LD_NATIVE_PASS_CAPTURE) return;
     D3D12_CPU_DESCRIPTOR_HANDLE srv[16], smp[16], vtex[16];
     ID3D12Resource* resources[32] = {0};
+    rsx_native_replay_srv_snapshot snapshots[32] = {0};
     for (u32 i = 0; i < 16; ++i) {
         srv[i] = srv_cpu(slots[i]); smp[i] = smp_cpu(samplers[i]);
         vtex[i] = srv_cpu(vertex_slots[i]);
-        resources[i] = ld_native_pass_immutable_texture(slots[i]);
+        resources[i] = ld_native_pass_sampled_resource(slots[i], &snapshots[i]);
         if (packet->has_vertex_texture_table)
-            resources[16 + i] = ld_native_pass_immutable_texture(vertex_slots[i]);
+            resources[16 + i] = ld_native_pass_sampled_resource(vertex_slots[i], &snapshots[16 + i]);
     }
     rsx_native_draw_payload_input input = {0};
     input.draw_ordinal = g_ld_stats.groups_executed + 1u;
@@ -10062,8 +10139,8 @@ static void ld_native_pass_capture_draw(const rsx_native_draw_packet* packet,
         input.pixel_constants.data = g.ps_cb_mapped + ps_offset;
         input.pixel_constants.size = ((g.fp_constants.count ? g.fp_constants.count : 1u) + 1u) * 16u;
     }
-    if (!rsx_native_replay_pass_capture(g_ld_native_pass.pass, packet, &input,
-            srv, smp, packet->has_vertex_texture_table ? vtex : NULL, resources))
+    if (!rsx_native_replay_pass_capture_with_snapshots(g_ld_native_pass.pass, packet, &input,
+            srv, smp, packet->has_vertex_texture_table ? vtex : NULL, resources, snapshots))
         ld_native_pass_mutation(rsx_native_replay_pass_error(g_ld_native_pass.pass));
 }
 

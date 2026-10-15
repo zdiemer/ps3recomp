@@ -56,6 +56,10 @@ class NativeReplayPass(unittest.TestCase):
             self.assertIn('WARP replay rejection=3 passed after completion', ran.stdout)
             for draws in (1, 2):
                 self.assertIn(f'WARP pull-only draws={draws} owned-SRV-VA passed after original-GPU-buffer overwrite', ran.stdout)
+            for format_name in ('RGBA8', 'R32_RRR1'):
+                self.assertIn(f'WARP sampled versions format={format_name} draws=3 snapshots=2 reuses=1 compared=4096 mismatches=0 original-overwrite and scrubbed-transitions passed', ran.stdout)
+            for rejection in (1, 2, 3, 4):
+                self.assertIn(f'WARP snapshot rejection={rejection} passed; zero snapshots published', ran.stdout)
             self.assertIn('actual-source native replay WARP integration passed', ran.stdout)
 
 
