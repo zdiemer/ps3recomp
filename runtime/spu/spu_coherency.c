@@ -211,13 +211,34 @@ static void taskset_notify_publication(uint32_t ea)
  * This lock remains exclusive and non-recursive; the protected reservation
  * checks, stores, and notifications are unchanged. */
 static SRWLOCK g_lockline = SRWLOCK_INIT;
-void spu_lockline_lock(void) { AcquireSRWLockExclusive(&g_lockline); }
+#include "spu_coherency_profile.inc"
+void spu_lockline_lock(void)
+{
+    /* An ordinary acquire-load is the entire disabled diagnostic overhead.
+     * Uncontended acquisitions never read a clock, even when enabled. */
+    if (!atomic_load_explicit(&s_coh_profile_enabled, memory_order_acquire)) {
+        AcquireSRWLockExclusive(&g_lockline);
+        return;
+    }
+    if (TryAcquireSRWLockExclusive(&g_lockline)) return;
+    if (!coh_profile_admit()) { AcquireSRWLockExclusive(&g_lockline); return; }
+    const uint32_t tid = GetCurrentThreadId();
+    const uint64_t caller = (uint64_t)COH_PROFILE_CALLER();
+    const uint64_t begin = coh_profile_qpc();
+    AcquireSRWLockExclusive(&g_lockline);
+    const uint64_t end = coh_profile_qpc();
+    coh_profile_record_locked(begin, end, caller, tid);
+}
 void spu_lockline_unlock(void) { ReleaseSRWLockExclusive(&g_lockline); }
 #else
 #include <stdatomic.h>
 static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
 void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
 void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
+int spu_coh_lock_profile_start(void) { return 0; }
+void spu_coh_lock_profile_stop(spu_coh_lock_profile_snapshot* snapshot)
+{ if (snapshot) memset(snapshot, 0, sizeof(*snapshot)); }
+int spu_coh_lock_profile_dump(const char* path) { (void)path; return 0; }
 #endif
 
 /* ===========================================================================

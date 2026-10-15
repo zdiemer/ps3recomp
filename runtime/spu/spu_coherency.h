@@ -29,6 +29,7 @@
 #include "spu_context.h"
 
 #include <stdint.h>
+#include "spu_coherency_profile.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,7 +38,7 @@ extern "C" {
 /* SPU external event: lock-line reservation lost. */
 #define SPU_EVENT_LR  0x400u
 
-/* The lock-line lock. One process-wide spinlock serializing every lock-line
+/* The lock-line lock. One process-wide exclusive lock serializing every lock-line
  * transaction, SPU and PPU alike: the SPU's GETLLAR snapshot and PUTLLC
  * compare-and-commit, and a PPU store or stwcx to a line some SPU has
  * reserved. The critical sections are two 128-byte memcpy and a memcmp. */
