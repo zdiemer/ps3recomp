@@ -151,6 +151,36 @@ int main(void)
     assert(C5("getsockopt", a, SYS_NET_SOL_SOCKET, SYS_NET_SO_NBIO, OPT, LEN) == 0);
     assert(vm_read32(OPT) == 1);
 
+#ifdef _WIN32
+    /* A departed UDP peer must not poison the socket shared by other peers.
+     * Reserve then close a loopback destination to provoke Port Unreachable. */
+    {
+        SOCKET departed = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in address = {0};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        assert(bind(departed, (struct sockaddr*)&address, sizeof(address)) == 0);
+        int size = sizeof(address);
+        assert(getsockname(departed, (struct sockaddr*)&address, &size) == 0);
+        assert(closesocket(departed) == 0);
+        put_sockaddr(ADDR_B, LOOP, ntohs(address.sin_port));
+        memcpy(vm_base + BUF, "probe", 5);
+        for (int i = 0; i < 5; ++i) {
+            assert(call("sendto", a, BUF, 5, 0, ADDR_B, 16) == 5);
+            Sleep(20);
+            assert((uint32_t)call("recvfrom", a, BUF, 64, 0, 0, 0) == 0x80010223u);
+            assert(errno_cell() == SYS_NET_EWOULDBLOCK);
+        }
+        put_sockaddr(ADDR_A, LOOP, port_a);
+        memcpy(vm_base + BUF, "alive", 5);
+        assert(call("sendto", b, BUF, 5, 0, ADDR_A, 16) == 5);
+        vm_write32(POLLFD, (uint32_t)a); vm_write16(POLLFD+4, SYS_NET_POLLIN);
+        assert(C3("socketpoll", POLLFD, 1, 1000) == 1);
+        assert(call("recvfrom", a, BUF, 64, 0, ADDR_B, LEN) == 5);
+        assert(memcmp(vm_base + BUF, "alive", 5) == 0);
+    }
+#endif
+
     /* TCP: listen, connect, accept, select for readability, round-trip. */
     int32_t l = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_STREAM, 0);
     put_sockaddr(ADDR_A, LOOP, 0);

@@ -19,6 +19,7 @@
     #define WIN32_LEAN_AND_MEAN
     #include <winsock2.h>
     #include <ws2tcpip.h>
+    #include <mswsock.h>
     typedef SOCKET host_socket_t;
     typedef WSAPOLLFD host_pollfd;
     #define HOST_INVALID_SOCKET INVALID_SOCKET
@@ -299,6 +300,22 @@ int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
 
     host_socket_t fd = socket(AF_INET, host_type, (type >= SYS_NET_SOCK_DGRAM_P2P) ? 0 : protocol);
     if (fd == HOST_INVALID_SOCKET) return host_fail();
+
+#ifdef _WIN32
+    if (host_type == SOCK_DGRAM) {
+        /* One absent peer must not reset a shared UDP game socket. Winsock
+         * otherwise reports a previous peer's ICMP Port Unreachable on the
+         * next receive, including when other peers are still connected. */
+        BOOL report_unreachable = FALSE;
+        DWORD returned = 0;
+        if (WSAIoctl(fd, SIO_UDP_CONNRESET, &report_unreachable, sizeof(report_unreachable),
+                     NULL, 0, &returned, NULL, NULL) == SOCKET_ERROR) {
+            int32_t error = host_fail();
+            host_closesocket(fd);
+            return error;
+        }
+    }
+#endif
 
     int slot = alloc_slot(fd);
     if (slot < 0) {
