@@ -172,6 +172,13 @@ void rsx_live_draw_dump_shader_cache(void);
  * writes; the active owned write may finish later. Do not unload the SDK while
  * this returns 0. Renderer owner calls start/stop; repeated stops are safe. */
 int rsx_live_draw_stop_shader_cache(unsigned timeout_ms);
+/* Terminal renderer-owner operation, after the last draw and before ready is
+ * cleared: detach cached shader sources/blobs and persist their merged bundle
+ * with a bounded worker wait. Rendering may NOT resume after this call.
+ * Returns 1 if saved/already saved or caching unavailable. A timeout/failure
+ * returns 0; a timed-out worker owns its data and may finish later. The SDK
+ * module must remain loaded until it finishes or the process exits. */
+int rsx_live_draw_finish_shader_bundle(unsigned timeout_ms);
 
 /* Bounded live AUTH diagnostic. The null-backend window starts it from a
  * private WM_APP message immediately before New Game is confirmed. */
