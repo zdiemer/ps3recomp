@@ -267,6 +267,7 @@ static int ld_vertex_cache_enabled(void)
 #include <windows.h>
 #include <initguid.h>
 #include <d3d12.h>
+#include "rsx_native_draw_packet.h"
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
@@ -9681,6 +9682,130 @@ static void write_topology_indices(u32 prim, u32* indices)
     }
 }
 
+/* BEGIN RSX NATIVE DRAW PACKET RECORDERS */
+static void rsx_native_draw_packet_transition(
+    const rsx_native_draw_packet* packet,
+    D3D12_RESOURCE_STATES before,
+    D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER barrier;
+    memset(&barrier, 0, sizeof(barrier));
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    for (UINT i = 0; i < packet->transition_count; ++i) {
+        barrier.Transition.pResource = packet->transition_resources[i];
+        packet->list->lpVtbl->ResourceBarrier(packet->list, 1, &barrier);
+    }
+}
+
+typedef char rsx_native_draw_transition_capacity_must_match_srv_table[
+    RSX_NATIVE_DRAW_MAX_TRANSITIONS == SRV_TABLE_SIZE ? 1 : -1];
+
+void rsx_native_draw_packet_begin(const rsx_native_draw_packet* packet)
+{
+    if (!packet || !packet->list)
+        return;
+
+    rsx_native_draw_packet_transition(
+        packet,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    if (packet->has_depth_stencil && packet->clear_depth_stencil)
+        packet->list->lpVtbl->ClearDepthStencilView(
+            packet->list, packet->depth_stencil,
+            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+            1.0f, 0, 0, NULL);
+
+}
+
+void rsx_native_draw_packet_targets(const rsx_native_draw_packet* packet)
+{
+    if (!packet || !packet->list)
+        return;
+
+    packet->list->lpVtbl->OMSetRenderTargets(
+        packet->list, packet->render_target_count,
+        packet->render_targets, FALSE,
+        packet->has_depth_stencil ? &packet->depth_stencil : NULL);
+    packet->list->lpVtbl->SetDescriptorHeaps(
+        packet->list, 2, packet->descriptor_heaps);
+}
+
+void rsx_native_draw_packet_bind(const rsx_native_draw_packet* packet)
+{
+    if (!packet || !packet->list)
+        return;
+
+    packet->list->lpVtbl->SetPipelineState(
+        packet->list, packet->pipeline_state);
+
+    if (packet->apply_depth_bias && packet->bias_list)
+        packet->bias_list->lpVtbl->RSSetDepthBias(
+            packet->bias_list,
+            packet->depth_bias,
+            0,
+            packet->slope_scaled_depth_bias);
+
+    packet->list->lpVtbl->SetGraphicsRootSignature(
+        packet->list, packet->root_signature);
+    if (packet->has_pull_shader_resource)
+        packet->list->lpVtbl->SetGraphicsRootShaderResourceView(
+            packet->list, 5, packet->pull_shader_resource);
+    packet->list->lpVtbl->SetGraphicsRootConstantBufferView(
+        packet->list, 0, packet->vertex_constant_buffer);
+    if (packet->has_pixel_constant_buffer)
+        packet->list->lpVtbl->SetGraphicsRootConstantBufferView(
+            packet->list, 4, packet->pixel_constant_buffer);
+    packet->list->lpVtbl->SetGraphicsRootDescriptorTable(
+        packet->list, 1, packet->srv_table);
+    packet->list->lpVtbl->SetGraphicsRootDescriptorTable(
+        packet->list, 2, packet->sampler_table);
+    if (packet->has_vertex_texture_table)
+        packet->list->lpVtbl->SetGraphicsRootDescriptorTable(
+            packet->list, 3, packet->vertex_texture_table);
+
+    packet->list->lpVtbl->RSSetViewports(packet->list, 1, &packet->viewport);
+    packet->list->lpVtbl->RSSetScissorRects(packet->list, 1, &packet->scissor);
+    packet->list->lpVtbl->OMSetStencilRef(
+        packet->list, packet->stencil_reference);
+    if (packet->has_vertex_buffer)
+        packet->list->lpVtbl->IASetVertexBuffers(
+            packet->list, 0, 1, &packet->vertex_buffer);
+    packet->list->lpVtbl->IASetPrimitiveTopology(packet->list, packet->topology);
+}
+
+void rsx_native_draw_packet_draw(const rsx_native_draw_packet* packet)
+{
+    if (!packet || !packet->list)
+        return;
+    if (packet->indexed) {
+        packet->list->lpVtbl->IASetIndexBuffer(packet->list, &packet->index_buffer);
+        packet->list->lpVtbl->DrawIndexedInstanced(
+            packet->list, packet->vertex_or_index_count,
+            packet->instance_count, packet->start_vertex_or_index,
+            packet->base_vertex, packet->start_instance);
+    } else {
+        packet->list->lpVtbl->DrawInstanced(
+            packet->list, packet->vertex_or_index_count,
+            packet->instance_count, packet->start_vertex_or_index,
+            packet->start_instance);
+    }
+}
+
+void rsx_native_draw_packet_end(const rsx_native_draw_packet* packet)
+{
+    if (!packet || !packet->list)
+        return;
+    rsx_native_draw_packet_transition(
+        packet,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_RENDER_TARGET);
+}
+/* END RSX NATIVE DRAW PACKET RECORDERS */
+
 static void sink_end_impl(void* user, const rsx_dispatch* r,
                           ld_slow_draw_scope* slow_draw)
 {
@@ -10558,48 +10683,43 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
     }
 
     ld_slow_draw_advance(slow_draw, LD_SLOW_DRAW_COMMAND_RECORDING);
-    D3D12_RESOURCE_BARRIER bar = {0};
-    bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    for (u32 k = 0; k < n_surf_used; k++) {
-        bar.Transition.pResource = g.surfaces[surf_used[k]].tex;
-        bar.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        bar.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar);
+    rsx_native_draw_packet packet;
+    memset(&packet, 0, sizeof(packet));
+    packet.list = g.list;
+    packet.bias_list = g_ld_bias_list;
+    packet.pipeline_state = pso;
+    packet.root_signature = g.rootsig_x;
+    packet.descriptor_heaps[0] = g.srv_heap;
+    packet.descriptor_heaps[1] = g.smp_heap;
+    packet.render_target_count = n_mrt;
+    packet.render_targets[0] = rtv_handle(LD_SWAP_BUFFERS + target);
+    for (u32 r = 1; r < n_mrt; r++)
+        packet.render_targets[r] = rtv_handle(LD_SWAP_BUFFERS + mrt[r]);
+    packet.has_depth_stencil = g.depth != NULL;
+    if (packet.has_depth_stencil) {
+        packet.depth_stencil = dsv_handle(current_zslot);
+        if (current_zslot)
+            packet.clear_depth_stencil =
+                !g.zdepths[current_zslot - 1].cleared;
+        else
+            packet.clear_depth_stencil = !g.depth_cleared;
     }
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(LD_SWAP_BUFFERS + target);
-    D3D12_CPU_DESCRIPTOR_HANDLE dsv; int have_dsv = 0;
-    if (g.depth) {
-        dsv = dsv_handle(current_zslot);
-        have_dsv = 1;
+    packet.transition_count = n_surf_used;
+    for (u32 k = 0; k < n_surf_used; k++) {
+        packet.transition_resources[k] = g.surfaces[surf_used[k]].tex;
+    }
+    rsx_native_draw_packet_begin(&packet);
+    if (packet.clear_depth_stencil) {
         if (current_zslot) {
             zdepth_t* z = &g.zdepths[current_zslot - 1];
-            if (!z->cleared) {
-                g.list->lpVtbl->ClearDepthStencilView(
-                    g.list, dsv,
-                    D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-                    1.0f, 0, 0, NULL);
-                z->cleared = 1;
-                z->had_write = 0;
-                g_ld_stats.implicit_depth_clears++;
-            }
-        } else if (!g.depth_cleared) {
-            g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
-                D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+            z->cleared = 1;
+            z->had_write = 0;
+        } else {
             g.depth_cleared = 1;
-            g_ld_stats.implicit_depth_clears++;
         }
+        g_ld_stats.implicit_depth_clears++;
     }
-    {
-        D3D12_CPU_DESCRIPTOR_HANDLE rtvs[4];
-        rtvs[0] = rtv;
-        for (u32 r = 1; r < n_mrt; r++)
-            rtvs[r] = rtv_handle(LD_SWAP_BUFFERS + mrt[r]);
-        g.list->lpVtbl->OMSetRenderTargets(g.list, n_mrt, rtvs, FALSE,
-                                           have_dsv ? &dsv : NULL);
-    }
-    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
-    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+    rsx_native_draw_packet_targets(&packet);
     const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
     const D3D12_GPU_DESCRIPTOR_HANDLE stbl = sampler_table(smp_slots);
     D3D12_GPU_DESCRIPTOR_HANDLE vtex_table = {0};
@@ -10628,33 +10748,30 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
     memcpy(cbdst, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16);
     memcpy(cbdst + 512 * 16, xf, sizeof(xf));
 
-    g.list->lpVtbl->SetPipelineState(g.list, pso);
     if (g_ld_bias_list) {
         float factor=0, units=0;
         if (rsx_dsp_reg(&g.rsx,0x0A68)&1) {
             u32 bits=rsx_dsp_reg(&g.rsx,0x0A78); memcpy(&factor,&bits,4);
             bits=rsx_dsp_reg(&g.rsx,0x0A7C); memcpy(&units,&bits,4);
         }
-        g_ld_bias_list->lpVtbl->RSSetDepthBias(g_ld_bias_list,
-            isfinite(units)?units:0,0,isfinite(factor)?factor:0);
+        packet.apply_depth_bias = 1;
+        packet.depth_bias = isfinite(units) ? units : 0;
+        packet.slope_scaled_depth_bias = isfinite(factor) ? factor : 0;
     }
-    g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.rootsig_x);
-    if (g_ld_pull_active)
-        g.list->lpVtbl->SetGraphicsRootShaderResourceView(g.list,5,
-            g.vb->lpVtbl->GetGPUVirtualAddress(g.vb)+g.vb_used);
-    g.list->lpVtbl->SetGraphicsRootConstantBufferView(
-        g.list, 0, g.cb->lpVtbl->GetGPUVirtualAddress(g.cb) + g.cb_used);
-    if (ld_fp_constants_buffered())
-        g.list->lpVtbl->SetGraphicsRootConstantBufferView(
-            g.list, 4,
-            g.ps_cb->lpVtbl->GetGPUVirtualAddress(g.ps_cb) +
-                ps_cb_offset);
-    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
-    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 2, stbl);
-    if (vtex_mask)
-        g.list->lpVtbl->SetGraphicsRootDescriptorTable(
-            g.list, 3, vtex_table);
-    g.cb_used += CB_BLOCK_ALIGNED;
+    packet.has_pull_shader_resource = g_ld_pull_active != 0;
+    if (packet.has_pull_shader_resource)
+        packet.pull_shader_resource =
+            g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
+    packet.vertex_constant_buffer =
+        g.cb->lpVtbl->GetGPUVirtualAddress(g.cb) + g.cb_used;
+    packet.has_pixel_constant_buffer = ld_fp_constants_buffered();
+    if (packet.has_pixel_constant_buffer)
+        packet.pixel_constant_buffer =
+            g.ps_cb->lpVtbl->GetGPUVirtualAddress(g.ps_cb) + ps_cb_offset;
+    packet.srv_table = table;
+    packet.sampler_table = stbl;
+    packet.has_vertex_texture_table = vtex_mask != 0;
+    packet.vertex_texture_table = vtex_table;
 
     D3D12_VIEWPORT dvp = {0, 0, (float)g.surfaces[target].w, (float)g.surfaces[target].h, 0.0f, 1.0f};
     D3D12_RECT sc = {
@@ -10689,19 +10806,32 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
     sc.right = rsx_render_edge(sc.right, (u32)W, (u32)dvp.Width);
     sc.top = rsx_render_edge(sc.top, (u32)H, (u32)dvp.Height);
     sc.bottom = rsx_render_edge(sc.bottom, (u32)H, (u32)dvp.Height);
-    g.list->lpVtbl->RSSetViewports(g.list, 1, &dvp);
-    g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
     /* Dynamic stencil reference (kept out of the PSO key on purpose). */
-    g.list->lpVtbl->OMSetStencilRef(
-        g.list, rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
+    packet.viewport = dvp;
+    packet.scissor = sc;
+    packet.stencil_reference =
+        rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu;
 
-    D3D12_VERTEX_BUFFER_VIEW vbv;
-    vbv.BufferLocation = g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
-    vbv.StrideInBytes = vertex_stride;
-    vbv.SizeInBytes = (u32)draw_vb_bytes;
-    if (vertex_stride)
-        g.list->lpVtbl->IASetVertexBuffers(g.list, 0, 1, &vbv);
-    g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    packet.has_vertex_buffer = vertex_stride != 0;
+    packet.vertex_buffer.BufferLocation =
+        g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
+    packet.vertex_buffer.StrideInBytes = vertex_stride;
+    packet.vertex_buffer.SizeInBytes = (u32)draw_vb_bytes;
+    packet.topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    packet.vertex_or_index_count = n_tri;
+    packet.instance_count = 1;
+    packet.start_vertex_or_index = 0;
+    packet.base_vertex = 0;
+    packet.start_instance = 0;
+    packet.indexed = indexed;
+    if (indexed) {
+        packet.index_buffer.BufferLocation =
+            g.ib->lpVtbl->GetGPUVirtualAddress(g.ib) + g.ib_used;
+        packet.index_buffer.SizeInBytes = (u32)draw_ib_bytes;
+        packet.index_buffer.Format = DXGI_FORMAT_R32_UINT;
+    }
+    rsx_native_draw_packet_bind(&packet);
+    g.cb_used += CB_BLOCK_ALIGNED;
     {
         const u64 serial = ++g_ld_recent_draw_total;
         ld_recent_draw* draw =
@@ -10734,18 +10864,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
         draw->cb_used = g.cb_used;
         draw->vb_used = g.vb_used;
     }
-    if (indexed) {
-        D3D12_INDEX_BUFFER_VIEW ibv;
-        ibv.BufferLocation =
-            g.ib->lpVtbl->GetGPUVirtualAddress(g.ib) + g.ib_used;
-        ibv.SizeInBytes = (u32)draw_ib_bytes;
-        ibv.Format = DXGI_FORMAT_R32_UINT;
-        g.list->lpVtbl->IASetIndexBuffer(g.list, &ibv);
-        g.list->lpVtbl->DrawIndexedInstanced(
-            g.list, n_tri, 1, 0, 0, 0);
-    } else {
-        g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
-    }
+    rsx_native_draw_packet_draw(&packet);
     ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
     for (u32 r = 1; r < n_mrt; r++)
         ld_surface_note_write(mrt[r], LD_SURFACE_WRITE_DRAW);
@@ -10775,12 +10894,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
     g_ld_profile.total.vertex_upload_bytes += draw_vb_bytes;
 #endif
 
-    for (u32 k = 0; k < n_surf_used; k++) {
-        bar.Transition.pResource = g.surfaces[surf_used[k]].tex;
-        bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        bar.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        g.list->lpVtbl->ResourceBarrier(g.list, 1, &bar);
-    }
+    rsx_native_draw_packet_end(&packet);
     /* A guest-side failure can occur before the next flip even though useful
      * orphanage draws have already reached internal world targets.  Preserve
      * a few progressively later surface snapshots directly from the draw
