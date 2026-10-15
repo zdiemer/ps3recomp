@@ -270,6 +270,7 @@ static int ld_vertex_cache_enabled(void)
 #include "rsx_native_draw_packet.h"
 #include "rsx_native_draw_payload.h"
 #include "rsx_native_replay_pass.h"
+#include "rsx_pipeline_recipes.h"
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
@@ -1274,6 +1275,8 @@ static u64 g_ld_vtex_missing_for_txl = 0;
 static u64 g_ld_divider_fetches = 0;
 static char g_ld_shader_disk_dir[MAX_PATH];
 static int g_ld_shader_disk_ready = -1;
+static rsx_pipeline_recipes* g_ld_pipeline_recipes;
+static int g_ld_pipeline_recipes_saved;
 /* Process-lifetime coordinator: bounded stop can leave an owned write alive. */
 static rsx_shader_store g_shader_store;
 static u64 g_ld_shader_disk_hits[2] = {0, 0};
@@ -5844,6 +5847,58 @@ static int shader_disk_cache_prepare(void)
     return 1;
 }
 
+/* Recipe collection has no hot-path file I/O. Recreate exact known driver
+ * pipelines once during renderer loading, before guest draws can consume them.
+ * The environment controls are private comparison switches, not graphics
+ * options: defaults collect and prewarm automatically in this experiment. */
+static void ld_pipeline_recipes_initialize(const void* root_bytes, size_t root_size)
+{
+    const char* enabled = getenv("RSX_PIPELINE_RECIPES");
+    char path[MAX_PATH];
+    wchar_t wide_path[MAX_PATH];
+    if ((enabled && !strcmp(enabled, "0")) || !shader_disk_cache_prepare())
+        return;
+    const int count = snprintf(path, sizeof(path), "%s\\pipeline_recipes_v1.bin",
+                               g_ld_shader_disk_dir);
+    if (count < 0 || (size_t)count >= sizeof(path) ||
+        !MultiByteToWideChar(CP_ACP, 0, path, -1, wide_path, MAX_PATH))
+        return;
+    g_ld_pipeline_recipes = rsx_pipeline_recipes_create(
+        g.dev, g.rootsig_x, root_bytes, root_size, wide_path);
+    g_ld_pipeline_recipes_saved = 0;
+}
+
+static void ld_pipeline_recipes_prepare(void)
+{
+    if (!g_ld_pipeline_recipes) return;
+    const char* prewarm = getenv("RSX_PIPELINE_PREWARM");
+    rsx_pipeline_recipes_stats stats = {0};
+    int loaded = 0;
+    if (!prewarm || strcmp(prewarm, "0")) {
+        fprintf(stderr, "[pipeline-recipes] preparing known graphics pipelines before gameplay\n");
+        loaded = rsx_pipeline_recipes_load(g_ld_pipeline_recipes, &stats);
+    }
+    fprintf(stderr, "[pipeline-recipes] loaded=%d entries=%u ready=%u failed=%u "
+        "invalid=%u bytes=%llu prepare_ms=%.3f\n", loaded, stats.loaded,
+        stats.prewarmed, stats.prewarm_failed, stats.corrupt_archives,
+        (unsigned long long)stats.owned_bytes, stats.prewarm_ms);
+}
+
+static void ld_pipeline_recipes_save(void)
+{
+    if (!g_ld_pipeline_recipes || g_ld_pipeline_recipes_saved) return;
+    g_ld_pipeline_recipes_saved = 1;
+    const int saved = rsx_pipeline_recipes_save_atomic(g_ld_pipeline_recipes);
+    rsx_pipeline_recipes_stats stats = {0};
+    rsx_pipeline_recipes_get_stats(g_ld_pipeline_recipes, &stats);
+    fprintf(stderr, "[pipeline-recipes] save=%d loaded=%u remembered=%u "
+        "ready=%u failed=%u hits=%u misses=%u unsupported=%u capacity_rejections=%u bytes=%llu\n",
+        saved, stats.loaded, stats.remembered, stats.prewarmed,
+        stats.prewarm_failed, stats.find_hits, stats.find_misses,
+        stats.unsupported_recipes, stats.capacity_rejections,
+        (unsigned long long)stats.owned_bytes);
+}
+
 static int shader_disk_cache_path(
     char path[MAX_PATH], u32 stage, u64 hash, u32 source_length)
 {
@@ -6815,25 +6870,30 @@ static ID3D12PipelineState* build_pso(
         pd.RTVFormats[r] = rs->rt_fp16 ? DXGI_FORMAT_R16G16B16A16_FLOAT
                                        : DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
-    ID3D12PipelineState* pso = NULL;
+    ID3D12PipelineState* pso = rsx_pipeline_recipes_find(g_ld_pipeline_recipes, &pd);
+    HRESULT hr = S_OK;
+    if (!pso) {
 #if defined(YZ_PERF_PROFILE)
-    g_ld_profile.total.create_pso_calls++;
-    const LONGLONG create_begin = ld_profile_qpc();
+        g_ld_profile.total.create_pso_calls++;
+        const LONGLONG create_begin = ld_profile_qpc();
 #endif
-    const u64 slow_create_begin = slow_draw && slow_draw->active
-        ? ld_slow_draw_qpc() : 0;
-    HRESULT hr = g.dev->lpVtbl->CreateGraphicsPipelineState(
-        g.dev, &pd, &IID_ID3D12PipelineState, (void**)&pso);
-    if (slow_draw && slow_draw->active) {
-        const u64 slow_create_end = ld_slow_draw_qpc();
-        if (slow_create_end >= slow_create_begin)
-            slow_draw->event.create_graphics_pso_ticks +=
-                slow_create_end - slow_create_begin;
+        const u64 slow_create_begin = slow_draw && slow_draw->active
+            ? ld_slow_draw_qpc() : 0;
+        hr = g.dev->lpVtbl->CreateGraphicsPipelineState(
+            g.dev, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+        if (slow_draw && slow_draw->active) {
+            const u64 slow_create_end = ld_slow_draw_qpc();
+            if (slow_create_end >= slow_create_begin)
+                slow_draw->event.create_graphics_pso_ticks +=
+                    slow_create_end - slow_create_begin;
+        }
+#if defined(YZ_PERF_PROFILE)
+        g_ld_profile.total.create_pso_qpc +=
+            (u64)(ld_profile_qpc() - create_begin);
+#endif
+        if (SUCCEEDED(hr) && pso)
+            rsx_pipeline_recipes_remember(g_ld_pipeline_recipes, &pd, pso);
     }
-#if defined(YZ_PERF_PROFILE)
-    g_ld_profile.total.create_pso_qpc +=
-        (u64)(ld_profile_qpc() - create_begin);
-#endif
     if (FAILED(hr)) {
         const HRESULT removed = g.dev->lpVtbl->GetDeviceRemovedReason(g.dev);
         if (create_fail_logs++ < 32)
@@ -11638,6 +11698,9 @@ static int make_root_signature(void)
     HRESULT hr = g.dev->lpVtbl->CreateRootSignature(g.dev, 0, sig->lpVtbl->GetBufferPointer(sig),
                                                     sig->lpVtbl->GetBufferSize(sig),
                                                     &IID_ID3D12RootSignature, (void**)&g.rootsig_x);
+    if (SUCCEEDED(hr))
+        ld_pipeline_recipes_initialize(sig->lpVtbl->GetBufferPointer(sig),
+                                       sig->lpVtbl->GetBufferSize(sig));
     sig->lpVtbl->Release(sig);
     return SUCCEEDED(hr) ? 0 : -1;
 }
@@ -12138,6 +12201,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 
     ld_slow_draw_configure();
     shader_bundle_load_initial();
+    ld_pipeline_recipes_prepare();
     if (g_ld_shader_disk_ready > 0)
         rsx_shader_store_start(&g_shader_store);
     g.ready = 1;
@@ -12441,6 +12505,7 @@ void rsx_live_draw_dump_present_samples(void)
 {
     /* Haze exits after this diagnostic dump without renderer teardown. */
     if (g.ready) ld_report_counters();
+    ld_pipeline_recipes_save();
     ld_sampler_pages_dump();
     ld_texture_diag_dump();
     ld_slow_flush_dump();
@@ -14171,6 +14236,7 @@ void rsx_live_draw_present(u32 buffer_id)
 
 void rsx_live_draw_shutdown(void)
 {
+    ld_pipeline_recipes_save();
     ld_native_pass_mutation("shutdown");
     if (g_ld_native_payload.phase == 1 || g_ld_native_payload.phase == 2)
         ld_native_payload_abort("shutdown_before_capture_completed");
@@ -14429,6 +14495,8 @@ void rsx_live_draw_shutdown(void)
                 (unsigned long long)g_ld_shader_disk_rejects);
     }
     for (u32 i = 0; i < g.n_psos; i++) if (g.psos[i].pso) g.psos[i].pso->lpVtbl->Release(g.psos[i].pso);
+    rsx_pipeline_recipes_destroy(g_ld_pipeline_recipes);
+    g_ld_pipeline_recipes = NULL;
     shader_blob_cache_release(&g.vs_blobs);
     shader_blob_cache_release(&g.ps_blobs);
     free(g_shader_bundle_bytes);
