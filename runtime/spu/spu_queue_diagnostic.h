@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 #ifndef SPU_QUEUE_DIAG_CAPACITY
-#define SPU_QUEUE_DIAG_CAPACITY 65536u
+#define SPU_QUEUE_DIAG_CAPACITY 262144u
 #endif
 #define SPU_QUEUE_DIAG_DEPTH 1024u
 #define SPU_QUEUE_DIAG_SLOTS 512u
@@ -26,6 +26,11 @@ typedef struct spu_queue_diag_snapshot {
     uint64_t recorded, frequency, epochs, publications, submits;
     uint64_t invalidations, unsupported_tail, pending_overwritten, pending_at_stop;
     uint64_t ambiguous_submits, max_overwritten_pop_qpc, begin_qpc, end_qpc;
+    /* Published records not popped at stop. Minima ignore zero (unknown)
+     * clocks, which are counted separately. Submit minimum covers these
+     * pending records only, not jobs that have yet to publish anything. */
+    uint64_t min_pending_publication_qpc, min_pending_submit_qpc;
+    uint64_t pending_unknown_publication_qpc, pending_unknown_submit_qpc;
 } spu_queue_diag_snapshot;
 /* One validated queue. All *_locked calls require the existing coherency
  * lock. Header and buffer mappings must stay valid until reset/stop. No guest

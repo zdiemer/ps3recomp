@@ -177,6 +177,18 @@ void spu_queue_diag_stop(spu_queue_diag_snapshot* snapshot)
     spu_lockline_lock();
     if (!s_diag.stopped) {
         s_diag.totals.pending_at_stop = diag_pending();
+        for (unsigned i = 0; i < s_diag.depth; ++i) {
+            if (!s_diag.pending[i].valid) continue;
+            const spu_queue_diag_row* row = &s_diag.pending[i].row;
+            if (!row->publication_qpc) ++s_diag.totals.pending_unknown_publication_qpc;
+            else if (!s_diag.totals.min_pending_publication_qpc ||
+                    row->publication_qpc < s_diag.totals.min_pending_publication_qpc)
+                s_diag.totals.min_pending_publication_qpc = row->publication_qpc;
+            if (!row->submit_qpc) ++s_diag.totals.pending_unknown_submit_qpc;
+            else if (!s_diag.totals.min_pending_submit_qpc ||
+                    row->submit_qpc < s_diag.totals.min_pending_submit_qpc)
+                s_diag.totals.min_pending_submit_qpc = row->submit_qpc;
+        }
         s_diag.totals.end_qpc = diag_qpc();
     }
     s_diag.active = 0; s_diag.stopped = 1;
