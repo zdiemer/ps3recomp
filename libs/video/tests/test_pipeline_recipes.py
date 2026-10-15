@@ -37,7 +37,10 @@ class PipelineRecipes(unittest.TestCase):
             self.assertIn("rejected archive truncated before driver create", ran.stdout)
             self.assertIn("rejected archive version before driver create", ran.stdout)
             self.assertIn("rejected archive second-record checksum before driver create", ran.stdout)
+            self.assertTrue("rejected archive oversized sparse archive before driver create" in ran.stdout or
+                            "oversized sparse-file test unavailable" in ran.stdout)
             self.assertIn("root signature mismatch rejected before driver creation", ran.stdout)
+            self.assertIn("large aggregate archive roundtrip passed:", ran.stdout)
             self.assertIn("actual-source pipeline recipe WARP roundtrip passed", ran.stdout)
 
 
