@@ -268,6 +268,7 @@ static int ld_vertex_cache_enabled(void)
 #include <initguid.h>
 #include <d3d12.h>
 #include "rsx_native_draw_packet.h"
+#include "rsx_native_draw_payload.h"
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
@@ -9806,6 +9807,152 @@ void rsx_native_draw_packet_end(const rsx_native_draw_packet* packet)
 }
 /* END RSX NATIVE DRAW PACKET RECORDERS */
 
+/* One-shot ownership validation, separate from timing runs. An output path
+ * in RSX_NATIVE_PAYLOAD_CAPTURE enables a <path>.request trigger. Capture is
+ * bounded by two successful normal presents, and its owned bytes are retained
+ * across a further normal present interval before writing. This archive
+ * contains draw INPUTS ONLY: no resource snapshots, descriptors, commands or
+ * presentation. It must never be accepted as a replayable frame. */
+static struct {
+    int configured, phase;
+    char path[MAX_PATH * 2], request[MAX_PATH * 2], partial[MAX_PATH * 2];
+    rsx_native_draw_payload_store store;
+    u64 first_draw, expected_draws, sealed_hash;
+    u32 frame;
+} g_ld_native_payload;
+
+static void ld_native_payload_abort(const char* reason)
+{
+    fprintf(stderr, "[native-payload] failed frame=%u phase=%d reason=%s\n",
+        g_ld_native_payload.frame, g_ld_native_payload.phase, reason);
+    rsx_native_draw_payload_destroy(&g_ld_native_payload.store);
+    g_ld_native_payload.phase = 3;
+}
+
+static void ld_native_payload_append(u64 vb_bytes, u64 ib_bytes, u32 ps_offset)
+{
+    if (g_ld_native_payload.phase != 1) return;
+    const u32 ps_bytes = ld_fp_constants_buffered()
+        ? ((g.fp_constants.count ? g.fp_constants.count : 1u) + 1u) * 16u : 0;
+    if (vb_bytes > VERT_BUFFER_SIZE || ib_bytes > INDEX_BUFFER_SIZE ||
+        g.vb_used > VERT_BUFFER_SIZE - vb_bytes ||
+        g.ib_used > INDEX_BUFFER_SIZE - ib_bytes ||
+        g.cb_used > CB_RING_BYTES - CB_BLOCK_BYTES ||
+        ps_bytes > PS_CB_RING_BYTES || ps_offset > PS_CB_RING_BYTES - ps_bytes) {
+        ld_native_payload_abort("source_range");
+        return;
+    }
+    rsx_native_draw_payload_input input;
+    memset(&input, 0, sizeof(input));
+    input.draw_ordinal = g_ld_stats.groups_executed + 1u;
+    input.vertex.data = vb_bytes ? g.vb_mapped + g.vb_used : NULL;
+    input.vertex.size = (size_t)vb_bytes;
+    input.index.data = ib_bytes ? (u8*)g.ib_mapped + g.ib_used : NULL;
+    input.index.size = (size_t)ib_bytes;
+    input.vertex_constants.data = g.cb_mapped + g.cb_used;
+    input.vertex_constants.size = CB_BLOCK_BYTES;
+    input.pixel_constants.data = ps_bytes ? g.ps_cb_mapped + ps_offset : NULL;
+    input.pixel_constants.size = ps_bytes;
+    if (!rsx_native_draw_payload_append(&g_ld_native_payload.store, &input, NULL))
+        ld_native_payload_abort("append_limit_or_allocation");
+}
+
+static void ld_native_payload_boundary(void)
+{
+    _Static_assert(sizeof(rsx_native_draw_payload_record) == 9u * sizeof(u64),
+        "Native payload archive requires packed u64 record fields");
+    if (!g_ld_native_payload.configured) {
+        g_ld_native_payload.configured = 1;
+        const char* path = getenv("RSX_NATIVE_PAYLOAD_CAPTURE");
+        if (!path || !*path) {
+            g_ld_native_payload.phase = 3;
+            return;
+        }
+        if (strlen(path) + sizeof(".request") > sizeof(g_ld_native_payload.path)) {
+            ld_native_payload_abort("path_too_long");
+            return;
+        }
+        snprintf(g_ld_native_payload.path, sizeof(g_ld_native_payload.path), "%s", path);
+        snprintf(g_ld_native_payload.request, sizeof(g_ld_native_payload.request), "%s.request", path);
+        snprintf(g_ld_native_payload.partial, sizeof(g_ld_native_payload.partial), "%s.partial", path);
+    }
+    if (g_ld_native_payload.phase == 3) return;
+    if (!g.ready || g_ld_movie_mode) {
+        ld_native_payload_abort("not_normal_present");
+        return;
+    }
+    rsx_native_draw_payload_store* store = &g_ld_native_payload.store;
+    if (g_ld_native_payload.phase == 1) {
+        g_ld_native_payload.expected_draws =
+            g_ld_stats.groups_executed - g_ld_native_payload.first_draw;
+        if (g_ld_frames != g_ld_native_payload.frame + 1u ||
+            !g_ld_native_payload.expected_draws ||
+            g_ld_native_payload.expected_draws != store->record_count ||
+            !rsx_native_draw_payload_seal(store)) {
+            ld_native_payload_abort("draw_coverage_or_frame_boundary");
+            return;
+        }
+        g_ld_native_payload.sealed_hash = fnv1a(store->bytes,
+            (u32)store->bytes_used, 1469598103934665603ull);
+        g_ld_native_payload.phase = 2;
+        return;
+    }
+    if (g_ld_native_payload.phase == 2) {
+        const u64 retained_hash = fnv1a(store->bytes,
+            (u32)store->bytes_used, 1469598103934665603ull);
+        if (g_ld_frames != g_ld_native_payload.frame + 2u ||
+            retained_hash != g_ld_native_payload.sealed_hash) {
+            ld_native_payload_abort("owned_bytes_changed_or_missing_present");
+            return;
+        }
+        /* Fixed little-endian u64 fields, followed by 9-u64 records and
+         * zero-padded arena bytes. Flags: 1=draw coverage, 2=retention verified.
+         * The replay_complete field is deliberately zero. */
+        const u64 header[] = {1, 3, 0, g_ld_native_payload.frame,
+            store->record_count, store->bytes_used,
+            g_ld_native_payload.first_draw + 1u,
+            g_ld_native_payload.first_draw + g_ld_native_payload.expected_draws,
+            retained_hash};
+        FILE* file = fopen(g_ld_native_payload.partial, "wbx");
+        int ok = file != NULL;
+        if (file) {
+            ok = fwrite("HZPAY001", 1, 8, file) == 8 &&
+                fwrite(header, sizeof(header), 1, file) == 1 &&
+                fwrite(store->records, sizeof(*store->records), store->record_count, file) == store->record_count &&
+                fwrite(store->bytes, 1, store->bytes_used, file) == store->bytes_used;
+            if (fclose(file) != 0) ok = 0;
+        }
+        if (ok) ok = MoveFileExA(g_ld_native_payload.partial,
+            g_ld_native_payload.path, MOVEFILE_WRITE_THROUGH) != 0;
+        /* Preserve failed/partial evidence; never overwrite a prior capture. */
+        if (!ok)
+            fprintf(stderr, "[native-payload] archive_write_failed partial=%s\n",
+                g_ld_native_payload.partial);
+        fprintf(stderr, "[native-payload] saved=%d frame=%u draws=%u bytes=%llu "
+            "retention_verified=1 replay_complete=0 path=%s\n", ok,
+            g_ld_native_payload.frame, store->record_count,
+            (unsigned long long)store->bytes_used, g_ld_native_payload.path);
+        rsx_native_draw_payload_destroy(store);
+        g_ld_native_payload.phase = 3;
+        return;
+    }
+    if (GetFileAttributesA(g_ld_native_payload.request) == INVALID_FILE_ATTRIBUTES)
+        return;
+    if (GetFileAttributesA(g_ld_native_payload.path) != INVALID_FILE_ATTRIBUTES ||
+        GetFileAttributesA(g_ld_native_payload.partial) != INVALID_FILE_ATTRIBUTES ||
+        !DeleteFileA(g_ld_native_payload.request) ||
+        !rsx_native_draw_payload_init(store, 256u * 1024u * 1024u, 8192u)) {
+        ld_native_payload_abort("existing_output_or_trigger_or_init");
+        return;
+    }
+    g_ld_native_payload.first_draw = g_ld_stats.groups_executed;
+    g_ld_native_payload.frame = g_ld_frames;
+    g_ld_native_payload.phase = 1;
+    fprintf(stderr, "[native-payload] begin frame=%u first_draw=%llu\n",
+        g_ld_native_payload.frame,
+        (unsigned long long)(g_ld_native_payload.first_draw + 1u));
+}
+
 static void sink_end_impl(void* user, const rsx_dispatch* r,
                           ld_slow_draw_scope* slow_draw)
 {
@@ -10830,6 +10977,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
         packet.index_buffer.SizeInBytes = (u32)draw_ib_bytes;
         packet.index_buffer.Format = DXGI_FORMAT_R32_UINT;
     }
+    ld_native_payload_append(draw_vb_bytes, draw_ib_bytes, ps_cb_offset);
     rsx_native_draw_packet_bind(&packet);
     g.cb_used += CB_BLOCK_ALIGNED;
     {
@@ -13647,6 +13795,7 @@ void rsx_live_draw_present(u32 buffer_id)
 #endif
 
     /* new frame: reset per-frame ring cursors */
+    ld_native_payload_boundary();
     g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0;
     g.srv_ring_used = 0; g.smp_ring_used = 0;
 #if !defined(YZ_PERF_CLEAN)
@@ -13662,6 +13811,8 @@ void rsx_live_draw_present(u32 buffer_id)
 
 void rsx_live_draw_shutdown(void)
 {
+    if (g_ld_native_payload.phase == 1 || g_ld_native_payload.phase == 2)
+        ld_native_payload_abort("shutdown_before_capture_completed");
     ld_sampler_pages_dump();
     if (!g.ready) {
         rsx_live_draw_stop_shader_cache(2000);

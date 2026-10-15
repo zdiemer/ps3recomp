@@ -5,8 +5,9 @@
  * Immediate D3D12 recording packet for one already-resolved RSX draw.
  *
  * All interfaces, resources, descriptor handles, and GPU addresses are
- * borrowed. The caller fills the packet, then treats it as immutable through
- * begin/targets/bind/draw/end. No owner is retained by these helpers: the
+ * borrowed. The caller initializes each phase's fields before calling
+ * begin/targets/bind/draw/end; helpers treat their consumed fields as immutable.
+ * Later-phase fields may be filled between calls. No owner is retained: the
  * caller must keep CPU-side objects valid through recording and keep GPU
  * resources, upload ranges, and descriptors valid until the submission fence
  * retires them. Transition and render-target counts must fit the fixed packet
