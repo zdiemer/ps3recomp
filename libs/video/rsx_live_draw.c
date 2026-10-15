@@ -2500,6 +2500,7 @@ static struct {
 } g_ld_sampler_pages;
 static rsx_profile_buffer g_ld_sampler_pages_csv;
 static int g_ld_sampler_pages_csv_initialized;
+static int g_ld_sampler_pages_dumped;
 static void ld_sampler_pages_record(u32 frame)
 {
     if (!g_ld_sampler_pages_csv_initialized) {
@@ -2524,6 +2525,8 @@ static void ld_sampler_pages_record(u32 frame)
 }
 static void ld_sampler_pages_dump(void)
 {
+    if (g_ld_sampler_pages_dumped) return;
+    g_ld_sampler_pages_dumped = 1;
     if (g_ld_sampler_pages_csv.rows) {
         const int saved = rsx_profile_buffer_dump(&g_ld_sampler_pages_csv);
         fprintf(stderr, "[sampler-pages] saved=%d rows=%llu rejected=%llu capacity=%zu\n",
@@ -11151,6 +11154,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     memset(&g_ld_sampler_pages, 0, sizeof(g_ld_sampler_pages));
     rsx_profile_buffer_destroy(&g_ld_sampler_pages_csv);
     g_ld_sampler_pages_csv_initialized = 0;
+    g_ld_sampler_pages_dumped = 0;
     free(g_shader_bundle_bytes);
     g_shader_bundle_bytes = NULL;
     memset(&g_shader_bundle, 0, sizeof(g_shader_bundle));
@@ -11826,6 +11830,7 @@ void rsx_live_draw_dump_present_samples(void)
 {
     /* Haze exits after this diagnostic dump without renderer teardown. */
     if (g.ready) ld_report_counters();
+    ld_sampler_pages_dump();
     ld_texture_diag_dump();
     ld_slow_flush_dump();
     ld_texture_content_summary();
