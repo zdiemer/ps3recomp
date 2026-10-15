@@ -4,6 +4,7 @@
 #include "../../runtime/platform/win32_compat.h"
 #include "spurs_queue_profile.h"
 #include "spurs_queue_wait.h"
+#include "../../runtime/spu/spu_queue_diagnostic.h"
 
 /* Shared with the SDK's SPU queue routines: W0 pop, W1 push, W2 entry size,
  * W3 depth; the next quadword starts with the 64-bit buffer EA and ends with
@@ -20,6 +21,7 @@ s32 _cellSpursQueueInitialize(u64 spurs_ea, u64 taskset_ea, u64 queue_ea,
         (u64)buffer + (u64)size * depth > 0x100000000ull)
         return CELL_SPURS_TASK_ERROR_INVAL;
 
+    spu_queue_diag_reset(q);
     memset(vm_base + q, 0, 128);
     vm_write32(q + 0x08, size);
     vm_write32(q + 0x0C, depth);
@@ -126,6 +128,7 @@ static s32 queue_transfer(u64 queue_ea, u64 data_ea, u32 blocking, int push, u32
             spu_lockline_unlock();
             QUEUE_RETURN(CELL_OK);
         }
+        if (!push) spu_queue_diag_pop_locked(q, index, slot);
         /* Payload precedes publication under the same lock as GETLLAR/PUTLLC. */
         queue_write_index(vm_base + q + (push ? 4 : 0), (index + 1) % modulus);
         u32 taskset = (u32)vm_read64(q + 0x70);

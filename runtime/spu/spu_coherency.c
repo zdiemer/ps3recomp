@@ -13,10 +13,12 @@
 
 #include <stdlib.h>
 #include "spu_coherency.h"
+#include "spu_queue_diagnostic.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "spu_queue_diagnostic.inc"
 
 #ifdef __cplusplus
 extern "C" {
@@ -340,6 +342,7 @@ int spu_coh_is_reserved(uint32_t addr)
  * before notifying; this gives the DMA path the same ability. */
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
+    spu_queue_diag_notify_locked(ea);
     queue_notify_publication(ea);
     taskset_notify_publication(ea);
     uint32_t line = ea & ~127u;
@@ -357,6 +360,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 
 void spu_coh_notify_write(uint32_t ea)
 {
+    spu_queue_diag_notify_locked(ea);
     queue_notify_publication(ea);
     taskset_notify_publication(ea);
     uint32_t line = ea & ~127u;

@@ -6,6 +6,11 @@
 uint8_t* vm_base;
 int g_resv_store_active = 0;
 uint32_t g_ww_lo = 0, g_ww_hi = 0;
+/* This harness stubs the coherency owner; the linked diagnostic fixture tests
+ * the real publication/pop instrumentation separately. */
+void spu_queue_diag_reset(uint32_t ea) { (void)ea; }
+void spu_queue_diag_pop_locked(uint32_t ea,uint32_t index,const void* record)
+{ (void)ea; (void)index; (void)record; }
 static int locked;
 #ifdef _WIN32
 static SRWLOCK test_queue_lock = SRWLOCK_INIT;
