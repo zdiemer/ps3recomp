@@ -269,6 +269,7 @@ static int ld_vertex_cache_enabled(void)
 #include <d3d12.h>
 #include "rsx_native_draw_packet.h"
 #include "rsx_native_draw_payload.h"
+#include "rsx_native_replay_pass.h"
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
@@ -1951,6 +1952,10 @@ static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes)
     return g.guest_ptr(g.guest_user, location, offset, min_bytes);
 }
 static u64 fnv1a(const void* data, u32 n, u64 h);
+static void ld_native_pass_mutation(const char* reason);
+static void ld_native_pass_completed(void);
+static void ld_native_pass_finish(const char* boundary);
+static void ld_native_pass_boundary(void);
 static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface);
 static u64 live_legacy_pso_key(void);
 static void ld_vertex_diag_emit(const char* reason, int dump_surface);
@@ -2492,6 +2497,7 @@ static u32 sampler_slot(const rsx_dsp_texture* t, u64 key)
     if (g.n_samplers >= SMP_CACHE_SLOTS) return SMP_DEFAULT;
     D3D12_SAMPLER_DESC sd = decode_sampler(t);
     const u32 slot = 1 + g.n_samplers;
+    ld_native_pass_mutation("sampler_descriptor_write");
     g.dev->lpVtbl->CreateSampler(g.dev, &sd, smp_cpu(slot));
     g.smp_keys[g.n_samplers++] = key;
     return slot;
@@ -2831,6 +2837,7 @@ static void ld_slow_flush_dump(void)
 static void ld_flush(ld_flush_reason reason)
 {
     if (!g.ready) return;
+    ld_native_pass_mutation("flush");
     ld_slow_flush_scope slow_flush;
     ld_slow_flush_begin(&slow_flush, reason);
 #if defined(YZ_PERF_PROFILE)
@@ -3050,6 +3057,7 @@ static void ld_flush(ld_flush_reason reason)
         g.list->lpVtbl->EndQuery(g.list,g_ld_gpu_queries,D3D12_QUERY_TYPE_TIMESTAMP,0);
 #endif
     ld_sampler_pages_completed();
+    ld_native_pass_completed();
     g.upload_used = 0;
 #if defined(YZ_PERF_PROFILE)
     const u64 flush_ticks = (u64)(ld_profile_qpc() - flush_begin);
@@ -3118,6 +3126,7 @@ void rsx_live_draw_flush(void)
 
 static void retire_texture(ID3D12Resource* tex)
 {
+    ld_native_pass_mutation("resource_retirement");
     if (!tex || !g.ready) return;
     if (g.n_retired_textures >= MAX_RETIRED_TEXTURES)
         ld_flush(LD_FLUSH_RETIRE_QUEUE);
@@ -3318,6 +3327,7 @@ static ID3D12Resource* create_texture_mipped_scoped(DXGI_FORMAT fmt,
         const LONGLONG copy_begin = g_ld_profile.texture_decode_active
             ? ld_profile_qpc() : 0;
 #endif
+        ld_native_pass_mutation("CopyTextureRegion");
         g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
 #if defined(YZ_PERF_PROFILE)
         if (g_ld_profile.texture_decode_active) {
@@ -3342,6 +3352,7 @@ static ID3D12Resource* create_texture_mipped_scoped(DXGI_FORMAT fmt,
     const LONGLONG barrier_begin = g_ld_profile.texture_decode_active
         ? ld_profile_qpc() : 0;
 #endif
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
 #if defined(YZ_PERF_PROFILE)
     if (g_ld_profile.texture_decode_active) {
@@ -3474,6 +3485,7 @@ static ID3D12Resource* create_texture_cube(
             const LONGLONG copy_begin = g_ld_profile.texture_decode_active
                 ? ld_profile_qpc() : 0;
 #endif
+            ld_native_pass_mutation("CopyTextureRegion");
             g.list->lpVtbl->CopyTextureRegion(
                 g.list, &dst, 0, 0, 0, &src, NULL);
 #if defined(YZ_PERF_PROFILE)
@@ -3501,6 +3513,7 @@ static ID3D12Resource* create_texture_cube(
     const LONGLONG barrier_begin = g_ld_profile.texture_decode_active
         ? ld_profile_qpc() : 0;
 #endif
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
 #if defined(YZ_PERF_PROFILE)
     if (g_ld_profile.texture_decode_active) {
@@ -4739,6 +4752,7 @@ static ID3D12Resource* decode_vertex_texture(
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        ld_native_pass_mutation("ResourceBarrier");
         g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
         if (out_hash) *out_hash = hash;
     }
@@ -4983,12 +4997,15 @@ static u32 surface_feedback_srv(u32 slot)
     b[1].Transition.pResource = s->fb_tex;
     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, fresh ? 1 : 2, b);
+    ld_native_pass_mutation("CopyResource");
     g.list->lpVtbl->CopyResource(g.list, s->fb_tex, s->tex);
     b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
     return SRV_FEEDBACK_BASE + slot;
 }
@@ -5128,16 +5145,19 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds, 
     }
     b[0].Transition.pResource = s;        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[1].Transition.pResource = dst->tex; b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
     D3D12_TEXTURE_COPY_LOCATION sl = {0}, dl = {0};
     sl.pResource = s;        sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dl.pResource = dst->tex; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     D3D12_BOX box = { sx, sy, 0, sx + w, sy + h, 1 };
+    ld_native_pass_mutation("CopyTextureRegion");
     g.list->lpVtbl->CopyTextureRegion(g.list, &dl, dx, dy, 0, &sl, &box);
     for (int q = 0; q < 2; q++) {
         b[q].Transition.StateBefore = b[q].Transition.StateAfter;
         b[q].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
     ld_surface_note_write(slot, LD_SURFACE_WRITE_COPY);
     if (s_csv_file && s_csv_gate_open) {
@@ -5206,16 +5226,19 @@ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
     }
     b[0].Transition.pResource = src; b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[1].Transition.pResource = dst; b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
     D3D12_TEXTURE_COPY_LOCATION s = {0}, d = {0};
     s.pResource = src; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     d.pResource = dst; d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     D3D12_BOX box = { sx, sy, 0, sx + w, sy + h, 1 };
+    ld_native_pass_mutation("CopyTextureRegion");
     g.list->lpVtbl->CopyTextureRegion(g.list, &d, dx, dy, 0, &s, &box);
     for (int k = 0; k < 2; k++) {
         b[k].Transition.StateBefore = b[k].Transition.StateAfter;
         b[k].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
     ld_surface_note_write((u32)di, LD_SURFACE_WRITE_COPY);
     return 1;
@@ -5431,6 +5454,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         srv_write_zdepth(SRV_ZDEPTH_BASE + slot, z->snapshot);
         uav_write_zdepth(UAV_ZDEPTH_BASE + slot, z->snapshot);
     }
+    ld_native_pass_mutation("ClearDepthStencilView");
     g.list->lpVtbl->ClearDepthStencilView(
         g.list, dsv_handle(1 + slot),
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
@@ -5488,6 +5512,7 @@ static int zdepth_snapshot(u32 slot)
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         nbar++;
     }
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, nbar, bars);
 
     ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
@@ -5499,6 +5524,7 @@ static int zdepth_snapshot(u32 slot)
         g.list, 0, source_table);
     g.list->lpVtbl->SetComputeRootDescriptorTable(
         g.list, 1, destination_table);
+    ld_native_pass_mutation("Dispatch");
     g.list->lpVtbl->Dispatch(
         g.list, (z->snapshot_w + 7u) / 8u,
         (z->snapshot_h + 7u) / 8u, 1);
@@ -5506,6 +5532,7 @@ static int zdepth_snapshot(u32 slot)
     D3D12_RESOURCE_BARRIER uav_done = {0};
     uav_done.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     uav_done.UAV.pResource = z->snapshot;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &uav_done);
 
     D3D12_RESOURCE_BARRIER done[2] = {0};
@@ -5524,6 +5551,7 @@ static int zdepth_snapshot(u32 slot)
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     done[1].Transition.StateAfter =
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 2, done);
     z->snapshot_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     z->snapshot_valid = 1;
@@ -5609,6 +5637,7 @@ static int zdepth_pack(u32 index, u32 guest_w, u32 guest_h)
     bars[1].Transition.pResource = z->packed;
     bars[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     bars[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 2, bars);
     ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
     g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
@@ -5628,12 +5657,14 @@ static int zdepth_pack(u32 index, u32 guest_w, u32 guest_h)
     float scale[2] = {(float)guest_w / w * source_w / z->guest_w / zdepth_samples_x(z),
                       (float)guest_h / h * source_h / z->guest_h / zdepth_samples_y(z)};
     g.list->lpVtbl->SetComputeRoot32BitConstants(g.list, 2, 2, scale, 0);
+    ld_native_pass_mutation("Dispatch");
     g.list->lpVtbl->Dispatch(g.list, (w + 7) / 8, (h + 7) / 8, 1);
     for (u32 i = 0; i < 2; ++i) {
         D3D12_RESOURCE_STATES before = bars[i].Transition.StateBefore;
         bars[i].Transition.StateBefore = bars[i].Transition.StateAfter;
         bars[i].Transition.StateAfter = before;
     }
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 2, bars);
     z->packed_generation = z->generation;
     return 1;
@@ -5670,17 +5701,20 @@ static int ld_blit_depth(u32 sl, u32 sa, u32 sp, u32 dl, u32 da, u32 dp, u32 w, 
         bars[1].Transition.pResource = dst->tex;
         bars[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         bars[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        ld_native_pass_mutation("ResourceBarrier");
         g.list->lpVtbl->ResourceBarrier(g.list, 2, bars);
         D3D12_TEXTURE_COPY_LOCATION src = {0}, dest = {0};
         src.pResource = z->packed; dest.pResource = dst->tex;
         src.Type = dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         D3D12_BOX box = {0, 0, 0, cw, ch, 1};
+        ld_native_pass_mutation("CopyTextureRegion");
         g.list->lpVtbl->CopyTextureRegion(g.list, &dest, dx, dy, 0, &src, &box);
         for (u32 i = 0; i < 2; ++i) {
             D3D12_RESOURCE_STATES before = bars[i].Transition.StateBefore;
             bars[i].Transition.StateBefore = bars[i].Transition.StateAfter;
             bars[i].Transition.StateAfter = before;
         }
+        ld_native_pass_mutation("ResourceBarrier");
         g.list->lpVtbl->ResourceBarrier(g.list, 2, bars);
         ld_surface_note_write((u32)di, LD_SURFACE_WRITE_COPY);
         return 1;
@@ -8748,6 +8782,7 @@ static void ld_movie_overlay_begin(void)
     const float transparent[4] = {0, 0, 0, 0};
     if (!g.ready) return;
     for (u32 i = 0; i < g.n_surfaces; i++) {
+        ld_native_pass_mutation("ClearRenderTargetView");
         g.list->lpVtbl->ClearRenderTargetView(
             g.list, rtv_handle(LD_SWAP_BUFFERS + i), transparent, 0, NULL);
         ld_surface_note_write(i, LD_SURFACE_WRITE_OTHER);
@@ -8781,6 +8816,7 @@ static void ld_movie_capture_overlay(void)
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
 
     D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
@@ -8793,10 +8829,12 @@ static void ld_movie_capture_overlay(void)
     dst.PlacedFootprint.Footprint.Height = g_ld_resolution.host_h;
     dst.PlacedFootprint.Footprint.Depth = 1;
     dst.PlacedFootprint.Footprint.RowPitch = g.movie_overlay_pitch;
+    ld_native_pass_mutation("CopyTextureRegion");
     g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
     ld_flush(LD_FLUSH_MOVIE);
 
@@ -9807,6 +9845,228 @@ void rsx_native_draw_packet_end(const rsx_native_draw_packet* packet)
 }
 /* END RSX NATIVE DRAW PACKET RECORDERS */
 
+/* Bounded offscreen replay experiment. Only draws since an observed clear are
+ * eligible, with immutable decoded/white/vertex textures. Every uncaptured
+ * command emitter invalidates the pass BEFORE mutation. Invalid resources
+ * stay alive until the existing successful flush completion path retires them.
+ * This is a pass/color oracle, never a whole-frame benchmark. */
+enum { LD_NATIVE_PASS_IDLE, LD_NATIVE_PASS_ARMED, LD_NATIVE_PASS_CAPTURE,
+       LD_NATIVE_PASS_INVALID, LD_NATIVE_PASS_REPLAY, LD_NATIVE_PASS_DONE };
+static struct {
+    int configured, phase, clear_candidate;
+    char path[MAX_PATH * 2], request[MAX_PATH * 2];
+    rsx_native_replay_pass* pass;
+    rsx_dsp_surface signature;
+    u32 armed_frame, attempts, rejected;
+    u32 skipped_mutable, skipped_transition, skipped_oversized;
+    u64 first_draw;
+} g_ld_native_pass;
+
+static void ld_native_pass_mutation(const char* reason)
+{
+    if (g_ld_native_pass.phase != LD_NATIVE_PASS_CAPTURE) return;
+    fprintf(stderr, "[native-pass] reject attempt=%u draws=%u reason=%s\n",
+        g_ld_native_pass.attempts,
+        rsx_native_replay_pass_draw_count(g_ld_native_pass.pass), reason);
+    ++g_ld_native_pass.rejected;
+    g_ld_native_pass.phase = LD_NATIVE_PASS_INVALID;
+    g_ld_native_pass.clear_candidate = 0;
+}
+
+static void ld_native_pass_completed(void)
+{
+    if (g_ld_native_pass.phase != LD_NATIVE_PASS_INVALID) return;
+    rsx_native_replay_pass_destroy(g_ld_native_pass.pass);
+    g_ld_native_pass.pass = NULL;
+    g_ld_native_pass.phase = LD_NATIVE_PASS_ARMED;
+    g_ld_native_pass.clear_candidate = 0;
+}
+
+static void ld_native_pass_finish(const char* boundary)
+{
+    if (g_ld_native_pass.phase != LD_NATIVE_PASS_CAPTURE) return;
+    const u32 draws = rsx_native_replay_pass_draw_count(g_ld_native_pass.pass);
+    if (!draws || g_ld_stats.groups_executed - g_ld_native_pass.first_draw != draws) {
+        ld_native_pass_mutation("draw_coverage");
+        return;
+    }
+    g_ld_native_pass.phase = LD_NATIVE_PASS_REPLAY;
+    ld_flush(LD_FLUSH_READBACK);
+    int ok = g.ready && rsx_native_replay_pass_record(
+        g_ld_native_pass.pass, g.list, g_ld_bias_list);
+    if (ok) ok = rsx_native_replay_pass_record_compare(g_ld_native_pass.pass, g.list);
+    /* Even a partially recorded failed replay must retire before destruction. */
+    if (g.ready) ld_flush(LD_FLUSH_READBACK);
+    rsx_native_replay_compare_result result = {0};
+    if (ok && g.ready) ok = rsx_native_replay_pass_compare(g_ld_native_pass.pass, &result);
+    else ok = 0;
+    fprintf(stderr, "[native-pass] compared=%d boundary=%s draws=%u targets=%u "
+        "bytes=%llu mismatch=%llu depth_compared=0 full_frame=0 error=%s\n",
+        ok, boundary, draws, result.compared_targets,
+        (unsigned long long)result.compared_bytes,
+        (unsigned long long)result.mismatch_bytes,
+        rsx_native_replay_pass_error(g_ld_native_pass.pass));
+    FILE* file = fopen(g_ld_native_pass.path, "wbx");
+    if (file) {
+        const int written = fprintf(file,
+            "{\"frame\":%u,\"attempts\":%u,\"rejected\":%u,\"draws\":%u,"
+            "\"comparison_completed\":%s,\"color_targets\":%u,\"compared_bytes\":%llu,"
+            "\"mismatch_bytes\":%llu,\"depth_compared\":false,\"full_frame\":false}\n",
+            g_ld_frames, g_ld_native_pass.attempts, g_ld_native_pass.rejected,
+            draws, ok ? "true" : "false", result.compared_targets,
+            (unsigned long long)result.compared_bytes,
+            (unsigned long long)result.mismatch_bytes);
+        const int close_result = fclose(file);
+        if (written < 0 || close_result != 0)
+            fprintf(stderr, "[native-pass] report_write_failed path=%s\n", g_ld_native_pass.path);
+    } else fprintf(stderr, "[native-pass] report_open_failed path=%s\n", g_ld_native_pass.path);
+    if (g.ready) {
+        rsx_native_replay_pass_destroy(g_ld_native_pass.pass);
+        g_ld_native_pass.pass = NULL;
+    } /* Failed device/fence: retain resources rather than release in-flight data. */
+    g_ld_native_pass.phase = LD_NATIVE_PASS_DONE;
+}
+
+static void ld_native_pass_boundary(void)
+{
+    if (!g_ld_native_pass.configured) {
+        g_ld_native_pass.configured = 1;
+        const char* path = getenv("RSX_NATIVE_PASS_REPLAY");
+        if (!path || !*path || strlen(path) + sizeof(".request") > sizeof(g_ld_native_pass.path)) {
+            g_ld_native_pass.phase = LD_NATIVE_PASS_DONE;
+            return;
+        }
+        snprintf(g_ld_native_pass.path, sizeof(g_ld_native_pass.path), "%s", path);
+        snprintf(g_ld_native_pass.request, sizeof(g_ld_native_pass.request), "%s.request", path);
+    }
+    if (g_ld_native_pass.phase == LD_NATIVE_PASS_ARMED &&
+        g_ld_frames - g_ld_native_pass.armed_frame >= 120u) {
+        fprintf(stderr, "[native-pass] no_eligible_pass attempts=%u rejected=%u "
+            "skipped_mutable=%u skipped_transition=%u skipped_oversized=%u full_frame=0\n",
+            g_ld_native_pass.attempts, g_ld_native_pass.rejected,
+            g_ld_native_pass.skipped_mutable, g_ld_native_pass.skipped_transition,
+            g_ld_native_pass.skipped_oversized);
+        g_ld_native_pass.phase = LD_NATIVE_PASS_DONE;
+    }
+    if (g_ld_native_pass.phase != LD_NATIVE_PASS_IDLE ||
+        GetFileAttributesA(g_ld_native_pass.request) == INVALID_FILE_ATTRIBUTES) return;
+    if (GetFileAttributesA(g_ld_native_pass.path) != INVALID_FILE_ATTRIBUTES ||
+        !DeleteFileA(g_ld_native_pass.request)) {
+        fprintf(stderr, "[native-pass] existing_output_or_trigger_failure\n");
+        g_ld_native_pass.phase = LD_NATIVE_PASS_DONE;
+        return;
+    }
+    g_ld_native_pass.armed_frame = g_ld_frames;
+    g_ld_native_pass.phase = LD_NATIVE_PASS_ARMED;
+    fprintf(stderr, "[native-pass] armed frame=%u\n", g_ld_frames);
+}
+
+static void ld_native_pass_before_draw(void)
+{
+    if (g_ld_native_pass.phase != LD_NATIVE_PASS_CAPTURE &&
+        !(g_ld_native_pass.phase == LD_NATIVE_PASS_ARMED && g_ld_native_pass.clear_candidate)) return;
+    rsx_dsp_surface surface = {0};
+    rsx_dsp_get_surface(&g.rsx, &surface);
+    if (memcmp(&surface, &g_ld_native_pass.signature, sizeof(surface))) {
+        ld_native_pass_finish("target_departure");
+        g_ld_native_pass.clear_candidate = 0;
+    }
+}
+
+static ID3D12Resource* ld_native_pass_immutable_texture(u32 slot)
+{
+    if (slot == SRV_WHITE) return g.white_tex;
+    if (slot >= SRV_TEXTURE_BASE && slot < SRV_TEXTURE_BASE + g.n_textures)
+        return g.textures[slot - SRV_TEXTURE_BASE].tex;
+    if (slot >= SRV_VTEX_BASE && slot < SRV_VTEX_BASE + g.n_vtex)
+        return g.vtex[slot - SRV_VTEX_BASE].tex;
+    return NULL;
+}
+
+static void ld_native_pass_begin_draw(const rsx_native_draw_packet* packet,
+    const u32* mrt, u32 zslot, const u32* slots, const u32* vtex_slots, u32 vtex_mask)
+{
+    if (g_ld_native_pass.phase != LD_NATIVE_PASS_CAPTURE &&
+        !(g_ld_native_pass.phase == LD_NATIVE_PASS_ARMED && g_ld_native_pass.clear_candidate)) return;
+    g_ld_native_pass.clear_candidate = 0;
+    for (u32 i = 0; i < SRV_TABLE_SIZE; ++i) {
+        if (!ld_native_pass_immutable_texture(slots[i]) ||
+            (vtex_mask && !ld_native_pass_immutable_texture(vtex_slots[i]))) {
+            ++g_ld_native_pass.skipped_mutable;
+            ld_native_pass_mutation("mutable_sampled_resource");
+            return;
+        }
+    }
+    if (packet->transition_count) {
+        ++g_ld_native_pass.skipped_transition;
+        ld_native_pass_mutation("sampled_surface_transition");
+        return;
+    }
+    if (g_ld_native_pass.phase == LD_NATIVE_PASS_CAPTURE) return;
+    ID3D12Resource* colors[4] = {0};
+    for (u32 i = 0; i < packet->render_target_count; ++i) colors[i] = g.surfaces[mrt[i]].tex;
+    ID3D12Resource* depth = packet->has_depth_stencil
+        ? (zslot ? g.zdepths[zslot - 1].tex : g.depth) : NULL;
+    /* Avoid allocating giant shadow-atlas clones for this bounded oracle. */
+    for (u32 i = 0; i <= packet->render_target_count; ++i) {
+        ID3D12Resource* resource = i == packet->render_target_count ? depth : colors[i];
+        if (resource) {
+            D3D12_RESOURCE_DESC desc;
+            resource->lpVtbl->GetDesc(resource, &desc);
+            if (desc.Width > 4096u || desc.Height > 4096u) {
+                ++g_ld_native_pass.skipped_oversized;
+                return;
+            }
+        }
+    }
+    ++g_ld_native_pass.attempts;
+    g_ld_native_pass.pass = rsx_native_replay_pass_create(g.dev, 4096u, 128u * 1024u * 1024u);
+    if (!g_ld_native_pass.pass) {
+        fprintf(stderr, "[native-pass] create_failed\n");
+        g_ld_native_pass.phase = LD_NATIVE_PASS_DONE;
+        return;
+    }
+    g_ld_native_pass.phase = LD_NATIVE_PASS_CAPTURE;
+    g_ld_native_pass.first_draw = g_ld_stats.groups_executed;
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {0};
+    dsv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    if (!rsx_native_replay_pass_begin(g_ld_native_pass.pass, g.list, colors,
+            packet->render_target_count, depth, depth ? &dsv : NULL))
+        ld_native_pass_mutation(rsx_native_replay_pass_error(g_ld_native_pass.pass));
+}
+
+static void ld_native_pass_capture_draw(const rsx_native_draw_packet* packet,
+    u64 vb_bytes, u64 ib_bytes, u32 ps_offset,
+    const u32* slots, const u32* samplers, const u32* vertex_slots)
+{
+    if (g_ld_native_pass.phase != LD_NATIVE_PASS_CAPTURE) return;
+    D3D12_CPU_DESCRIPTOR_HANDLE srv[16], smp[16], vtex[16];
+    ID3D12Resource* resources[32] = {0};
+    for (u32 i = 0; i < 16; ++i) {
+        srv[i] = srv_cpu(slots[i]); smp[i] = smp_cpu(samplers[i]);
+        vtex[i] = srv_cpu(vertex_slots[i]);
+        resources[i] = ld_native_pass_immutable_texture(slots[i]);
+        if (packet->has_vertex_texture_table)
+            resources[16 + i] = ld_native_pass_immutable_texture(vertex_slots[i]);
+    }
+    rsx_native_draw_payload_input input = {0};
+    input.draw_ordinal = g_ld_stats.groups_executed + 1u;
+    input.vertex.data = vb_bytes ? g.vb_mapped + g.vb_used : NULL;
+    input.vertex.size = (size_t)vb_bytes;
+    input.index.data = ib_bytes ? (u8*)g.ib_mapped + g.ib_used : NULL;
+    input.index.size = (size_t)ib_bytes;
+    input.vertex_constants.data = g.cb_mapped + g.cb_used;
+    input.vertex_constants.size = CB_BLOCK_BYTES;
+    if (packet->has_pixel_constant_buffer) {
+        input.pixel_constants.data = g.ps_cb_mapped + ps_offset;
+        input.pixel_constants.size = ((g.fp_constants.count ? g.fp_constants.count : 1u) + 1u) * 16u;
+    }
+    if (!rsx_native_replay_pass_capture(g_ld_native_pass.pass, packet, &input,
+            srv, smp, packet->has_vertex_texture_table ? vtex : NULL, resources))
+        ld_native_pass_mutation(rsx_native_replay_pass_error(g_ld_native_pass.pass));
+}
+
 /* One-shot ownership validation, separate from timing runs. An output path
  * in RSX_NATIVE_PAYLOAD_CAPTURE enables a <path>.request trigger. Capture is
  * bounded by two successful normal presents, and its owned bytes are retained
@@ -9956,6 +10216,7 @@ static void ld_native_payload_boundary(void)
 static void sink_end_impl(void* user, const rsx_dispatch* r,
                           ld_slow_draw_scope* slow_draw)
 {
+    ld_native_pass_before_draw();
     g_ld_pull_active=0;
     (void)user; (void)r;
     if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) return;
@@ -10855,6 +11116,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
     for (u32 k = 0; k < n_surf_used; k++) {
         packet.transition_resources[k] = g.surfaces[surf_used[k]].tex;
     }
+    ld_native_pass_begin_draw(&packet, mrt, current_zslot, slots, vtex_slots, vtex_mask);
     rsx_native_draw_packet_begin(&packet);
     if (packet.clear_depth_stencil) {
         if (current_zslot) {
@@ -10978,6 +11240,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
         packet.index_buffer.Format = DXGI_FORMAT_R32_UINT;
     }
     ld_native_payload_append(draw_vb_bytes, draw_ib_bytes, ps_cb_offset);
+    ld_native_pass_capture_draw(&packet, draw_vb_bytes, draw_ib_bytes, ps_cb_offset,
+        slots, smp_slots, vtex_slots);
     rsx_native_draw_packet_bind(&packet);
     g.cb_used += CB_BLOCK_ALIGNED;
     {
@@ -11109,6 +11373,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
 
 static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 {
+    ld_native_pass_finish("next_clear");
     (void)user; (void)r;
     if (g_ld_movie_mode && !ld_movie_composite_ui_enabled()) return;
     g_ld_stats.clears++;
@@ -11193,6 +11458,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             const float cd = g_ld_depth_clear && sf.depth_format == 1u
                 ? (float)(zs & 0xFFFFu) / 65535.0f
                 : (float)(zs >> 8) / 16777215.0f;
+            ld_native_pass_mutation("ClearDepthStencilView");
             g.list->lpVtbl->ClearDepthStencilView(g.list, dsv,
                 clear_flags, cd, (UINT8)(zs & 0xFFu), 1, &clear_rect);
         }
@@ -11211,6 +11477,11 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
             if (mask & RSX_CLEAR_DEPTH)
                 g.depth_cleared = 1;
         }
+    }
+    if (g_ld_native_pass.phase == LD_NATIVE_PASS_ARMED) {
+        memset(&g_ld_native_pass.signature, 0, sizeof(g_ld_native_pass.signature));
+        rsx_dsp_get_surface(&g.rsx, &g_ld_native_pass.signature);
+        g_ld_native_pass.clear_candidate = 1;
     }
 }
 
@@ -11953,6 +12224,7 @@ void rsx_live_draw_set_movie_mode(int on)
             if (!g.ready) goto movie_mode_done;
             const float black[4] = {0, 0, 0, 1};
             for (u32 i = 0; i < g.n_surfaces; i++) {
+                ld_native_pass_mutation("ClearRenderTargetView");
                 g.list->lpVtbl->ClearRenderTargetView(
                     g.list, rtv_handle(LD_SWAP_BUFFERS + i), black, 0, NULL);
                 ld_surface_note_write(i, LD_SURFACE_WRITE_OTHER);
@@ -12194,6 +12466,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
 
     D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
@@ -12206,10 +12479,12 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
     src.PlacedFootprint.Footprint.Height = h;
     src.PlacedFootprint.Footprint.Depth = 1;
     src.PlacedFootprint.Footprint.RowPitch = pitch;
+    ld_native_pass_mutation("CopyTextureRegion");
     g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
 
     ld_flush(LD_FLUSH_MOVIE_PRESENT);
@@ -12295,6 +12570,7 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
 
     D3D12_TEXTURE_COPY_LOCATION src = {0}, dst = {0};
@@ -12305,10 +12581,12 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
     dst.PlacedFootprint.Footprint.Height = height;
     dst.PlacedFootprint.Footprint.Depth = 1;
     dst.PlacedFootprint.Footprint.RowPitch = pitch;
+    ld_native_pass_mutation("CopyTextureRegion");
     g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
 
     ld_flush(LD_FLUSH_READBACK);                   /* copy completes on the GPU */
@@ -12601,6 +12879,7 @@ static void ld_report_counters(void)
 
 void rsx_live_draw_present(u32 buffer_id)
 {
+    ld_native_pass_finish("present_boundary");
     if (!g.ready) return;
     ld_pull_update();
     if (!ld_refresh_display_state()) return;
@@ -12963,14 +13242,17 @@ void rsx_live_draw_present(u32 buffer_id)
     bar[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
 
+    ld_native_pass_mutation("CopyResource");
     g.list->lpVtbl->CopyResource(g.list, bb, srcimg);
 
     bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    ld_native_pass_mutation("ResourceBarrier");
     g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
 
     ld_flush(LD_FLUSH_PRESENT);
@@ -13796,6 +14078,7 @@ void rsx_live_draw_present(u32 buffer_id)
 
     /* new frame: reset per-frame ring cursors */
     ld_native_payload_boundary();
+    ld_native_pass_boundary();
     g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0;
     g.srv_ring_used = 0; g.smp_ring_used = 0;
 #if !defined(YZ_PERF_CLEAN)
@@ -13811,6 +14094,7 @@ void rsx_live_draw_present(u32 buffer_id)
 
 void rsx_live_draw_shutdown(void)
 {
+    ld_native_pass_mutation("shutdown");
     if (g_ld_native_payload.phase == 1 || g_ld_native_payload.phase == 2)
         ld_native_payload_abort("shutdown_before_capture_completed");
     ld_sampler_pages_dump();

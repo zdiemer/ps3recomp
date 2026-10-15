@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -44,8 +45,10 @@ class LiveFlush(unittest.TestCase):
                        '/I' + str(root), str(here / 'test_live_flush.c'),
                        '/Fo' + str(root / 'test_live_flush.obj'), '/Fe' + str(executable)]
             built = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=60)
+            print(f'[live-flush] compile_exit={built.returncode}')
             self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
             ran = subprocess.run([str(executable)], cwd=root, capture_output=True, text=True, timeout=15)
+            print(f'[live-flush] fixture_exit={ran.returncode}')
             self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
             self.assertIn('52 actual-source flush/upload cases passed', ran.stdout)
             self.assertIn('bounded sampler page advancement passed', ran.stdout)
@@ -54,4 +57,7 @@ class LiveFlush(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main()
+    program = unittest.main(testRunner=unittest.TextTestRunner(stream=sys.stdout, verbosity=2), exit=False)
+    code = 0 if program.result.wasSuccessful() else 1
+    print(f'[live-flush] TEST_EXIT={code}')
+    raise SystemExit(code)

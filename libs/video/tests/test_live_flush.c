@@ -7,6 +7,9 @@
  * No D3D device, OS wait, graphics driver, or game is launched by this test.
  */
 #define _CRT_SECURE_NO_WARNINGS
+#ifdef NDEBUG
+#error This fixture requires active assertions
+#endif
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -96,18 +99,20 @@ static struct {
 } scenario;
 static struct {
     unsigned close, execute, signal, get_completed, event, wait, release,
-             alloc, reset, finish, dred, info;
+             alloc, reset, finish, dred, info, pass_mutation, pass_completed;
     int completion_proved, alloc_succeeded, reset_succeeded;
     u32 failed_stage;
     u64 qpc;
 } calls;
 
 static HRESULT mock_close(ID3D12GraphicsCommandList* list) {
+    assert(calls.pass_mutation == 1 && calls.pass_completed == 0);
     assert(list == g.list); ++calls.close; return scenario.close_hr;
 }
 static void mock_execute(ID3D12CommandQueue* queue, unsigned count,
                          ID3D12CommandList* const* lists) {
     assert(queue == g.queue && count == 1 && lists[0] == g.list);
+    assert(calls.pass_mutation == 1 && calls.pass_completed == 0);
     assert(calls.close == 1 && !FAILED(scenario.close_hr)); ++calls.execute;
 }
 static HRESULT mock_signal(ID3D12CommandQueue* queue, ID3D12Fence* fence, u64 value) {
@@ -138,6 +143,7 @@ static unsigned mock_release(ID3D12Resource* resource) {
 }
 static HRESULT mock_alloc_reset(ID3D12CommandAllocator* allocator) {
     assert(allocator == g.alloc && calls.completion_proved);
+    assert(calls.pass_mutation == 1 && calls.pass_completed == 0);
     assert(g.smp_page == 3 && g.smp_ring_used == 7 && g.smp_upload_reclaim_pending);
     assert(g_ld_sampler_pages.completions == 0 && g.upload_used == 12345);
     assert(calls.release == 2); ++calls.alloc;
@@ -147,6 +153,7 @@ static HRESULT mock_list_reset(ID3D12GraphicsCommandList* list,
                                ID3D12CommandAllocator* allocator, void* initial_pso) {
     assert(list == g.list && allocator == g.alloc && initial_pso == NULL);
     assert(calls.completion_proved && calls.alloc_succeeded);
+    assert(calls.pass_mutation == 1 && calls.pass_completed == 0);
     assert(g.smp_page == 3 && g.smp_ring_used == 7 && g.smp_upload_reclaim_pending);
     assert(g_ld_sampler_pages.completions == 0 && g.upload_used == 12345);
     ++calls.reset; calls.reset_succeeded = !FAILED(scenario.reset_hr); return scenario.reset_hr;
@@ -169,6 +176,23 @@ static void ld_drain_info_queue(const char* where) {
 /* This includes the untouched production function, including its real guards
  * and storage-reclamation ordering. Only external interfaces are substituted. */
 #include "sampler_pages_actual.inc"
+static void ld_native_pass_mutation(const char* reason) {
+    assert(reason && strcmp(reason,"flush") == 0);
+    assert(g.ready && calls.pass_mutation == 0 && calls.pass_completed == 0);
+    /* Invalidate captured state before even closing or submitting its list,
+     * including when a later submission/completion/reset step will fail. */
+    assert(calls.close == 0 && calls.execute == 0 && calls.signal == 0);
+    assert(calls.get_completed == 0 && calls.release == 0 && calls.alloc == 0 && calls.reset == 0);
+    ++calls.pass_mutation;
+}
+static void ld_native_pass_completed(void) {
+    /* This hook can destroy quarantined replay resources. A signalled event
+     * alone is insufficient: the fence and both reset results must be proven. */
+    assert(g.ready && calls.pass_mutation == 1 && calls.pass_completed == 0);
+    assert(calls.execute == 1 && calls.signal == 1 && calls.completion_proved);
+    assert(calls.alloc == 1 && calls.reset == 1 && calls.alloc_succeeded && calls.reset_succeeded);
+    ++calls.pass_completed;
+}
 #include "live_flush_actual.inc"
 #include "sampler_upload_actual.inc"
 
@@ -234,6 +258,7 @@ static void run_case(enum fixture_case test, int diagnostic, int through_upload_
     }
     assert(memcmp(heaps,before_heaps,sizeof(heaps)) == 0);
     assert(calls.finish == 1 && g.ready == success);
+    assert(calls.pass_mutation == 1 && calls.pass_completed == (unsigned)success);
     if (success) {
         assert(calls.release == 2 && g.n_retired_textures == 0);
         assert(calls.alloc == 1 && calls.reset == 1 && g_ld_sampler_pages.completions == 1);
@@ -256,6 +281,13 @@ static void run_case(enum fixture_case test, int diagnostic, int through_upload_
             assert(calls.alloc == 0 && calls.reset == 0);
         }
         if (diagnostic) assert(calls.failed_stage != 0);
+        /* A failed flush freezes the renderer. Retrying must not invalidate
+         * again or call completion on quarantined native-pass resources. */
+        unsigned char before_calls[sizeof(calls)], before_state[sizeof(g)];
+        memcpy(before_calls,&calls,sizeof(calls)); memcpy(before_state,&g,sizeof(g));
+        ld_flush(LD_FLUSH_DESCRIPTOR_RING);
+        ld_flush(LD_FLUSH_SAMPLER_UPLOAD);
+        assert(!memcmp(before_calls,&calls,sizeof(calls)) && !memcmp(before_state,&g,sizeof(g)));
     }
 }
 static void test_page_advancement(void) {
@@ -304,6 +336,7 @@ static void test_terminal_flush_is_noop(void) {
     ld_flush(LD_FLUSH_SAMPLER_UPLOAD);
     assert(memcmp(&g,before,sizeof(g)) == 0);
     assert(calls.close == 0 && calls.finish == 0 && calls.release == 0);
+    assert(calls.pass_mutation == 0 && calls.pass_completed == 0);
     assert(g_ld_sampler_pages.completions == 0);
     puts("terminal flush no-op passed");
 }
