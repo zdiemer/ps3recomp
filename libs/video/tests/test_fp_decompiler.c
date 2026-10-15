@@ -300,6 +300,126 @@ int main(void)
         check_absent("lif_handled", hlsl, "unhandled FP opcode");
     }
 
+    /* Test 11: cube/shadow declarations for never-sampled units are
+     * canonicalized away, while sampled units keep their requested type. */
+    {
+        u8 plain[16];
+        put_word(plain + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);
+        put_word(plain + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(plain + 8, 0);
+        put_word(plain + 12, 0);
+        char base[16384], unused_typed[16384];
+        const int n0 = rsx_fp_decompile_shadow_ex(plain, sizeof(plain), CTRL_32BIT,
+            0, 0, 0, base, sizeof(base), NULL);
+        const int n1 = rsx_fp_decompile_shadow_ex(plain, sizeof(plain), CTRL_32BIT,
+            1u << 9, 1u << 12, 0, unused_typed, sizeof(unused_typed), NULL);
+        check_true("unused_texture_types_canonical", n0 >= 0 && n1 >= 0 &&
+                   strcmp(base, unused_typed) == 0);
+
+        u8 sampled[16];
+        put_word(sampled + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(3) | END);
+        put_word(sampled + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(sampled + 8, 0);
+        put_word(sampled + 12, 0);
+        char cube_a[16384], cube_b[16384], shadow_a[16384], shadow_b[16384];
+        const int ca = rsx_fp_decompile_shadow_ex(sampled, sizeof(sampled), CTRL_32BIT,
+            1u << 3, 0, 0, cube_a, sizeof(cube_a), NULL);
+        const int cb = rsx_fp_decompile_shadow_ex(sampled, sizeof(sampled), CTRL_32BIT,
+            (1u << 3) | (1u << 9), 0, 0, cube_b, sizeof(cube_b), NULL);
+        check_true("used_cube_kept_unused_cube_removed", ca >= 0 && cb >= 0 &&
+                   strcmp(cube_a, cube_b) == 0);
+        check("used_cube_decl", cube_a, "TextureCube rsx_tex3 : register(t3);");
+        check("used_cube_sample", cube_a,
+              "rsx_tex3.Sample(rsx_samp[3], ((input.tc0).xyzw).xyz)");
+        const int sa = rsx_fp_decompile_shadow_ex(sampled, sizeof(sampled), CTRL_32BIT,
+            0, 1u << 3, 0, shadow_a, sizeof(shadow_a), NULL);
+        const int sb = rsx_fp_decompile_shadow_ex(sampled, sizeof(sampled), CTRL_32BIT,
+            0, (1u << 3) | (1u << 12), 0, shadow_b, sizeof(shadow_b), NULL);
+        check_true("used_shadow_kept_unused_shadow_removed", sa >= 0 && sb >= 0 &&
+                   strcmp(shadow_a, shadow_b) == 0);
+        check("used_shadow_decl", shadow_a,
+              "Texture2D<float> rsx_tex3 : register(t3);");
+        check("used_shadow_sampler", shadow_a,
+              "SamplerComparisonState rsx_samp3 : register(s3);");
+        check("used_shadow_sample", shadow_a,
+              "rsx_tex3.SampleCmp(rsx_samp3, ((input.tc0).xyzw).xy, ((input.tc0).xyzw).z)");
+    }
+
+    /* Test 12: the prepass skips inline constants and reads samples in branch
+     * bodies linearly. Unknown or malformed streams keep the caller masks. */
+    {
+        u8 constant_prog[48];
+        memset(constant_prog, 0, sizeof(constant_prog));
+        put_word(constant_prog + 0, OPC(0x01) | OUTMASK_ALL | OUTREG(0));
+        put_word(constant_prog + 4, T_CONST | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(constant_prog + 8, 0);
+        put_word(constant_prog + 12, 0);
+        put_word(constant_prog + 16, OPC(0x17) | TEXU(9)); /* constant data, not TEX */
+        put_word(constant_prog + 32, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);
+        put_word(constant_prog + 36, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        char constant_a[16384], constant_b[16384];
+        const int ka = rsx_fp_decompile_shadow_ex(constant_prog, sizeof(constant_prog),
+            CTRL_32BIT, 0, 0, 0, constant_a, sizeof(constant_a), NULL);
+        const int kb = rsx_fp_decompile_shadow_ex(constant_prog, sizeof(constant_prog),
+            CTRL_32BIT, 1u << 9, 0, 0, constant_b, sizeof(constant_b), NULL);
+        check_true("inline_constant_not_sampled", ka >= 0 && kb >= 0 &&
+                   strcmp(constant_a, constant_b) == 0);
+
+        u8 branch_prog[80];
+        memset(branch_prog, 0, sizeof(branch_prog));
+        put_word(branch_prog + 0, OPC(0x02)); /* IFE */
+        put_word(branch_prog + 4, 1u << 20); /* exec_if greater-than */
+        put_word(branch_prog + 8, (1u << 31) | (48u >> 2)); /* branch, else */
+        put_word(branch_prog + 12, 64u >> 2); /* end */
+        put_word(branch_prog + 16, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(4));
+        put_word(branch_prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(branch_prog + 32, OPC(0x01) | OUTMASK_ALL | INSRC(1));
+        put_word(branch_prog + 36, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(branch_prog + 48, OPC(0x01) | OUTMASK_ALL | INSRC(2));
+        put_word(branch_prog + 52, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(branch_prog + 64, OPC(0x3C) | OUTMASK_ALL | OUTREG(1) | END);
+        put_word(branch_prog + 68, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        char branch_hlsl[16384];
+        const int branch_result = rsx_fp_decompile_shadow_ex(branch_prog,
+            sizeof(branch_prog), CTRL_32BIT, 1u << 4, 0, 0,
+            branch_hlsl, sizeof(branch_hlsl), NULL);
+        check_true("branch_program_decoded", branch_result >= 0);
+        check("branch_sample_preserves_cube", branch_hlsl,
+              "rsx_tex4.Sample(rsx_samp[4], ((input.tc0).xyzw).xyz)");
+
+        u8 unknown[16];
+        put_word(unknown + 0, OPC(0x3F) | OUTMASK_ALL | END);
+        put_word(unknown + 4, 0);
+        put_word(unknown + 8, 0);
+        put_word(unknown + 12, 0);
+        char fallback[16384];
+        const int unknown_result = rsx_fp_decompile_shadow_ex(unknown, sizeof(unknown),
+            CTRL_32BIT, 1u << 9, 0, 0, fallback, sizeof(fallback), NULL);
+        check_true("unknown_opcode_retains_fallback", unknown_result >= 0);
+        check("unknown_opcode_retains_cube_mask", fallback,
+              "TextureCube rsx_tex9 : register(t9);");
+
+        u8 truncated_constant[16];
+        put_word(truncated_constant + 0, OPC(0x01) | OUTMASK_ALL | END);
+        put_word(truncated_constant + 4, T_CONST | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(truncated_constant + 8, 0);
+        put_word(truncated_constant + 12, 0);
+        const int malformed_result = rsx_fp_decompile_shadow_ex(truncated_constant,
+            sizeof(truncated_constant), CTRL_32BIT, 1u << 9, 0, 0,
+            fallback, sizeof(fallback), NULL);
+        check_true("truncated_constant_keeps_old_path", malformed_result >= 0);
+        check("truncated_constant_retains_cube_mask", fallback,
+              "TextureCube rsx_tex9 : register(t9);");
+        u8 overlap_prog[16];
+        put_word(overlap_prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);
+        put_word(overlap_prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(overlap_prog + 8, 0);
+        put_word(overlap_prog + 12, 0);
+        check_true("unused_overlap_still_rejected",
+            rsx_fp_decompile_shadow_ex(overlap_prog, sizeof(overlap_prog), CTRL_32BIT,
+                1u << 9, 1u << 9, 0, fallback, sizeof(fallback), NULL) == -1);
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
