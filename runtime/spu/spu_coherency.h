@@ -19,8 +19,8 @@
  *
  * The bitmap check is an atomic load against a global that stays zero until an
  * SPU actually reserves something, so a title that never runs SPU code avoids
- * touching the 4 MiB map. The optional PPU accessor predicate uses the same
- * atomic state and remains disabled unless explicitly selected at startup.
+ * touching the 4 MiB map. The inline PPU accessor predicate uses the same
+ * atomic state; diagnostic modes retain the out-of-line accessor.
  */
 
 #ifndef SPU_COHERENCY_H
@@ -69,7 +69,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
  * lookup guarded by a global that is zero until the first GETLLAR. */
 int spu_coh_is_reserved(uint32_t addr);
 
-/* The experimental PPU accessor predicate uses the same bitmap as the
+/* The inline PPU accessor predicate uses the same bitmap as the
  * ABI helper above. Keep the representation C/C++ ABI-compatible; all accesses
  * to these objects, including the reference helper, use compiler atomics. */
 #define SPU_COH_LINE_SHIFT 7u
