@@ -25,6 +25,11 @@ typedef struct rsx_native_replay_compare_result {
     uint64_t compared_bytes;
     uint64_t mismatch_bytes;
     uint32_t compared_targets;
+    uint64_t compared_depth_bytes;
+    uint64_t mismatch_depth_bytes;
+    uint64_t compared_stencil_bytes;
+    uint64_t mismatch_stencil_bytes;
+    uint32_t compared_depth_planes;
 } rsx_native_replay_compare_result;
 
 /* Optional immutable resource-version capture for one SRV slot. source_state
@@ -107,15 +112,18 @@ int rsx_native_replay_pass_record(
     ID3D12GraphicsCommandList* list,
     ID3D12GraphicsCommandList9* bias_list);
 
-/* Records color-output copies to private readback buffers and restores color
- * targets to RENDER_TARGET state. Caller submits and waits before compare().
- * Depth is replayed but deliberately not compared by this first prototype. */
+/* Records color and depth/stencil output copies to private readback buffers.
+ * Restores colors to RENDER_TARGET and depth/stencil to DEPTH_WRITE. Caller
+ * submits and waits before compare(). Depth supports D16, D32, D24S8 and
+ * D32S8 (including typeless resources with matching typed DSVs). */
 int rsx_native_replay_pass_record_compare(
     rsx_native_replay_pass* pass,
     ID3D12GraphicsCommandList* list);
 
-/* Reads completed color readbacks and compares active texel bytes (excluding
- * D3D row-pitch padding). Returns 1 on a completed comparison. */
+/* Reads completed readbacks and compares active texel bytes, excluding row
+ * padding and the unused high byte of D24. The original counters remain
+ * color-only; depth/stencil counters are separate. A return of 1 means the
+ * comparison completed, not that its mismatch counters are zero. */
 int rsx_native_replay_pass_compare(
     rsx_native_replay_pass* pass,
     rsx_native_replay_compare_result* result);

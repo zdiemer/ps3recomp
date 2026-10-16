@@ -121,6 +121,17 @@ static void transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource
     barrier.Transition.StateBefore = before; barrier.Transition.StateAfter = after;
     list->lpVtbl->ResourceBarrier(list,1,&barrier);
 }
+static DXGI_FORMAT depth_format(int mode) {
+    switch ((mode - 1) % 4) {
+    case 0: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    case 1: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case 2: return DXGI_FORMAT_D32_FLOAT;
+    default: return DXGI_FORMAT_D16_UNORM;
+    }
+}
+static int has_stencil(DXGI_FORMAT format) {
+    return format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || format == DXGI_FORMAT_D24_UNORM_S8_UINT;
+}
 static void create_scene(gpu_context* g, scene* s, int depth_enabled, int pull_enabled, int sample_texture) {
     memset(s,0,sizeof(*s));
     ID3D12Device* device = g->device;
@@ -134,12 +145,22 @@ static void create_scene(gpu_context* g, scene* s, int depth_enabled, int pull_e
     s->rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s->rtv_heap,&s->rtv);
     device->lpVtbl->CreateRenderTargetView(device,s->color,NULL,s->rtv);
     if (depth_enabled) {
-        desc.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        desc.Format = depth_format(depth_enabled);
+        s->depth_view.Format = desc.Format;
+        if (depth_enabled > 4) {
+            switch (desc.Format) {
+            case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS; break;
+            case DXGI_FORMAT_D24_UNORM_S8_UINT: desc.Format = DXGI_FORMAT_R24G8_TYPELESS; break;
+            case DXGI_FORMAT_D32_FLOAT: desc.Format = DXGI_FORMAT_R32_TYPELESS; break;
+            default: desc.Format = DXGI_FORMAT_R16_TYPELESS; break;
+            }
+        }
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         OK(device->lpVtbl->CreateCommittedResource(device,&hp,D3D12_HEAP_FLAG_NONE,&desc,
             D3D12_RESOURCE_STATE_DEPTH_WRITE,NULL,&IID_ID3D12Resource,(void**)&s->depth));
         s->dsv_heap = heap(device,D3D12_DESCRIPTOR_HEAP_TYPE_DSV,1,0);
         s->dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s->dsv_heap,&s->dsv);
-        s->depth_view.Format = desc.Format; s->depth_view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        s->depth_view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
         device->lpVtbl->CreateDepthStencilView(device,s->depth,&s->depth_view,s->dsv);
     }
     s->srv_cpu_heap = heap(device,D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,32,0);
@@ -218,15 +239,17 @@ static void create_scene(gpu_context* g, scene* s, int depth_enabled, int pull_e
     blend->SrcBlend = blend->SrcBlendAlpha = D3D12_BLEND_ONE; blend->DestBlend = blend->DestBlendAlpha = D3D12_BLEND_ZERO;
     blend->BlendOp = blend->BlendOpAlpha = D3D12_BLEND_OP_ADD; blend->LogicOp = D3D12_LOGIC_OP_NOOP;
     blend->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    pso.DepthStencilState.DepthEnable = depth_enabled; pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pso.DepthStencilState.DepthEnable = depth_enabled != 0;
+    pso.DepthStencilState.StencilEnable = depth_enabled && has_stencil(s->depth_view.Format); pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
     pso.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
     pso.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
     pso.DepthStencilState.FrontFace.StencilFailOp = pso.DepthStencilState.FrontFace.StencilDepthFailOp =
         pso.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+    if (pso.DepthStencilState.StencilEnable) pso.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
     pso.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     pso.DepthStencilState.BackFace = pso.DepthStencilState.FrontFace;
-    if (depth_enabled) pso.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    if (depth_enabled) pso.DSVFormat = s->depth_view.Format;
     OK(device->lpVtbl->CreateGraphicsPipelineState(device,&pso,&IID_ID3D12PipelineState,(void**)&s->pso));
     RELEASE(signature); RELEASE(vs); RELEASE(ps);
     s->constants = buffer(device,D3D12_HEAP_TYPE_UPLOAD,512);
@@ -244,6 +267,7 @@ static void fill_packet(gpu_context* g, scene* s, rsx_native_draw_packet* p, UIN
     p->srv_table = s->srv_gpu; p->sampler_table = s->sampler_gpu;
     p->render_targets[0] = s->rtv; p->render_target_count = 1;
     p->has_depth_stencil = s->depth != NULL; p->depth_stencil = s->dsv; p->clear_depth_stencil = clear_depth;
+    p->stencil_reference = 17 + draw_index;
     p->viewport.Width = p->viewport.Height = 32; p->viewport.MaxDepth = 1;
     p->scissor.left = draw_index ? 16 : 4; p->scissor.right = draw_index ? 28 : 16;
     p->scissor.top = 4; p->scissor.bottom = 28;
@@ -281,13 +305,13 @@ static void verify_original(scene* s, UINT draws) {
     }
     D3D12_RANGE no_write = {0,0}; s->original_readback->lpVtbl->Unmap(s->original_readback,0,&no_write);
 }
-static void exercise(gpu_context* g, int depth_enabled, UINT draws, int rejection, int pull_enabled) {
+static void exercise(gpu_context* g, int depth_enabled, UINT draws, int rejection, int pull_enabled, int corruption) {
     scene s; create_scene(g,&s,depth_enabled,pull_enabled,0);
     const FLOAT blue[4] = {0,0,1,1};
     g->list->lpVtbl->ClearRenderTargetView(g->list,s.rtv,blue,0,NULL);
-    int implicit_clear = depth_enabled && draws == 1;
+    int implicit_clear = depth_enabled && has_stencil(s.depth_view.Format) && draws == 1;
     if (s.depth) g->list->lpVtbl->ClearDepthStencilView(g->list,s.dsv,
-        D3D12_CLEAR_FLAG_DEPTH|D3D12_CLEAR_FLAG_STENCIL,implicit_clear ? 0.0f : 1.0f,0,0,NULL);
+        (D3D12_CLEAR_FLAGS)(D3D12_CLEAR_FLAG_DEPTH | (has_stencil(s.depth_view.Format) ? D3D12_CLEAR_FLAG_STENCIL : 0)),implicit_clear ? 0.0f : 1.0f,0,0,NULL);
     rsx_native_replay_pass* pass = rsx_native_replay_pass_create(g->device,2,4096);
     assert(pass);
     ID3D12Resource* colors[4] = {s.color,NULL,NULL,NULL};
@@ -347,11 +371,30 @@ static void exercise(gpu_context* g, int depth_enabled, UINT draws, int rejectio
         checking_replay_packets = 1; checked_replay_packets = 0;
         assert(rsx_native_replay_pass_record(pass,g->list,NULL));
         checking_replay_packets = 0; assert(checked_replay_packets == draws);
+        if (corruption) {
+            /* Only the original depth OR stencil changes. Color remains exact;
+             * the old color-only oracle would incorrectly accept these cases. */
+            assert(s.depth && (corruption == 1 || has_stencil(s.depth_view.Format)));
+            g->list->lpVtbl->ClearDepthStencilView(g->list, s.dsv,
+                corruption == 1 ? D3D12_CLEAR_FLAG_DEPTH : D3D12_CLEAR_FLAG_STENCIL,
+                0.25f, 91, 0, NULL);
+        }
         assert(rsx_native_replay_pass_record_compare(pass,g->list));
         submit_wait(g);
         rsx_native_replay_compare_result result;
         assert(rsx_native_replay_pass_compare(pass,&result));
         assert(result.compared_targets == 1 && result.compared_bytes == 32u*32u*4u && result.mismatch_bytes == 0);
+        const UINT depth_bytes = !depth_enabled ? 0 : s.depth_view.Format == DXGI_FORMAT_D16_UNORM ? 2 :
+            s.depth_view.Format == DXGI_FORMAT_D24_UNORM_S8_UINT ? 3 : 4;
+        assert(result.compared_depth_bytes == (uint64_t)32*32*depth_bytes);
+        assert(result.compared_stencil_bytes == (s.depth && has_stencil(s.depth_view.Format) ? 32u*32u : 0));
+        assert(result.compared_depth_planes == (s.depth ? 1u + (UINT)has_stencil(s.depth_view.Format) : 0));
+        assert((result.mismatch_depth_bytes > 0) == (corruption == 1));
+        assert((result.mismatch_stencil_bytes > 0) == (corruption == 2));
+        if (depth_enabled) printf("WARP depth-output format=%d corruption=%d depth=%llu stencil=%llu depth_mismatch=%llu stencil_mismatch=%llu passed\n",
+            depth_enabled, corruption, (unsigned long long)result.compared_depth_bytes,
+            (unsigned long long)result.compared_stencil_bytes, (unsigned long long)result.mismatch_depth_bytes,
+            (unsigned long long)result.mismatch_stencil_bytes);
         printf("WARP replay depth=%d draws=%u compared=%llu mismatches=%llu CPU-source-mutation passed\n",
             depth_enabled,draws,(unsigned long long)result.compared_bytes,(unsigned long long)result.mismatch_bytes);
         if (pull_enabled) printf("WARP pull-only draws=%u owned-SRV-VA passed after original-GPU-buffer overwrite\n",draws);
@@ -526,9 +569,14 @@ int main(void) {
         &IID_ID3D12GraphicsCommandList,(void**)&g.list));
     OK(g.device->lpVtbl->CreateFence(g.device,0,D3D12_FENCE_FLAG_NONE,&IID_ID3D12Fence,(void**)&g.fence));
     g.event = CreateEventA(NULL,FALSE,FALSE,NULL); assert(g.event);
-    for (int depth = 0; depth < 2; ++depth) for (UINT draws = 1; draws <= 2; ++draws) exercise(&g,depth,draws,0,0);
-    exercise(&g,0,1,1,0); exercise(&g,0,1,2,0);
-    exercise(&g,0,1,0,1); exercise(&g,0,2,0,1); exercise(&g,0,1,3,1);
+    for (int depth = 0; depth < 2; ++depth) for (UINT draws = 1; draws <= 2; ++draws) exercise(&g,depth,draws,0,0,0);
+    for (int mode = 1; mode <= 8; ++mode) {
+        exercise(&g,mode,2,0,0,0);
+        exercise(&g,mode,2,0,0,1);
+        if (has_stencil(depth_format(mode))) exercise(&g,mode,2,0,0,2);
+    }
+    exercise(&g,0,1,1,0,0); exercise(&g,0,1,2,0,0);
+    exercise(&g,0,1,0,1,0); exercise(&g,0,2,0,1,0); exercise(&g,0,1,3,1,0);
     exercise_sampled_versions(&g,0,0); exercise_sampled_versions(&g,1,0);
     exercise_sampled_versions(&g,0,1); exercise_sampled_versions(&g,0,2);
     exercise_sampled_versions(&g,1,3); exercise_sampled_versions(&g,1,4);
@@ -552,6 +600,6 @@ int main(void) {
     }
     CloseHandle(g.event); RELEASE(g.list); RELEASE(g.allocator); RELEASE(g.queue); RELEASE(g.fence);
     RELEASE(g.device); RELEASE(warp); RELEASE(factory);
-    puts("actual-source native replay WARP integration passed; sampled descriptor swizzle/color versions verified, depth bytes not directly compared");
+    puts("actual-source native replay WARP integration passed; sampled descriptor swizzle/color versions verified, depth and stencil bytes compared with independent corruption checks");
     return 0;
 }

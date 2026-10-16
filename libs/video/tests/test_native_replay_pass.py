@@ -54,6 +54,9 @@ class NativeReplayPass(unittest.TestCase):
             self.assertIn('WARP replay rejection=1 passed after completion', ran.stdout)
             self.assertIn('WARP replay rejection=2 passed after completion', ran.stdout)
             self.assertIn('WARP replay rejection=3 passed after completion', ran.stdout)
+            for mode in range(1, 9):
+                for corruption in ((0, 1, 2) if (mode - 1) % 4 < 2 else (0, 1)):
+                    self.assertIn(f'WARP depth-output format={mode} corruption={corruption} ', ran.stdout)
             for draws in (1, 2):
                 self.assertIn(f'WARP pull-only draws={draws} owned-SRV-VA passed after original-GPU-buffer overwrite', ran.stdout)
             for format_name in ('RGBA8', 'R32_RRR1'):

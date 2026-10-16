@@ -10067,13 +10067,19 @@ static void ld_native_pass_finish(const char* boundary)
     else ok = 0;
     fprintf(stderr, "[native-pass] compared=%d boundary=%s draws=%u targets=%u "
         "bytes=%llu mismatch=%llu snapshots=%u snapshot_bytes=%llu snapshot_reuses=%llu "
-        "depth_compared=0 full_frame=0 error=%s\n",
+        "depth_planes=%u depth_bytes=%llu depth_mismatch=%llu "
+        "stencil_bytes=%llu stencil_mismatch=%llu full_frame=0 error=%s\n",
         ok, boundary, draws, result.compared_targets,
         (unsigned long long)result.compared_bytes,
         (unsigned long long)result.mismatch_bytes,
         rsx_native_replay_pass_snapshot_count(g_ld_native_pass.pass),
         (unsigned long long)rsx_native_replay_pass_snapshot_bytes(g_ld_native_pass.pass),
         (unsigned long long)rsx_native_replay_pass_snapshot_reuses(g_ld_native_pass.pass),
+        result.compared_depth_planes,
+        (unsigned long long)result.compared_depth_bytes,
+        (unsigned long long)result.mismatch_depth_bytes,
+        (unsigned long long)result.compared_stencil_bytes,
+        (unsigned long long)result.mismatch_stencil_bytes,
         rsx_native_replay_pass_error(g_ld_native_pass.pass));
     FILE* file = fopen(g_ld_native_pass.path, "wbx");
     if (file) {
@@ -10081,14 +10087,21 @@ static void ld_native_pass_finish(const char* boundary)
             "{\"frame\":%u,\"attempts\":%u,\"rejected\":%u,\"draws\":%u,"
             "\"comparison_completed\":%s,\"color_targets\":%u,\"compared_bytes\":%llu,"
             "\"mismatch_bytes\":%llu,\"snapshots\":%u,\"snapshot_bytes\":%llu,"
-            "\"snapshot_reuses\":%llu,\"depth_compared\":false,\"full_frame\":false}\n",
+            "\"snapshot_reuses\":%llu,\"depth_compared\":%s,\"depth_planes\":%u,"
+            "\"depth_bytes\":%llu,\"depth_mismatch_bytes\":%llu,"
+            "\"stencil_bytes\":%llu,\"stencil_mismatch_bytes\":%llu,\"full_frame\":false}\n",
             g_ld_frames, g_ld_native_pass.attempts, g_ld_native_pass.rejected,
             draws, ok ? "true" : "false", result.compared_targets,
             (unsigned long long)result.compared_bytes,
             (unsigned long long)result.mismatch_bytes,
             rsx_native_replay_pass_snapshot_count(g_ld_native_pass.pass),
             (unsigned long long)rsx_native_replay_pass_snapshot_bytes(g_ld_native_pass.pass),
-            (unsigned long long)rsx_native_replay_pass_snapshot_reuses(g_ld_native_pass.pass));
+            (unsigned long long)rsx_native_replay_pass_snapshot_reuses(g_ld_native_pass.pass),
+            ok && result.compared_depth_planes ? "true" : "false", result.compared_depth_planes,
+            (unsigned long long)result.compared_depth_bytes,
+            (unsigned long long)result.mismatch_depth_bytes,
+            (unsigned long long)result.compared_stencil_bytes,
+            (unsigned long long)result.mismatch_stencil_bytes);
         const int close_result = fclose(file);
         if (written < 0 || close_result != 0)
             fprintf(stderr, "[native-pass] report_write_failed path=%s\n", g_ld_native_pass.path);

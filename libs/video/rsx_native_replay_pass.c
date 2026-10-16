@@ -34,6 +34,8 @@ typedef struct replay_color_readback {
     UINT rows;
     UINT64 row_bytes;
     UINT64 total_bytes;
+    UINT pixel_stride;
+    UINT pixel_bytes;
 } replay_color_readback;
 
 typedef struct replay_texture_snapshot {
@@ -91,6 +93,8 @@ struct rsx_native_replay_pass {
     ID3D12Resource* upload;
     ID3D12Resource* readback[RSX_NATIVE_REPLAY_MAX_COLOR_TARGETS];
     replay_color_readback color_readback[RSX_NATIVE_REPLAY_MAX_COLOR_TARGETS];
+    replay_color_readback depth_readback[2];
+    uint32_t depth_planes;
     uint64_t readback_bytes;
     uint64_t owned_gpu_bytes;
 };
@@ -846,100 +850,157 @@ int rsx_native_replay_pass_record(
     return 1;
 }
 
+static int replay_record_readback(
+    rsx_native_replay_pass* pass, ID3D12GraphicsCommandList* list,
+    ID3D12Resource* original, ID3D12Resource* replayed,
+    D3D12_RESOURCE_STATES source_state, UINT subresource,
+    UINT pixel_stride, UINT pixel_bytes, replay_color_readback* rb)
+{
+    D3D12_RESOURCE_DESC desc;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT original_fp;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT replay_fp;
+    UINT rows;
+    UINT64 row_bytes, total_bytes;
+    UINT64 replay_offset;
+    D3D12_HEAP_PROPERTIES heap;
+    D3D12_RESOURCE_DESC buffer;
+    D3D12_RESOURCE_ALLOCATION_INFO readback_allocation;
+    ID3D12Resource* readback = NULL;
+    D3D12_TEXTURE_COPY_LOCATION src;
+    D3D12_TEXTURE_COPY_LOCATION dst;
+    D3D12_RESOURCE_BARRIER bars[2];
+    original->lpVtbl->GetDesc(original, &desc);
+    pass->device->lpVtbl->GetCopyableFootprints(
+        pass->device, &desc, subresource, 1, 0, &original_fp, &rows,
+        &row_bytes, &total_bytes);
+    if (!rows || !row_bytes || !total_bytes || total_bytes > RSX_NATIVE_REPLAY_MAX_ALLOCATION)
+        return replay_fail(pass, "invalid_readback_footprint");
+    if (pixel_stride && (row_bytes != desc.Width * pixel_stride ||
+        !pixel_bytes || pixel_bytes > pixel_stride || rows != desc.Height))
+        return replay_fail(pass, "unexpected_depth_plane_layout");
+    replay_offset = (total_bytes + 511u) & ~511ull;
+    pass->device->lpVtbl->GetCopyableFootprints(
+        pass->device, &desc, subresource, 1, replay_offset, &replay_fp,
+        NULL, NULL, NULL);
+    if (replay_offset > RSX_NATIVE_REPLAY_MAX_ALLOCATION - total_bytes ||
+        pass->readback_bytes > RSX_NATIVE_REPLAY_MAX_ALLOCATION - replay_offset - total_bytes)
+        return replay_fail(pass, "readback_limit");
+    memset(&heap, 0, sizeof(heap));
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    memset(&buffer, 0, sizeof(buffer));
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = replay_offset + total_bytes;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    (void)pass->device->lpVtbl->GetResourceAllocationInfo(
+        pass->device, &readback_allocation, 0, 1, &buffer);
+    if (!readback_allocation.SizeInBytes ||
+        readback_allocation.SizeInBytes == UINT64_MAX ||
+        readback_allocation.SizeInBytes >
+            RSX_NATIVE_REPLAY_MAX_ALLOCATION - pass->owned_gpu_bytes)
+        return replay_fail(pass, "readback_allocation_limit");
+    if (FAILED(pass->device->lpVtbl->CreateCommittedResource(
+            pass->device, &heap, D3D12_HEAP_FLAG_NONE, &buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource,
+            (void**)&readback)))
+        return replay_fail(pass, "create_readback_resource");
+    pass->owned_gpu_bytes += readback_allocation.SizeInBytes;
+    memset(&src, 0, sizeof(src));
+    memset(&dst, 0, sizeof(dst));
+    src.pResource = original;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = subresource;
+    dst.pResource = readback;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = original_fp;
+    memset(bars, 0, sizeof(bars));
+    bars[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bars[0].Transition.pResource = original;
+    bars[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bars[0].Transition.StateBefore = source_state;
+    bars[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bars[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bars[1].Transition.pResource = replayed;
+    bars[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bars[1].Transition.StateBefore = source_state;
+    bars[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->lpVtbl->ResourceBarrier(list, 2, bars);
+    list->lpVtbl->CopyTextureRegion(list, &dst, 0, 0, 0, &src, NULL);
+    src.pResource = replayed;
+    dst.PlacedFootprint = replay_fp;
+    list->lpVtbl->CopyTextureRegion(list, &dst, 0, 0, 0, &src, NULL);
+    bars[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bars[0].Transition.StateAfter = source_state;
+    bars[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    bars[1].Transition.StateAfter = source_state;
+    list->lpVtbl->ResourceBarrier(list, 2, bars);
+    rb->resource = readback;
+    rb->original_footprint = original_fp;
+    rb->replay_footprint = replay_fp;
+    rb->rows = rows;
+    rb->row_bytes = row_bytes;
+    rb->total_bytes = total_bytes;
+    pass->readback_bytes += replay_offset + total_bytes;
+    rb->pixel_stride = pixel_stride;
+    rb->pixel_bytes = pixel_bytes;
+    return 1;
+}
+
 int rsx_native_replay_pass_record_compare(
     rsx_native_replay_pass* pass,
     ID3D12GraphicsCommandList* list)
 {
     uint32_t i;
+    UINT depth_stride = 0, depth_bytes = 0, depth_planes = 0;
     if (!pass || pass->state != REPLAY_RECORDED || !list)
         return replay_fail(pass, "invalid_compare_record_state");
-    for (i = 0; i < pass->color_count; ++i) {
+    if (pass->original_depth) {
         D3D12_RESOURCE_DESC desc;
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT original_fp;
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT replay_fp;
-        UINT rows;
-        UINT64 row_bytes, total_bytes;
-        UINT64 replay_offset;
-        D3D12_HEAP_PROPERTIES heap;
-        D3D12_RESOURCE_DESC buffer;
-        D3D12_RESOURCE_ALLOCATION_INFO readback_allocation;
-        ID3D12Resource* readback = NULL;
-        D3D12_TEXTURE_COPY_LOCATION src;
-        D3D12_TEXTURE_COPY_LOCATION dst;
-        D3D12_RESOURCE_BARRIER bars[2];
-        pass->original_color[i]->lpVtbl->GetDesc(pass->original_color[i], &desc);
-        pass->device->lpVtbl->GetCopyableFootprints(
-            pass->device, &desc, 0, 1, 0, &original_fp, &rows,
-            &row_bytes, &total_bytes);
-        if (!rows || !row_bytes || !total_bytes || total_bytes > RSX_NATIVE_REPLAY_MAX_ALLOCATION)
-            return replay_fail(pass, "invalid_readback_footprint");
-        replay_offset = (total_bytes + 511u) & ~511ull;
-        pass->device->lpVtbl->GetCopyableFootprints(
-            pass->device, &desc, 0, 1, replay_offset, &replay_fp,
-            NULL, NULL, NULL);
-        if (replay_offset > RSX_NATIVE_REPLAY_MAX_ALLOCATION - total_bytes ||
-            pass->readback_bytes > RSX_NATIVE_REPLAY_MAX_ALLOCATION - replay_offset - total_bytes)
-            return replay_fail(pass, "readback_limit");
-        memset(&heap, 0, sizeof(heap));
-        heap.Type = D3D12_HEAP_TYPE_READBACK;
-        memset(&buffer, 0, sizeof(buffer));
-        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        buffer.Width = replay_offset + total_bytes;
-        buffer.Height = 1;
-        buffer.DepthOrArraySize = 1;
-        buffer.MipLevels = 1;
-        buffer.SampleDesc.Count = 1;
-        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        (void)pass->device->lpVtbl->GetResourceAllocationInfo(
-            pass->device, &readback_allocation, 0, 1, &buffer);
-        if (!readback_allocation.SizeInBytes ||
-            readback_allocation.SizeInBytes == UINT64_MAX ||
-            readback_allocation.SizeInBytes >
-                RSX_NATIVE_REPLAY_MAX_ALLOCATION - pass->owned_gpu_bytes)
-            return replay_fail(pass, "readback_allocation_limit");
-        if (FAILED(pass->device->lpVtbl->CreateCommittedResource(
-                pass->device, &heap, D3D12_HEAP_FLAG_NONE, &buffer,
-                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource,
-                (void**)&readback)))
-            return replay_fail(pass, "create_readback_resource");
-        pass->owned_gpu_bytes += readback_allocation.SizeInBytes;
-        memset(&src, 0, sizeof(src));
-        memset(&dst, 0, sizeof(dst));
-        src.pResource = pass->original_color[i];
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        dst.pResource = readback;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint = original_fp;
-        memset(bars, 0, sizeof(bars));
-        bars[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        bars[0].Transition.pResource = pass->original_color[i];
-        bars[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        bars[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        bars[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        bars[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        bars[1].Transition.pResource = pass->replay_color[i];
-        bars[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        bars[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        bars[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        list->lpVtbl->ResourceBarrier(list, 2, bars);
-        list->lpVtbl->CopyTextureRegion(list, &dst, 0, 0, 0, &src, NULL);
-        src.pResource = pass->replay_color[i];
-        dst.PlacedFootprint = replay_fp;
-        list->lpVtbl->CopyTextureRegion(list, &dst, 0, 0, 0, &src, NULL);
-        bars[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        bars[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        bars[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        bars[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        list->lpVtbl->ResourceBarrier(list, 2, bars);
-        pass->readback[i] = readback;
-        pass->color_readback[i].resource = readback;
-        pass->color_readback[i].original_footprint = original_fp;
-        pass->color_readback[i].replay_footprint = replay_fp;
-        pass->color_readback[i].rows = rows;
-        pass->color_readback[i].row_bytes = row_bytes;
-        pass->color_readback[i].total_bytes = total_bytes;
-        pass->readback_bytes += replay_offset + total_bytes;
+        D3D12_FEATURE_DATA_FORMAT_INFO info;
+        DXGI_FORMAT typed = pass->depth_view.Format, typeless;
+        switch (typed) {
+        case DXGI_FORMAT_D16_UNORM:
+            typeless = DXGI_FORMAT_R16_TYPELESS;
+            depth_stride = depth_bytes = 2; depth_planes = 1; break;
+        case DXGI_FORMAT_D32_FLOAT:
+            typeless = DXGI_FORMAT_R32_TYPELESS;
+            depth_stride = depth_bytes = 4; depth_planes = 1; break;
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+            typeless = DXGI_FORMAT_R24G8_TYPELESS;
+            depth_stride = 4; depth_bytes = 3; depth_planes = 2; break;
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+            typeless = DXGI_FORMAT_R32G8X24_TYPELESS;
+            depth_stride = depth_bytes = 4; depth_planes = 2; break;
+        default: return replay_fail(pass, "unsupported_depth_compare_format");
+        }
+        pass->original_depth->lpVtbl->GetDesc(pass->original_depth, &desc);
+        memset(&info, 0, sizeof(info)); info.Format = desc.Format;
+        if ((desc.Format != typed && desc.Format != typeless) ||
+            FAILED(pass->device->lpVtbl->CheckFeatureSupport(pass->device,
+                D3D12_FEATURE_FORMAT_INFO, &info, sizeof(info))) ||
+            info.PlaneCount != depth_planes)
+            return replay_fail(pass, "unsupported_depth_compare_planes");
     }
+    for (i = 0; i < pass->color_count; ++i) {
+        if (!replay_record_readback(pass, list, pass->original_color[i],
+            pass->replay_color[i], D3D12_RESOURCE_STATE_RENDER_TARGET, 0,
+            0, 0, &pass->color_readback[i])) return 0;
+        pass->readback[i] = pass->color_readback[i].resource;
+    }
+    /* begin() restricts outputs to one mip and one array slice, so plane
+     * indices are subresource indices. D3D12 copies depth/stencil separately:
+     * D24 is four bytes with one unused high byte; stencil is one byte.
+     * https://microsoft.github.io/DirectX-Specs/d3d/PlanarDepthStencilDDISpec.html */
+    for (i = 0; i < depth_planes; ++i) {
+        if (!replay_record_readback(pass, list, pass->original_depth,
+            pass->replay_depth, D3D12_RESOURCE_STATE_DEPTH_WRITE, i,
+            i ? 1 : depth_stride, i ? 1 : depth_bytes,
+            &pass->depth_readback[i])) return 0;
+    }
+    pass->depth_planes = depth_planes;
     pass->state = REPLAY_COMPARE_RECORDED;
     return 1;
 }
@@ -953,8 +1014,15 @@ int rsx_native_replay_pass_compare(
     if (!pass || pass->state != REPLAY_COMPARE_RECORDED || !result)
         return replay_fail(pass, "invalid_compare_state");
     memset(&local, 0, sizeof(local));
-    for (i = 0; i < pass->color_count; ++i) {
-        replay_color_readback* rb = &pass->color_readback[i];
+    for (i = 0; i < pass->color_count + pass->depth_planes; ++i) {
+        const int is_depth = i >= pass->color_count;
+        const int is_stencil = i == pass->color_count + 1;
+        replay_color_readback* rb = is_depth
+            ? &pass->depth_readback[i - pass->color_count] : &pass->color_readback[i];
+        uint64_t* compared = !is_depth ? &local.compared_bytes : is_stencil
+            ? &local.compared_stencil_bytes : &local.compared_depth_bytes;
+        uint64_t* mismatches = !is_depth ? &local.mismatch_bytes : is_stencil
+            ? &local.mismatch_stencil_bytes : &local.mismatch_depth_bytes;
         D3D12_RANGE range;
         const uint8_t* mapped = NULL;
         UINT row;
@@ -972,16 +1040,18 @@ int rsx_native_replay_pass_compare(
                 (SIZE_T)row * rb->replay_footprint.Footprint.RowPitch;
             UINT64 col;
             for (col = 0; col < rb->row_bytes; ++col) {
-                if (a[col] != b[col])
-                    local.mismatch_bytes++;
+                if (rb->pixel_stride && col % rb->pixel_stride >= rb->pixel_bytes)
+                    continue;
+                if (a[col] != b[col]) ++*mismatches;
+                ++*compared;
             }
-            local.compared_bytes += rb->row_bytes;
         }
         {
             D3D12_RANGE no_write = {0, 0};
             rb->resource->lpVtbl->Unmap(rb->resource, 0, &no_write);
         }
-        local.compared_targets++;
+        if (is_depth) ++local.compared_depth_planes;
+        else ++local.compared_targets;
     }
     *result = local;
     return 1;
@@ -1041,6 +1111,9 @@ void rsx_native_replay_pass_destroy(rsx_native_replay_pass* pass)
         if (pass->replay_color[i]) pass->replay_color[i]->lpVtbl->Release(pass->replay_color[i]);
         if (pass->readback[i]) pass->readback[i]->lpVtbl->Release(pass->readback[i]);
     }
+    for (i = 0; i < 2; ++i)
+        if (pass->depth_readback[i].resource)
+            pass->depth_readback[i].resource->lpVtbl->Release(pass->depth_readback[i].resource);
     if (pass->original_depth) pass->original_depth->lpVtbl->Release(pass->original_depth);
     if (pass->replay_depth) pass->replay_depth->lpVtbl->Release(pass->replay_depth);
     if (pass->upload) pass->upload->lpVtbl->Release(pass->upload);
