@@ -75,6 +75,7 @@ u32  rsx_live_draw_get_last_draws(void) { return 0; }
 double rsx_live_draw_get_present_fps(void) { return 0.0; }
 void rsx_live_draw_dump_present_samples(void) {}
 void rsx_live_draw_dump_shader_cache(void) {}
+int rsx_live_draw_finish_shader_bundle(unsigned timeout_ms) { (void)timeout_ms; return 1; }
 void rsx_live_draw_a010_probe_begin(void) {}
 int  rsx_live_draw_a010_probe_active(void) { return 0; }
 int  rsx_live_draw_a010_world_ready(void) { return 1; }
@@ -5673,7 +5674,7 @@ static int shader_disk_cache_path(
 #define SHADER_BUNDLE_MAGIC "HZSHBND1"
 #define SHADER_BUNDLE_SCHEMA_VERSION 1u
 #define SHADER_BUNDLE_COMPILER_TAG 0xD59F4A31u /* D3DCompile vs/ps_5_0, flags=0 */
-#define SHADER_BUNDLE_MAX_BYTES (64u * 1024u * 1024u)
+#define SHADER_BUNDLE_MAX_BYTES (128u * 1024u * 1024u)
 #define SHADER_BUNDLE_MAX_ENTRIES (2u * MAX_SHADER_BLOBS)
 #define SHADER_BUNDLE_MAX_MERGE_ITEMS (2u * SHADER_BUNDLE_MAX_ENTRIES)
 #define SHADER_BUNDLE_MAX_SOURCE (256u * 1024u)
@@ -6294,6 +6295,98 @@ void rsx_live_draw_dump_shader_cache(void)
     memset(&g_shader_bundle, 0, sizeof(g_shader_bundle));
     InterlockedExchange(&g_shader_bundle_dump_state, success ? 2 : 0);
 }
+
+/* BEGIN RSX SHADER BUNDLE SHUTDOWN
+ * Terminal, renderer-owner operation. Transfer the cache's existing owned
+ * source allocations and blob references; no shader payload copies or disk
+ * access occur on the owner. A timed-out worker never references renderer
+ * state, so display/GPU teardown can proceed independently. */
+static void shader_blob_cache_release(shader_blob_cache_t* cache);
+typedef struct shader_bundle_shutdown_job {
+    char path[MAX_PATH];
+    shader_blob_cache_t vs;
+    shader_blob_cache_t ps;
+} shader_bundle_shutdown_job;
+
+static DWORD WINAPI shader_bundle_shutdown_worker(void* argument)
+{
+    shader_bundle_shutdown_job* job = (shader_bundle_shutdown_job*)argument;
+    shader_bundle_item* items = (shader_bundle_item*)calloc(
+        SHADER_BUNDLE_MAX_ENTRIES, sizeof(*items));
+    u32 count = 0, entries = 0;
+    size_t bytes = 0;
+    int saved = 0;
+    if (items) {
+        shader_bundle_append_cache(items, &count, &job->vs, (u32)'V',
+            SHADER_BUNDLE_MAX_ENTRIES);
+        shader_bundle_append_cache(items, &count, &job->ps, (u32)'P',
+            SHADER_BUNDLE_MAX_ENTRIES);
+        saved = shader_bundle_persist_file(job->path, items, count,
+            &entries, &bytes);
+    }
+    free(items);
+    shader_blob_cache_release(&job->vs);
+    shader_blob_cache_release(&job->ps);
+    free(job);
+    /* Only process-lifetime status counters are shared. Never log from this
+     * worker: CRT exit must not wait on its stdio lock after a timeout. */
+    if (saved) {
+        InterlockedExchange(&g_shader_bundle_saved_entries, (LONG)entries);
+        InterlockedExchange64(&g_shader_bundle_saved_bytes, (LONG64)bytes);
+    }
+    InterlockedExchange(&g_shader_bundle_dump_state, saved ? 2 : 3);
+    return saved ? 1u : 0u;
+}
+
+int rsx_live_draw_finish_shader_bundle(unsigned timeout_ms)
+{
+    const ULONGLONG began = GetTickCount64();
+    shader_bundle_shutdown_job* job;
+    HANDLE thread;
+    DWORD result = 0;
+    if (!g.ready || g_ld_shader_disk_ready != 1) return 1;
+    const LONG prior = InterlockedCompareExchange(
+        &g_shader_bundle_dump_state, 1, 0);
+    if (prior != 0) return prior == 2;
+    job = (shader_bundle_shutdown_job*)calloc(1, sizeof(*job));
+    if (!job || !shader_bundle_path(job->path)) {
+        free(job);
+        InterlockedExchange(&g_shader_bundle_dump_state, 0);
+        return 0;
+    }
+    memcpy(&job->vs, &g.vs_blobs, sizeof(job->vs));
+    memcpy(&job->ps, &g.ps_blobs, sizeof(job->ps));
+    memset(&g.vs_blobs, 0, sizeof(g.vs_blobs));
+    memset(&g.ps_blobs, 0, sizeof(g.ps_blobs));
+    thread = CreateThread(NULL, 0, shader_bundle_shutdown_worker, job, 0, NULL);
+    if (!thread) {
+        /* No worker acquired ownership. Leave a retryable original cache. */
+        memcpy(&g.vs_blobs, &job->vs, sizeof(g.vs_blobs));
+        memcpy(&g.ps_blobs, &job->ps, sizeof(g.ps_blobs));
+        free(job);
+        InterlockedExchange(&g_shader_bundle_dump_state, 0);
+        return 0;
+    }
+    const ULONGLONG elapsed = GetTickCount64() - began;
+    const DWORD remaining = elapsed >= timeout_ms ? 0 :
+        timeout_ms - (DWORD)elapsed;
+    const DWORD waited = WaitForSingleObject(thread, remaining);
+    const int saved = waited == WAIT_OBJECT_0 &&
+        GetExitCodeThread(thread, &result) && result == 1;
+    CloseHandle(thread);
+    /* On timeout the detached job owns everything it uses. Do not terminate
+     * it, free it, or unload this module until it finishes/process exits. */
+    fprintf(stderr, "[shader-cache-bundle-shutdown] status=%s entries=%u "
+        "bytes=%llu elapsed_ms=%llu\n",
+        saved ? "saved" : waited == WAIT_TIMEOUT ? "timeout" : "failed",
+        saved ? (u32)InterlockedCompareExchange(
+            &g_shader_bundle_saved_entries, 0, 0) : 0,
+        saved ? (unsigned long long)InterlockedCompareExchange64(
+            &g_shader_bundle_saved_bytes, 0, 0) : 0,
+        (unsigned long long)(GetTickCount64() - began));
+    return saved;
+}
+/* END RSX SHADER BUNDLE SHUTDOWN */
 
 static HRESULT shader_disk_create_blob(size_t size, ID3DBlob** blob)
 {
