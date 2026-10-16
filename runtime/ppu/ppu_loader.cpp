@@ -772,8 +772,8 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  * to serialize through the SPU lock-line lock, or it can land inside a PUTLLC's
  * compare and be written straight back over; and it has to raise SPU_EVENT_LR,
  * which is how an SPURS idle service parked in `rdch SPU_RdEventStat` finds out
- * work was posted. The optional inline predicate remains disabled unless
- * PPU_INLINE_COH_CHECK=ON is present at startup. */
+ * work was posted. Inline the identical atomic reservation predicate by default;
+ * PPU_INLINE_COH_CHECK=OFF retains the out-of-line diagnostic comparison. */
 /* ---------------------------------------------------------------------------
  * lwarx/stwcx. cross-thread reservation invalidation.
  *
@@ -1403,8 +1403,9 @@ static inline bool vm_memory_probes(void)
     return enabled;
 }
 
-/* Generated PPU TUs may opt into an inline ordinary-RAM read path through
- * PPU_INLINE_READS=ON. Keep it disabled until ppu_run initializes the exact
+/* Generated PPU TUs may opt into an inline ordinary-RAM read path at compile
+ * time, with PPU_INLINE_READS=OFF as a runtime opt-out. Keep it disabled until
+ * ppu_run initializes the exact
  * same immutable diagnostic decision used by the out-of-line accessors. */
 extern "C" int ppu_native_reads_inline_enabled = 0;
 static int ppu_inline_coh_predicate_enabled = 0;
@@ -1420,9 +1421,10 @@ extern "C" void ppu_native_reads_inline_init(void)
     }
 
     const char* request = getenv("PPU_INLINE_READS");
-    const int requested = request && strcmp(request, "ON") == 0;
+    const int requested = !request || !*request || strcmp(request, "ON") == 0;
     const char* coh_request = getenv("PPU_INLINE_COH_CHECK");
-    const int coh_requested = coh_request && strcmp(coh_request, "ON") == 0;
+    const int coh_requested = !coh_request || !*coh_request ||
+        strcmp(coh_request, "ON") == 0;
     const int probes = vm_memory_probes() ? 1 : 0;
     ppu_native_reads_inline_enabled = requested && !probes && vm_base;
     ppu_inline_coh_predicate_enabled = coh_requested && !probes && vm_base;
