@@ -1,4 +1,5 @@
 /* Exercise the live uploader with synthetic guest bytes and a real WARP GPU. */
+#include <initguid.h>
 #include <assert.h>
 #include <io.h>
 #include "../rsx_live_draw.c"
@@ -592,6 +593,7 @@ static void resolution_tests(void)
     OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.srv_heap));
     hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER; hd.NumDescriptors=1;
     OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.smp_heap));
+    g.smp_pages[0]=g.smp_heap; g.smp_page_count=1;
     assert(make_depth_snapshot_pipeline()==0);
     g.width=g.height=8; g.ready=1;
     const char* sizes[]={"8x8","12x12","16x16","11x13","12x12","native"};
@@ -825,6 +827,7 @@ static void resolution_tests(void)
     g.rtv_heap=g.srv_cpu_heap=g.dsv_heap=NULL;
     g.srv_heap->lpVtbl->Release(g.srv_heap); g.srv_heap=NULL;
     g.smp_heap->lpVtbl->Release(g.smp_heap); g.smp_heap=NULL;
+    g.smp_pages[0]=NULL; g.smp_page_count=0;
     g.depth_pack_pso->lpVtbl->Release(g.depth_pack_pso); g.depth_pack_pso=NULL;
     g.depth_pack_rootsig->lpVtbl->Release(g.depth_pack_rootsig); g.depth_pack_rootsig=NULL;
     g.depth_snapshot_pso->lpVtbl->Release(g.depth_snapshot_pso); g.depth_snapshot_pso=NULL;
@@ -1702,6 +1705,9 @@ int main(void)
     g.guest_ptr = resolve;
     ID3D12Resource* readback = buffer(D3D12_HEAP_TYPE_READBACK);
 
+    /* Manual fixture setup bypasses rsx_live_draw_init. Mark the renderer ready
+     * only after its device, queue, command list, fence and upload buffer exist. */
+    g.ready=1;
     texture_content_cache_tests(readback);
 
     rsx_dsp_texture t = {0}; t.dimension = 2; t.width = t.height = 8;
