@@ -110,7 +110,6 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
     /* `ctx` is about to go out of scope: take it out of the reserving set
      * first, or the coherency walk dereferences this stack frame after it is
      * gone. See spu_coh_unregister. */
-    spu_mfc_release(&ctx);
     spu_coh_unregister(&ctx);
     { extern void spu_mfc_release(spu_context*);
       spu_mfc_release(&ctx); }

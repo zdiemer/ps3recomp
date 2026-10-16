@@ -13,7 +13,7 @@ root = Path(__file__).resolve().parents[1]
 spu = root / 'runtime/spu'
 common = ['spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c', 'spu_workload.c',
           'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c', 'spu_vm_pagemap.c',
-          'spurs_policy_blob_weak.c', 'spu_interp.c']
+          'spurs_policy_blob_weak.c', 'spu_interp.c', 'spu_taskset_dispatch.c', 'spu_overlay_registry.c']
 failed = []
 with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
     for name in ['test_spu_mfc_slots', 'test_spu_mfc_shared_lookup', 'test_spu_coherency', 'test_spu_lockline_peer', 'test_spu_registry_allocation']:
@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
         subprocess.run(command + ['-o', str(binary)], check=True)
         if name == 'test_spu_registry_allocation':
             for mode, diagnostic in [('mfc', 'cannot allocate private MFC engine'),
-                                     ('coh', 'cannot register reservation holder')]:
+                                     ('coh', 'cannot retain reservation holders')]:
                 result = subprocess.run([str(binary), mode], timeout=10,
                                         capture_output=True, text=True)
                 assert result.returncode == -signal.SIGABRT, result

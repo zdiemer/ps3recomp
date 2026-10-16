@@ -24,7 +24,7 @@ def harness() -> str:
     configure = '    if (!si->taskset_wake_configured)' + unique_between(
         source, '    if (!si->taskset_wake_configured)', '    /* Real BE instance:')
     wait = '        uint32_t poll_cause = SPU_TASKSET_DISPATCH_POLL;' + unique_between(
-        source, '        uint32_t poll_cause = SPU_TASKSET_DISPATCH_POLL;', '        u32 ea = si->ea;')
+        source, '        uint32_t poll_cause = SPU_TASKSET_DISPATCH_POLL;', '        if (si->stopping) break;')
     return (HARNESS.replace('@@DISPATCH@@', (ROOT / 'runtime/spu/spu_taskset_dispatch.c').as_posix())
             .replace('@@WATCH@@', extracted_source()).replace('@@MODE@@', mode)
             .replace('@@CONFIGURE@@', configure).replace('@@WAIT@@', wait))
@@ -89,6 +89,8 @@ static uint64_t readiness(unsigned task)
 /* The configuration/wait blocks below are extracted verbatim from cellSpurs.
  * Only Win32 failure injection and the scheduler's other fields are fixtures. */
 struct SpursInst {
+    SRWLOCK lock;
+    CONDITION_VARIABLE wake;
     HANDLE taskset_wake_event;
     int taskset_wake_enabled, taskset_wake_configured;
 };
@@ -108,12 +110,18 @@ static void configure(struct SpursInst* si, uint32_t spurs_ea) {
 @@CONFIGURE@@
 }
 #undef CreateEventA
+static BOOL wait_condition(PCONDITION_VARIABLE cv, PSRWLOCK lock, DWORD ms, ULONG flags)
+{ assert(ms == 1 && !flags); ++sleep_calls; return SleepConditionVariableSRW(cv, lock, ms, flags); }
+#define SleepConditionVariableSRW wait_condition
 #define WaitForSingleObject wait_event
 #define Sleep fallback_sleep
 static uint32_t wait_cause(struct SpursInst* si) {
+    AcquireSRWLockExclusive(&si->lock);
 @@WAIT@@
+    ReleaseSRWLockExclusive(&si->lock);
     return poll_cause;
 }
+#undef SleepConditionVariableSRW
 #undef WaitForSingleObject
 #undef Sleep
 

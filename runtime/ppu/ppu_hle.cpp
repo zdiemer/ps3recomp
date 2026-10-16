@@ -75,6 +75,8 @@ extern "C" int ps3_hle_has(uint32_t nid)
 typedef uint64_t (*hle_generic)(uint64_t, uint64_t, uint64_t, uint64_t,
                                 uint64_t, uint64_t, uint64_t, uint64_t);
 
+extern "C" uint64_t vm_read64(uint64_t addr);
+
 /* The deprecated SAIL initializer has nine integer arguments. The generic
  * bridge covers only r3..r10; argument nine lives at the ELFv1 stack slot 0x70. */
 extern "C" int32_t cellSailPlayerInitialize(uint32_t, int32_t, uint32_t,

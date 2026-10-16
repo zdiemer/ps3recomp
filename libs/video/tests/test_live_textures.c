@@ -1439,6 +1439,7 @@ static u64 override_epoch=1;
 static u8 override_pixels[4*4*4];
 static unsigned override_calls;
 static int override_present=1;
+static int override_watch;
 static u64 test_override_revision(u32 format,u32 width,u32 height,void* user)
 {
     assert(user==&override_epoch);
@@ -1447,7 +1448,8 @@ static u64 test_override_revision(u32 format,u32 width,u32 height,void* user)
 static const u8* test_override_pixels(u32 format,u32 w,u32 h,const u8* src,size_t size,void* user)
 {
     assert(user==&override_epoch && (format&0x9F)==0x88 && w==4 && h==4);
-    assert(src==guest+1536 && size==16 && !memcmp(src,guest+1536,16));
+    const u8* expected=override_watch?watch_guest+1536:guest+1536;
+    assert(src==expected && size==16 && !memcmp(src,expected,16));
     ++override_calls;
     return override_present ? override_pixels : NULL;
 }

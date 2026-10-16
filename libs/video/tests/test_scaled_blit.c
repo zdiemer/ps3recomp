@@ -9,7 +9,7 @@ PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 u32 g_rsx_last_reference;
 void rsx_state_init(rsx_state* s) { (void)s;abort(); }
 void rsx_raise_user_cmd(u32 a) { (void)a;abort(); }
-int rsx_draw_engine_enabled(void) { abort(); }
+int rsx_draw_engine_enabled(void) { return 0; }
 void rsx_draw_engine_method(u32 m,u32 a) { (void)m;(void)a;abort(); }
 int rsx_process_method(rsx_state* s,u32 m,u32 a) { (void)s;(void)m;(void)a;abort(); }
 void rsx_draw_engine_set_display_buffer(u32 a,u32 b,u32 c,u32 d,u32 e,u32 f) { abort(); }

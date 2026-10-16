@@ -170,7 +170,7 @@ s32 cellSailPlayerDestroy(CellSailPlayerHandle handle)
 enum { SAIL_CALL_BOOT = 1, SAIL_CALL_OPEN_STREAM = 2, SAIL_CALL_CLOSE_STREAM = 3,
        SAIL_CALL_START = 10, SAIL_CALL_STOP = 11 };
 
-static void sail_notify(int slot, u32 major, u32 minor, u64 arg0, u64 arg1)
+static void sail_notify_ex(int slot, u32 major, u32 minor, u64 arg0, u64 arg1)
 {
     if (slot < 0 || !g_ps3_guest_caller) return;
     const u32 cb = s_sail_players[slot].callback_ea;
@@ -187,17 +187,29 @@ static void sail_notify(int slot, u32 major, u32 minor, u64 arg0, u64 arg1)
  * boot has reported CLOSED; without these events it boots the player and then
  * waits on a black screen for good. */
 #define SAIL_EV_STATE_CHANGED 3
-enum { SAIL_ST_BOOT_TRANSITION = 1, SAIL_ST_CLOSED = 2, SAIL_ST_OPEN_TRANSITION = 3,
+enum { SAIL_ST_INITIALIZED = 0, SAIL_ST_BOOT_TRANSITION = 1, SAIL_ST_CLOSED = 2, SAIL_ST_OPEN_TRANSITION = 3,
        SAIL_ST_OPENED = 4, SAIL_ST_START_TRANSITION = 5, SAIL_ST_RUNNING = 6,
        SAIL_ST_STOP_TRANSITION = 7, SAIL_ST_CLOSE_TRANSITION = 8 };
 
 /* One synchronous call: transition state, completion, settled state.
  * The call token belongs to completion arg1, not either state notification. */
-static void sail_call(int slot, u32 call, u32 via, u32 to, u64 userParam)
+static void sail_call_ex(int slot, u32 call, u32 via, u32 to, u64 userParam)
 {
-    sail_notify(slot, SAIL_EV_STATE_CHANGED, 0, via, 0);
-    sail_notify(slot, SAIL_EV_CALL_COMPLETED, call, 0, userParam);
-    sail_notify(slot, SAIL_EV_STATE_CHANGED, 0, to, 0);
+    sail_notify_ex(slot, SAIL_EV_STATE_CHANGED, 0, via, 0);
+    sail_notify_ex(slot, SAIL_EV_CALL_COMPLETED, call, 0, userParam);
+    sail_notify_ex(slot, SAIL_EV_STATE_CHANGED, 0, to, 0);
+}
+
+/* Existing host playback adapters include this implementation and use the
+ * four-argument helpers. Their state transitions have no completion token;
+ * Boot keeps the full upstream arg1 contract through the explicit helpers. */
+static void sail_notify(int slot, u32 major, u32 minor, u64 arg0)
+{
+    sail_notify_ex(slot, major, minor, arg0, 0);
+}
+static void sail_call(int slot, u32 call, u32 via, u32 to)
+{
+    sail_call_ex(slot, call, via, to, 0);
 }
 
 s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
@@ -207,7 +219,7 @@ s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_RUNNING;
-    sail_call(_sp, SAIL_CALL_BOOT, SAIL_ST_BOOT_TRANSITION, SAIL_ST_CLOSED, userParam);
+    sail_call_ex(_sp, SAIL_CALL_BOOT, SAIL_ST_BOOT_TRANSITION, SAIL_ST_CLOSED, userParam);
     return CELL_OK;
 }
 
@@ -233,7 +245,7 @@ s32 cellSailPlayerOpenStream(CellSailPlayerHandle handle, const char* path)
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     /* Stub: don't actually open anything */
-    sail_call(_sp, SAIL_CALL_OPEN_STREAM, SAIL_ST_OPEN_TRANSITION, SAIL_ST_OPENED, 0);
+    sail_call_ex(_sp, SAIL_CALL_OPEN_STREAM, SAIL_ST_OPEN_TRANSITION, SAIL_ST_OPENED, 0);
     return CELL_OK;
 }
 
@@ -243,7 +255,7 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle)
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     sail_host_playback(_sp, 0);
-    sail_call(_sp, SAIL_CALL_CLOSE_STREAM, SAIL_ST_CLOSE_TRANSITION, SAIL_ST_CLOSED, 0);
+    sail_call_ex(_sp, SAIL_CALL_CLOSE_STREAM, SAIL_ST_CLOSE_TRANSITION, SAIL_ST_CLOSED, 0);
     return CELL_OK;
 }
 
@@ -256,12 +268,12 @@ s32 cellSailPlayerStart(CellSailPlayerHandle handle)
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_RUNNING;
     /* Immediately signal finished since we don't play anything */
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
-    sail_call(_sp, SAIL_CALL_START, SAIL_ST_START_TRANSITION, SAIL_ST_RUNNING, 0);
+    sail_call_ex(_sp, SAIL_CALL_START, SAIL_ST_START_TRANSITION, SAIL_ST_RUNNING, 0);
     /* Nothing decodes the stream, so it has already ended: a finished stream
      * drops the player back to OPENED, which is what a title waiting out a
      * movie (Midway's logo AVIs) watches for. */
-    sail_notify(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_STOP_TRANSITION, 0);
-    sail_notify(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_OPENED, 0);
+    sail_notify_ex(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_STOP_TRANSITION, 0);
+    sail_notify_ex(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_OPENED, 0);
     sail_host_playback(_sp, 1);
     return CELL_OK;
 }
@@ -274,7 +286,7 @@ s32 cellSailPlayerStop(CellSailPlayerHandle handle)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     sail_host_playback(_sp, 0);
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
-    sail_call(_sp, SAIL_CALL_STOP, SAIL_ST_STOP_TRANSITION, SAIL_ST_OPENED, 0);
+    sail_call_ex(_sp, SAIL_CALL_STOP, SAIL_ST_STOP_TRANSITION, SAIL_ST_OPENED, 0);
     return CELL_OK;
 }
 
@@ -576,7 +588,7 @@ s32 cellSailPlayerInitialize(u32 pSelf, s32 legacyMode, u32 pAllocator,
         s_sail_players[i].max_user = maxUser;
         s_sail_players[i].spurs_ea = pSpurs;
         s_sail_players[i].state = CELL_SAIL_PLAYER_STATE_INITIALIZED;
-        sail_notify(i, SAIL_EV_STATE_CHANGED, 0, 0); /* SDK INITIALIZED */
+        sail_notify_ex(i, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_INITIALIZED, 0);
         return CELL_OK;
     }
     return (s32)CELL_SAIL_ERROR_OUT_OF_MEMORY;

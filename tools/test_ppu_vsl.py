@@ -31,13 +31,14 @@ def main():
     src = """#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include "ppu_vmx.h"
 typedef struct { uint8_t vr[32][16]; uint32_t vscr; } Context;
 typedef struct { uint8_t a[16], b[16], expected[16]; } Case;
 """
     for dst in (1,2,3):
         insn = decode(0x100001C4 | (dst<<21) | (1<<16) | (2<<11),0x1000)
         assert insn.mnemonic=="vsl",insn
-        fn=PPULifter().lift_function([insn,SimpleNamespace(addr=0x1004,mnemonic="blr",operands="")],0x1000,0x1008)
+        fn=PPULifter().lift_function([insn,SimpleNamespace(raw=None, addr=0x1004,mnemonic="blr",operands="")],0x1000,0x1008)
         body="\n".join(line for line in fn.body_lines if "return" not in line)
         src+=f"static void run{dst}(Context* ctx) {{\n{body}\n}}\n"
     rows=["{"+",".join("{"+",".join(map(str,v))+"}" for v in row)+"}" for row in cases]
@@ -67,7 +68,7 @@ typedef struct { uint8_t a[16], b[16], expected[16]; } Case;
         c=Path(tmp)/"vsl.c"
         exe=Path(tmp)/("vsl.exe" if os.name=="nt" else "vsl")
         c.write_text(src)
-        subprocess.run([cc,"-std=c11","-O2",str(c),"-o",str(exe)],check=True)
+        subprocess.run([cc,"-std=c11","-O2","-I"+str(Path(__file__).resolve().parents[1]/"runtime/ppu"),str(c),"-o",str(exe)],check=True)
         subprocess.run([str(exe)],check=True)
 
 

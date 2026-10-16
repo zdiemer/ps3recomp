@@ -257,3 +257,9 @@ int main(void)
     puts("SPURS same workload/lane across instances retains separate LS and TLS exit classification PASS");
     free(vm_base);return 0;
 }
+
+/* No task images are registered in this policy-module scheduler fixture. */
+void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }
+void ydkj_wake_all_event_flags(void) {}
+uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+{ (void)ls; (void)a; (void)b; (void)c; (void)d; assert(!"unexpected task dispatch"); return 0; }

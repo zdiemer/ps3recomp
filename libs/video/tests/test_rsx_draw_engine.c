@@ -1027,7 +1027,7 @@ static u32 stub_color_snapshot(void* user, u32 surface)
 {
     (void)user;
     feedback_calls++; feedback_surface = surface;
-    if (!feedback_texture) feedback_texture = stub_handle();
+    feedback_texture = stub_handle();
     return feedback_texture;
 }
 
@@ -1038,24 +1038,32 @@ static void test_color_feedback(void)
     precise.color_snapshot = stub_color_snapshot;
     rsx_draw_engine_set_backend(&precise);
     feedback_calls = feedback_surface = feedback_texture = 0;
+    m(M_SURFACE_FORMAT, 0x148);
+    m(M_COLOR_A_PITCH, 1024);
     m(M_CONTEXT_DMA_COLOR_A, DMA_MAIN);
     m(M_COLOR_A_OFFSET, TEX_OFFSET);
     m(M_CLEAR_BUFFERS, 0xF0u);
     const u32 surface = stub.last_created_color;
     bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    m(M_TEX_UNIT + 0x18, (256u << 16) | 256u);
+    m(0x1840, 1024);
     m(M_TEX_UNIT + 0x20, TEX_OFFSET);
     m(M_TEX_UNIT + 0x24, 2u | (2u << 4) | (0xA5u << 8) | (1u << 16));
     m(M_TEX_UNIT + 0x2C, 0x80000000u);
     m(M_TEX_UNIT + 0x30, 0xAAE4u);
-    m(M_TEX_UNIT + 0x38, (4u << 16) | 4u);
+    m(M_TEX_UNIT + 0x38, (256u << 16) | 256u);
+    m(0x1844, 1024);
     draw_triangle();
     CHECK(feedback_calls == 1 && feedback_surface == surface &&
           stub.bound_tex[0] == feedback_texture && stub.bound_tex[1] == feedback_texture &&
           stub.n_texture_create == 0,
-          "units sampling their render target share one pre-draw snapshot, not stale guest bytes");
+          "feedback bindings: copies=%u source=%u expected=%u t0=%u t1=%u copy=%u uploads=%d",
+          feedback_calls, feedback_surface, surface, stub.bound_tex[0], stub.bound_tex[1], feedback_texture, stub.n_texture_create);
+    const u32 previous = feedback_texture;
     draw_triangle();
-    CHECK(feedback_calls == 2 && stub.bound_tex[0] == feedback_texture,
-          "the next feedback draw refreshes the reusable snapshot");
+    CHECK(feedback_calls == 2 && stub.bound_tex[0] == feedback_texture &&
+          feedback_texture != previous && !stub.alive[previous],
+          "the next feedback draw replaces and retires the previous snapshot");
     engine_down();
 }
 
@@ -1081,6 +1089,13 @@ static void test_color_clear_mask(void)
     m(M_SCISSOR_H, 0);
     m(M_CLEAR_BUFFERS, 0xF0u);
     CHECK(stub.n_clear_color == clears, "an explicitly empty clear scissor writes no pixels");
+    m(M_SURFACE_FORMAT, 8u | (4u << 12)); /* 2x2 sample grid */
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    m(M_CLEAR_BUFFERS, RSX_CLEAR_COLOR_A);
+    CHECK(stub.clear_channels == 8 && stub.clear_rect[0] == 32 &&
+          stub.clear_rect[1] == 16 && stub.clear_rect[2] == 128 && stub.clear_rect[3] == 64,
+          "masked clear scissor covers the physical AA sample grid");
     engine_down();
 }
 

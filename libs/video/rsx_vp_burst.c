@@ -63,4 +63,3 @@ int rsx_vp_burst_process_32(rsx_state *state, u32 subchannel, u32 method,
     }
     return 1;
 }
-

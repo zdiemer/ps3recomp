@@ -47,7 +47,7 @@ int main()try{
         mov(program+bytes,1,0,4,4,true);bytes+=16;
         char hlsl[32768];const u32 ctrl=(half?0u:0x40u)|exports;
         check(rsx_fp_decompile_shadow_ex(program,bytes,ctrl,0,0,buffered,hlsl,sizeof(hlsl),nullptr)>0,"depth decompile");
-        check((strstr(hlsl,"SV_DEPTH")!=nullptr)==(exports!=0),"depth declaration");
+        check((strstr(hlsl,"SV_Depth")!=nullptr)==(exports!=0),"depth declaration");
         if(alpha)check((buffered?rsx_fp_apply_alpha_test_buffered(hlsl,sizeof(hlsl),0x204):rsx_fp_apply_alpha_test(hlsl,sizeof(hlsl),0x204,.5f))==1,"alpha patch");
         auto pc=compile(hlsl,"ps_5_0");ComPtr<ID3D11PixelShader> pixel;checked(dev->CreatePixelShader(pc->GetBufferPointer(),pc->GetBufferSize(),nullptr,&pixel));ctx->PSSetShader(pixel.Get(),nullptr,0);
         ID3D11RenderTargetView* targets[]={rtv[0].Get(),rtv[1].Get()};ctx->OMSetRenderTargets(mrt?2:1,targets,dsv.Get());

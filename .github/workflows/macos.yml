@@ -313,9 +313,9 @@ jobs:
           # aliasing on a texture bind, the texture cache's revalidation and
           # eviction, the pipeline key's stability under constant changes, and
           # restart cuts bounding topology expansion. Runs on Linux too.
-          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_vp_burst.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_rsx_draw_engine
-          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_vp_burst.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
           /tmp/test_color_feedback_engine
           # The NV4097 method decoder on its own: the vertex-constant window is
           # 32 dwords and the registers after it are not constants.
@@ -378,7 +378,7 @@ jobs:
             -o /tmp/test_spu_lockline_peer \
             runtime/spu/tests/test_spu_lockline_peer.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c runtime/spu/spu_taskset_dispatch.c runtime/spu/spu_overlay_registry.c \
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
@@ -395,7 +395,7 @@ jobs:
             -o /tmp/test_spu_taskset_wake \
             runtime/spu/tests/test_spu_taskset_wake.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c runtime/spu/spu_taskset_dispatch.c runtime/spu/spu_overlay_registry.c \
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
@@ -419,7 +419,7 @@ jobs:
             runtime/spu/tests/test_spu_lifted_start.c \
             runtime/spu/spu_channels.c runtime/spu/spu_drain.c \
             runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c \
-            runtime/spu/spu_workload.c runtime/spu/spurs_policy.c \
+            runtime/spu/spu_workload.c runtime/spu/spu_taskset_dispatch.c runtime/spu/spu_overlay_registry.c runtime/spu/spurs_policy.c \
             runtime/spu/spurs_job.c runtime/spu/spu_tsp_weak.c \
             runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
             runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
@@ -442,7 +442,7 @@ jobs:
             -o /tmp/test_spu_mfc_slots \
             runtime/spu/tests/test_spu_mfc_slots.c \
             runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c runtime/spu/spu_taskset_dispatch.c runtime/spu/spu_overlay_registry.c \
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \

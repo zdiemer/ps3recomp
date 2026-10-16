@@ -52,4 +52,3 @@ extern "C" int ppu_native_memory_begin_write(uint32_t destination, uint32_t size
     }
     return 1;
 }
-

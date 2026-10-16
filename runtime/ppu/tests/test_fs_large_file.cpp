@@ -128,3 +128,6 @@ int main(int argc, char** argv)
     printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }
+
+/* File contents are not SPU images in this sparse-file fixture. */
+extern "C" void spu_overlay_bind_elf(uint32_t ea, const uint8_t* bytes, uint32_t size) { (void)ea; (void)bytes; (void)size; }

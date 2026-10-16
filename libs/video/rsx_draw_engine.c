@@ -2472,9 +2472,14 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
                 g.rsx.seen[M_SCISSOR_VERTICAL >> 2]) {
                 const u32 h = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
                 const u32 v = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
-                x = h & 0xFFFFu; y = v & 0xFFFFu;
-                if (x + (h >> 16) < right) right = x + (h >> 16);
-                if (y + (v >> 16) < bottom) bottom = y + (v >> 16);
+                rsx_dsp_surface sf;
+                rsx_dsp_get_surface(&g.rsx, &sf);
+                /* Guest scissor pixels cover every sample in the AA grid. */
+                x = (h & 0xFFFFu) * sf.aa_sx; y = (v & 0xFFFFu) * sf.aa_sy;
+                const u32 width = (h >> 16) * sf.aa_sx;
+                const u32 height = (v >> 16) * sf.aa_sy;
+                if (x + width < right) right = x + width;
+                if (y + height < bottom) bottom = y + height;
             }
             if (right > x && bottom > y)
                 g.be->clear_color_rect(g.be->user, surface->handle, rgba,

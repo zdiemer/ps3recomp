@@ -557,7 +557,7 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
     si->starting = 0;
     if (start_rc) __atomic_store_n(&si->ea, 0, __ATOMIC_RELEASE);
     ReleaseSRWLockExclusive(&si->lock);
-    if (start_rc) return start_rc;
+    if (start_rc) { spu_taskset_wake_unregister(spurs_ea); return start_rc; }
     printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
            si->prefix, spurs_ea, si->nspus);
     return CELL_OK;

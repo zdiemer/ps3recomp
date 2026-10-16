@@ -20,7 +20,7 @@ def body(dst):
     insn = decode(0x10000608 | (dst << 21) | (1 << 16) | (2 << 11), 0x1000)
     assert insn.mnemonic == "vsum4ubs", insn
     insns = [insn,
-             SimpleNamespace(addr=0x1004, mnemonic="blr", operands="")]
+             SimpleNamespace(raw=None, addr=0x1004, mnemonic="blr", operands="")]
     lifted = PPULifter().lift_function(insns, 0x1000, 0x1008)
     return "\n".join(line for line in lifted.body_lines if "return" not in line)
 
@@ -49,6 +49,7 @@ def main():
     src = """#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include "ppu_vmx.h"
 typedef struct { uint8_t vr[32][16]; uint32_t vscr; } Context;
 typedef struct { uint8_t a[16], b[16], expected[16]; uint32_t sat; } Case;
 """
@@ -78,7 +79,7 @@ typedef struct { uint8_t a[16], b[16], expected[16]; uint32_t sat; } Case;
         c = Path(tmp)/"sum.c"
         exe = Path(tmp)/("sum.exe" if os.name=="nt" else "sum")
         c.write_text(src)
-        subprocess.run([cc,"-std=c11","-O2",str(c),"-o",str(exe)],check=True)
+        subprocess.run([cc,"-std=c11","-O2","-I"+str(Path(__file__).resolve().parents[1]/"runtime/ppu"),str(c),"-o",str(exe)],check=True)
         subprocess.run([str(exe)],check=True)
 
 

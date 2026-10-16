@@ -1269,35 +1269,6 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
       } }
 }
 
-/* A successful PUTLLC/PUTLLUC committed the 128-byte guest line `line`.
- *
- * A task signalling another task does it on the SPU, as libspurs does: a
- * GETLLAR/PUTLLC loop that sets the target's bit in the taskset's signalled
- * bitset. That updates the guest bit the waiter checks but never touches
- * s_sig_cv, so the parked task only saw it when its 1 s timed wait ran out.
- * Twisted Metal's post-FX pipeline chains its six tasks this way several
- * times a frame and took 4 s or more per frame. Wake the waiters whenever a
- * line holding a parked taskset's signalled bitset is committed; a commit
- * that did not signal them only costs a spurious wake, which the wait loop
- * re-checks. */
-void spu_taskset_line_committed(uint32_t line)
-{
-    for (int i = 0; i < SPU_PARKED_MAX; i++) {
-        const uint64_t k = s_parked[i];
-        if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
-#ifdef _WIN32
-        AcquireSRWLockExclusive(&s_sig_lock);
-        WakeAllConditionVariable(&s_sig_cv);
-        ReleaseSRWLockExclusive(&s_sig_lock);
-#else
-        pthread_mutex_lock(&s_sig_lock);
-        pthread_cond_broadcast(&s_sig_cv);
-        pthread_mutex_unlock(&s_sig_lock);
-#endif
-        return;
-    }
-}
-
 /* WAIT_SIGNAL from the task side (runs ON the task's host thread, called by
  * the 0xA70 taskset-syscall intercept). Consumes a pending signal or blocks
  * until one is delivered. Returns 0 (the syscall's success rc). */

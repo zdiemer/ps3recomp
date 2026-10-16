@@ -1,4 +1,4 @@
-/* Compare FI against its pre-optimization implementation, including all
+/* Compare FI against an independent fixed-point oracle, including all
  * exponent/step fields, sign/base boundaries and host FP environment modes.
  * Define SPU_FI_BENCHMARK for a pinned local-cost comparison instead. */
 #include "spu_helpers.h"
@@ -13,17 +13,18 @@
 static __attribute__((noinline)) u128 reference_fi(u128 a, u128 b)
 {
     u128 r;
-    for (int i = 0; i < 4; i++) {
-        uint32_t rb = b._u32[i];
-        uint32_t ra = a._u32[i];
-        uint32_t exp = (rb >> 23) & 0xFFu;
-        uint32_t base_bits = rb & 0xFFFFFC00u;
-        float base; memcpy(&base, &base_bits, sizeof base);
-        uint32_t step_frac = rb & 0x3FFu;
-        float step = ldexpf((float)step_frac, (int)exp - 127 - 13);
-        if (base < 0.0f) step = -step;
-        float y = ldexpf((float)(ra & 0x7FFFFu), -19);
-        r._f32[i] = base - step * y;
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t estimate = b._u32[i];
+        int exponent = (estimate >> 23) & 255;
+        if (!exponent) { r._u32[i] = 0; continue; }
+        /* Independently evaluate (1.base - step * fraction) in Q32.
+         * FI truncates, flushes exponent-zero operands/results, and treats
+         * exponent 255 as extended range, regardless of the host FP mode. */
+        uint64_t magnitude = ((uint64_t)(8192 + ((estimate >> 10) & 8191)) << 19)
+                           - (uint64_t)(estimate & 1023) * (a._u32[i] & 524287);
+        while (magnitude < (1ull << 32)) { magnitude <<= 1; --exponent; }
+        r._u32[i] = exponent <= 0 ? 0 : (estimate & 0x80000000u)
+                    | ((uint32_t)exponent << 23) | ((uint32_t)(magnitude >> 9) & 0x7fffffu);
     }
     return r;
 }
