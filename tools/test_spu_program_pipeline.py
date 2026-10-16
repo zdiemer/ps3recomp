@@ -68,7 +68,7 @@ class Pipeline(unittest.TestCase):
         workload = (runtime / 'spu_workload.c').read_text()
         workload = workload[workload.index('uint64_t spu_workload_fingerprint('):
                             workload.index('/* ---- dispatch')]
-        (self.root / 'workload.c').write_text('#include "spu_workload.h"\n#include <stdio.h>\n#include <string.h>\n' + workload)
+        (self.root / 'workload.c').write_text('#include "spu_workload.h"\n#include "spu_fingerprint_cache.h"\n#include "spu_elf_loader.h"\n#include <stdio.h>\n#include <string.h>\n' + workload)
         channels = (runtime / 'spu_channels.c').read_text()
         channels = channels[channels.index('typedef void (*spu_fn)'):
                             channels.index('/* Which image registered')]
@@ -237,7 +237,7 @@ class Pipeline(unittest.TestCase):
                     'assert(ctx.gpr[3]._u32[0] == 7); return 0; }\n')
                 (self.root / 'overlap_control.c').write_text(control)
                 binary = self.root / ('overlap_control.exe' if sys.platform == 'win32' else 'overlap_control')
-                compiled = subprocess.run([cc, '-std=c11', '-I' + str(runtime),
+                compiled = subprocess.run([cc, '-std=gnu17', '-pthread', '-I' + str(runtime),
                                 str(self.root / 'overlap_control.c'), str(self.root / 'workload.c'),
                                 str(self.root / 'registry.c'), str(output / 'registry.c'),
                                 str(output / 'sample' / 'spu_recomp.c'), '-o', str(binary)],
