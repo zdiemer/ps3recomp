@@ -114,8 +114,8 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
-#if defined(YZ_PERF_PROFILE)
 #include "rsx_profile_buffer.h"
+#if defined(YZ_PERF_PROFILE)
 static rsx_profile_buffer g_ld_profile_csv, g_ld_geometry_csv, g_ld_texture_misses_csv;
 static rsx_profile_buffer g_ld_texture_content_csv;
 static void ld_profile_buffers_dump(void)
@@ -366,6 +366,14 @@ extern volatile unsigned long long g_yz_auto_start_tick;
  * must stay <= 2048, else CreateDescriptorHeap fails. Identical sampler
  * tables share entries, so this is 128 unique tables between GPU flushes. */
 #define SMP_RING_TABLES  128
+/* Bounded storage, not more descriptors in one hardware heap. A one-page
+ * diagnostic build retains synchronous rollover for matched comparisons. */
+#ifndef LD_SAMPLER_HEAP_PAGES
+#define LD_SAMPLER_HEAP_PAGES 4
+#endif
+#if LD_SAMPLER_HEAP_PAGES < 1 || LD_SAMPLER_HEAP_PAGES > 4
+#error LD_SAMPLER_HEAP_PAGES must be between one and four
+#endif
 
 #define CB_BLOCK_BYTES   ((512 + 2) * 16)
 #define CB_BLOCK_ALIGNED ((CB_BLOCK_BYTES + 255) & ~255u)
@@ -544,6 +552,9 @@ typedef struct {
 
     ID3D12DescriptorHeap*      smp_cpu_heap;
     ID3D12DescriptorHeap*      smp_heap;
+    ID3D12DescriptorHeap*      smp_pages[LD_SAMPLER_HEAP_PAGES];
+    u32                        smp_page, smp_page_count;
+    int                        smp_upload_reclaim_pending;
     u32                        smp_step, smp_ring_used;
     u32                        smp_ring_slots[SMP_RING_TABLES][SMP_TABLE_SIZE];
     u64                        smp_keys[SMP_CACHE_SLOTS];
@@ -1701,6 +1712,8 @@ typedef enum {
     LD_FLUSH_PIXEL_CONSTANT_RING,
     LD_FLUSH_DESCRIPTOR_RING,
     LD_FLUSH_SHUTDOWN,
+    LD_FLUSH_SAMPLER_PAGE_BUDGET,
+    LD_FLUSH_SAMPLER_UPLOAD,
     LD_FLUSH_REASON_COUNT
 } ld_flush_reason;
 
@@ -2491,6 +2504,77 @@ static u32 sampler_slot(const rsx_dsp_texture* t, u64 key)
     g.smp_keys[g.n_samplers++] = key;
     return slot;
 }
+static struct {
+    u64 advances, sampler_exhaustions, srv_exhaustions;
+    u64 budget_flushes, upload_flushes, completions;
+} g_ld_sampler_pages;
+static rsx_profile_buffer g_ld_sampler_pages_csv;
+static int g_ld_sampler_pages_csv_initialized;
+static int g_ld_sampler_pages_dumped;
+static void ld_sampler_pages_record(u32 frame)
+{
+    if (!g_ld_sampler_pages_csv_initialized) {
+        g_ld_sampler_pages_csv_initialized = 1;
+        const char* path = getenv("RSX_SAMPLER_PAGES_CSV");
+        if (path && *path && !rsx_profile_buffer_init(&g_ld_sampler_pages_csv, path,
+                "frame,qpc,qpc_frequency,pages,advances,sampler_exhaustions,srv_exhaustions,budget_flushes,upload_flushes,completions\n",
+                32768, 240))
+            fprintf(stderr, "[sampler-pages] diagnostic allocation failed\n");
+    }
+    if (g_ld_sampler_pages_csv.rows) {
+        LARGE_INTEGER qpc, frequency;
+        QueryPerformanceCounter(&qpc);
+        QueryPerformanceFrequency(&frequency);
+        rsx_profile_buffer_printf(&g_ld_sampler_pages_csv,
+            "%u,%lld,%lld,%u,%llu,%llu,%llu,%llu,%llu,%llu\n",
+            frame, qpc.QuadPart, frequency.QuadPart, g.smp_page_count,
+            g_ld_sampler_pages.advances, g_ld_sampler_pages.sampler_exhaustions,
+            g_ld_sampler_pages.srv_exhaustions, g_ld_sampler_pages.budget_flushes,
+            g_ld_sampler_pages.upload_flushes, g_ld_sampler_pages.completions);
+    }
+}
+static void ld_sampler_pages_dump(void)
+{
+    if (g_ld_sampler_pages_dumped) return;
+    g_ld_sampler_pages_dumped = 1;
+    if (g_ld_sampler_pages_csv.rows) {
+        const int saved = rsx_profile_buffer_dump(&g_ld_sampler_pages_csv);
+        fprintf(stderr, "[sampler-pages] saved=%d rows=%llu rejected=%llu capacity=%zu\n",
+            saved, g_ld_sampler_pages_csv.recorded, g_ld_sampler_pages_csv.rejected,
+            g_ld_sampler_pages_csv.capacity);
+        rsx_profile_buffer_destroy(&g_ld_sampler_pages_csv);
+    }
+    fprintf(stderr, "[sampler-pages] pages=%u advances=%llu sampler_exhaustions=%llu srv_exhaustions=%llu budget_flushes=%llu upload_flushes=%llu completions=%llu\n",
+        g.smp_page_count, g_ld_sampler_pages.advances,
+        g_ld_sampler_pages.sampler_exhaustions, g_ld_sampler_pages.srv_exhaustions,
+        g_ld_sampler_pages.budget_flushes, g_ld_sampler_pages.upload_flushes,
+        g_ld_sampler_pages.completions);
+}
+/* Only the successful GPU-completion path can make prior pages writable.
+ * The current-page host cache is not GPU memory and may be discarded on
+ * advance. Descriptor contents on every earlier page remain untouched. */
+static void ld_sampler_pages_reset(void)
+{
+    g.smp_page = 0;
+    g.smp_heap = g.smp_pages[0];
+    g.smp_ring_used = 0;
+    g.smp_upload_reclaim_pending = 0;
+}
+static void ld_sampler_pages_completed(void)
+{
+    ld_sampler_pages_reset();
+    ++g_ld_sampler_pages.completions;
+}
+static int ld_sampler_pages_advance(void)
+{
+    if (g.smp_page + 1 >= g.smp_page_count) return 0;
+    g.smp_heap = g.smp_pages[++g.smp_page];
+    g.smp_ring_used = 0;
+    g.smp_upload_reclaim_pending = 1;
+    ++g_ld_sampler_pages.advances;
+    return 1;
+}
+
 static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE])
 {
     for (u32 i = 0; i < g.smp_ring_used; i++) {
@@ -2758,6 +2842,7 @@ static void ld_slow_flush_dump(void)
 /* BEGIN RSX SLOW FLUSH WRAPPER */
 static void ld_flush(ld_flush_reason reason)
 {
+    if (!g.ready) return;
     ld_slow_flush_scope slow_flush;
     ld_slow_flush_begin(&slow_flush, reason);
 #if defined(YZ_PERF_PROFILE)
@@ -2847,6 +2932,16 @@ static void ld_flush(ld_flush_reason reason)
         slow_flush.event.stage_mask |= 1u << LD_SLOW_FLUSH_COMPLETED_VALUE;
         slow_flush.event.completed_value = completed_value;
     }
+    /* UINT64_MAX reports device removal, not completion. Never recycle GPU
+     * storage on a failed fence, event wait, or command allocator reset. */
+    if (completed_value == UINT64_MAX) {
+        g.ready = 0;
+        ld_dump_dred("GetCompletedValue", DXGI_ERROR_DEVICE_REMOVED);
+        if (slow_flush.active)
+            slow_flush.event.failed_stage = LD_SLOW_FLUSH_COMPLETED_VALUE + 1;
+        ld_slow_flush_finish(&slow_flush);
+        return;
+    }
     if (completed_value < v) {
 #if defined(YZ_PERF_PROFILE)
         const LONGLONG wait_begin = ld_profile_qpc();
@@ -2892,6 +2987,16 @@ static void ld_flush(ld_flush_reason reason)
         g_ld_profile.total.fence_wait_qpc += wait_ticks;
         g_ld_profile.total.fence_reason_qpc[reason] += wait_ticks;
 #endif
+        const u64 after_wait = g.fence->lpVtbl->GetCompletedValue(g.fence);
+        if (wait_result != WAIT_OBJECT_0 || after_wait == UINT64_MAX || after_wait < v) {
+            fprintf(stderr, "[d3d-fail] fence wait result=%lu error=%lu completed=%llu expected=%llu\n",
+                (unsigned long)wait_result, (unsigned long)wait_error, after_wait, v);
+            g.ready = 0;
+            if (slow_flush.active)
+                slow_flush.event.failed_stage = LD_SLOW_FLUSH_WAIT + 1;
+            ld_slow_flush_finish(&slow_flush);
+            return;
+        }
     }
     stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
     ld_drain_info_queue("flush");
@@ -2929,6 +3034,12 @@ static void ld_flush(ld_flush_reason reason)
         if (FAILED(alloc_reset_hr) && !slow_flush.event.failed_stage)
             slow_flush.event.failed_stage = LD_SLOW_FLUSH_ALLOC_RESET + 1;
     }
+    if (FAILED(alloc_reset_hr)) {
+        g.ready = 0;
+        ld_dump_dred("CommandAllocator::Reset", alloc_reset_hr);
+        ld_slow_flush_finish(&slow_flush);
+        return;
+    }
     stage_begin = slow_flush.active ? ld_slow_flush_qpc() : 0;
     const HRESULT list_reset_hr = g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
     if (slow_flush.active) {
@@ -2939,11 +3050,18 @@ static void ld_flush(ld_flush_reason reason)
         if (FAILED(list_reset_hr) && !slow_flush.event.failed_stage)
             slow_flush.event.failed_stage = LD_SLOW_FLUSH_LIST_RESET + 1;
     }
+    if (FAILED(list_reset_hr)) {
+        g.ready = 0;
+        ld_dump_dred("CommandList::Reset", list_reset_hr);
+        ld_slow_flush_finish(&slow_flush);
+        return;
+    }
 #if defined(YZ_PERF_PROFILE)
     g_ld_gpu_armed = g_ld_gpu_results && g_ld_gpu_frequency;
     if (g_ld_gpu_armed)
         g.list->lpVtbl->EndQuery(g.list,g_ld_gpu_queries,D3D12_QUERY_TYPE_TIMESTAMP,0);
 #endif
+    ld_sampler_pages_completed();
     g.upload_used = 0;
 #if defined(YZ_PERF_PROFILE)
     const u64 flush_ticks = (u64)(ld_profile_qpc() - flush_begin);
@@ -3012,9 +3130,10 @@ void rsx_live_draw_flush(void)
 
 static void retire_texture(ID3D12Resource* tex)
 {
-    if (!tex) return;
+    if (!tex || !g.ready) return;
     if (g.n_retired_textures >= MAX_RETIRED_TEXTURES)
         ld_flush(LD_FLUSH_RETIRE_QUEUE);
+    if (!g.ready) return; /* Retain on terminal GPU failure; never overflow. */
     g.retired_textures[g.n_retired_textures++] = tex;
     ld_profile_note_ring_highwater();
 }
@@ -3124,10 +3243,23 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
 
 typedef struct { u32 w, h; const u8* data; u32 row_bytes, rows; } tex_level_t;
 
+/* The old sampler rollover also reclaimed the texture upload arena. Preserve
+ * that opportunity before the first subsequent texture allocation, rather
+ * than discovering an exhausted arena after recording partial cube copies.
+ * Warm resident draws keep recording without a submit/wait. */
+static int ld_sampler_pages_before_upload(void)
+{
+    if (!g.smp_upload_reclaim_pending) return 1;
+    ++g_ld_sampler_pages.upload_flushes;
+    ld_flush(LD_FLUSH_SAMPLER_UPLOAD);
+    return g.ready;
+}
+
 static ID3D12Resource* create_texture_mipped_scoped(DXGI_FORMAT fmt,
     const tex_level_t* lv, u32 n, ld_slow_texture_detail* slow_detail)
 {
     if (n == 0 || n > 14) return NULL;
+    if (!ld_sampler_pages_before_upload()) return NULL;
     /* Reject incomplete uploads before creating a resource or recording copy
      * commands. Cached entries must represent every requested mip. */
     if (g.upload_used > UPLOAD_SIZE) return NULL;
@@ -3286,6 +3418,7 @@ static ID3D12Resource* create_texture_cube(
     ld_slow_texture_detail* slow_detail)
 {
     if (!n_mips) return NULL;
+    if (!ld_sampler_pages_before_upload()) return NULL;
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -4360,6 +4493,7 @@ static u32 texture_srv_slot_scoped(const rsx_dsp_texture* t,
                     retire_texture(old);
                     ld_slow_texture_phase_end(slow_scope, slow_detail,
                         slow_detail ? &slow_detail->retire_ticks : NULL, phase_begin);
+                    if (!g.ready) return SRV_WHITE;
                     ++g_ld_texture_refresh_count;
                     if (g_ld_texture_refresh_count <= 64 ||
                         (g_ld_texture_refresh_count & 255) == 0)
@@ -4456,6 +4590,7 @@ static u32 texture_srv_slot_scoped(const rsx_dsp_texture* t,
         retire_texture(evicted);
         ld_slow_texture_phase_end(slow_scope, slow_detail,
             slow_detail ? &slow_detail->retire_ticks : NULL, phase_begin);
+        if (!g.ready) return SRV_WHITE;
     }
     *entry = replacement;
     texture_cache_link(index, bucket);
@@ -4661,6 +4796,7 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
                     e->content_hash = replacement_hash;
                     write_vertex_texture_srv(i, e->tex);
                     retire_texture(old);
+                    if (!g.ready) return SRV_WHITE;
                     g_ld_vtex_refreshes++;
                 }
             }
@@ -4795,8 +4931,10 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      * just like dynamic texture and zeta replacements. */
     if (s->tex)
         retire_texture(s->tex);
+    if (!g.ready) return LD_INVALID_SURFACE;
     if (s->fb_tex) {                 /* sized for the old resource */
         retire_texture(s->fb_tex);
+        if (!g.ready) return LD_INVALID_SURFACE;
         s->fb_tex = NULL;
     }
     s->tex = replacement;
@@ -5267,10 +5405,12 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
              * lifetimes for the application, so release it only after the
              * next submit/fence completes. */
             retire_texture(old->tex);
+            if (!g.ready) return 0;
             old->tex = NULL;
         }
         if (old->snapshot) {
             retire_texture(old->snapshot);
+            if (!g.ready) return 0;
             old->snapshot = NULL;
         }
     }
@@ -5476,7 +5616,11 @@ static int zdepth_pack(u32 index, u32 guest_w, u32 guest_h)
     rsx_render_surface_extent(&g_ld_resolution, guest_w, guest_h, &w, &h);
     if (w > 16384 || h > 16384 || g.srv_ring_used >= SRV_RING_TABLES) return 0;
     if (!z->packed || z->packed_w != w || z->packed_h != h) {
-        if (z->packed) { retire_texture(z->packed); z->packed = NULL; }
+        if (z->packed) {
+            retire_texture(z->packed);
+            if (!g.ready) return 0;
+            z->packed = NULL;
+        }
         D3D12_RESOURCE_DESC rd = {0};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         rd.Width = w; rd.Height = h; rd.DepthOrArraySize = rd.MipLevels = 1;
@@ -9367,12 +9511,14 @@ static void ld_movie_overlay_begin(void)
 
     ld_flush(LD_FLUSH_MOVIE);
     const float transparent[4] = {0, 0, 0, 0};
+    if (!g.ready) return;
     for (u32 i = 0; i < g.n_surfaces; i++) {
         g.list->lpVtbl->ClearRenderTargetView(
             g.list, rtv_handle(LD_SWAP_BUFFERS + i), transparent, 0, NULL);
         ld_surface_note_write(i, LD_SURFACE_WRITE_OTHER);
     }
     if (g.n_surfaces) ld_flush(LD_FLUSH_MOVIE);
+    if (!g.ready) return;
     ld_movie_reset_rings();
     fprintf(stderr, "[movie-ui] compositor armed (%ux%u, %u guest surfaces)\n",
             g_ld_resolution.host_w, g_ld_resolution.host_h, g.n_surfaces);
@@ -9419,6 +9565,7 @@ static void ld_movie_capture_overlay(void)
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
     ld_flush(LD_FLUSH_MOVIE);
 
+    if (!g.ready) return;
     const SIZE_T rb_size = (SIZE_T)g.movie_overlay_pitch * g_ld_resolution.host_h;
     u8* mapped = NULL;
     D3D12_RANGE rr = {0, rb_size};
@@ -10428,6 +10575,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
          * safe to submit/wait and reuse every transient draw ring here.
          */
         ld_flush(LD_FLUSH_VERTEX_RING);
+        if (!g.ready) return;
         g.vb_used = 0;
         g.ib_used = 0;
         g.cb_used = 0;
@@ -10816,6 +10964,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
           }
       } }
     for (u32 u = 0; u < SRV_TABLE_SIZE; u++) {
+        if (!g.ready) return;
         rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
         /* LD_PS1_BUF0=1 -- DIAGNOSTIC, not a fix. Force a 24-bit PS1 VRAM
          * bind at buffer 1 (offset 0x4003C0) to sample buffer 0 (0x400000).
@@ -11164,6 +11313,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
      * command list; doing that after SetPipelineState/root bindings silently
      * loses those bindings on the replacement list. */
     for (u32 u = 0; u < RSX_DSP_NUM_VERTEX_TEXTURES; u++) {
+        if (!g.ready) return;
         if (!((vtex_mask >> u) & 1u)) continue;
         rsx_dsp_vertex_texture vt;
         rsx_dsp_get_vertex_texture(&g.rsx, u, &vt);
@@ -11181,14 +11331,19 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
         else
             g_ld_vtex_unsupported++;
     }
+    if (!g.ready) return;
     const u32 required_srv_tables = 1u + (vtex_mask != 0);
-    if (g.srv_ring_used + required_srv_tables > SRV_RING_TABLES ||
-        sampler_table_needs_flush(smp_slots)) {
+    const int srv_full = g.srv_ring_used + required_srv_tables > SRV_RING_TABLES;
+    const int sampler_full = sampler_table_needs_flush(smp_slots);
+    if (srv_full) ++g_ld_sampler_pages.srv_exhaustions;
+    if (sampler_full) ++g_ld_sampler_pages.sampler_exhaustions;
+    if (srv_full || (sampler_full && !ld_sampler_pages_advance())) {
         /* Every descriptor referenced by the old command list is consumed
          * before recycling its shader-visible heap entries. Texture upload
          * commands recorded while resolving slots are also completed here;
          * no render-state command for this draw has been recorded yet. */
-        ld_flush(LD_FLUSH_DESCRIPTOR_RING);
+        if (!srv_full) ++g_ld_sampler_pages.budget_flushes;
+        ld_flush(srv_full ? LD_FLUSH_DESCRIPTOR_RING : LD_FLUSH_SAMPLER_PAGE_BUDGET);
         if (!g.ready) return;
         g.srv_ring_used = 0;
         g.smp_ring_used = 0;
@@ -11798,6 +11953,10 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
 {
     if (!rsx_live_draw_enabled()) return 0;
     if (g.ready) return 0;
+    memset(&g_ld_sampler_pages, 0, sizeof(g_ld_sampler_pages));
+    rsx_profile_buffer_destroy(&g_ld_sampler_pages_csv);
+    g_ld_sampler_pages_csv_initialized = 0;
+    g_ld_sampler_pages_dumped = 0;
     free(g_shader_bundle_bytes);
     g_shader_bundle_bytes = NULL;
     memset(&g_shader_bundle, 0, sizeof(g_shader_bundle));
@@ -12093,7 +12252,15 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &shd, &IID_ID3D12DescriptorHeap, (void**)&g.smp_cpu_heap);
     shd.NumDescriptors = SMP_RING_TABLES * SMP_TABLE_SIZE;
     shd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &shd, &IID_ID3D12DescriptorHeap, (void**)&g.smp_heap);
+    g.smp_page = g.smp_page_count = 0;
+    g.smp_upload_reclaim_pending = 0;
+    for (u32 page = 0; page < LD_SAMPLER_HEAP_PAGES; ++page) {
+        if (FAILED(g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &shd,
+                &IID_ID3D12DescriptorHeap, (void**)&g.smp_pages[page])))
+            break;
+        ++g.smp_page_count;
+    }
+    g.smp_heap = g.smp_pages[0];
     g.smp_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
     /* Fail init (fall back to null present) rather than crash later if any
      * shader-visible/CPU descriptor heap didn't create -- e.g. an over-limit
@@ -12322,6 +12489,7 @@ void rsx_live_draw_set_movie_mode(int on)
             /* Do not expose a partially rendered auth/fade surface between
              * the last host movie frame and the next clean guest scene. */
             ld_flush(LD_FLUSH_MOVIE);
+            if (!g.ready) goto movie_mode_done;
             const float black[4] = {0, 0, 0, 1};
             for (u32 i = 0; i < g.n_surfaces; i++) {
                 g.list->lpVtbl->ClearRenderTargetView(
@@ -12329,6 +12497,7 @@ void rsx_live_draw_set_movie_mode(int on)
                 ld_surface_note_write(i, LD_SURFACE_WRITE_OTHER);
             }
             if (g.n_surfaces) ld_flush(LD_FLUSH_MOVIE);
+            if (!g.ready) goto movie_mode_done;
             ld_movie_reset_rings();
             InterlockedExchange((volatile LONG*)&g_ld_movie_mode, 0);
             fprintf(stderr, "[movie-ui] compositor disarmed after %llu guest overlays\n",
@@ -12351,6 +12520,7 @@ void rsx_live_draw_set_movie_mode(int on)
 #endif
     }
     ld_vertex_diag_emit(on ? "movie-begin" : "movie-end", 0);
+movie_mode_done:
     if (serialized) {
         ReleaseSRWLockExclusive(&g_ld_access_lock);
         InterlockedExchange(&g_ld_host_waiting, 0);
@@ -12459,6 +12629,7 @@ static void ld_report_counters(void);
 
 void rsx_live_draw_dump_present_samples(void)
 {
+    ld_sampler_pages_dump();
     /* Normal exit only: never add periodic logging to the draw path. Totals
      * include menus/loading and are not a timed-gameplay hit-rate claim. */
     const rsx_fp_program_cache_stats fp_stats =
@@ -12590,6 +12761,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
 
     ld_flush(LD_FLUSH_MOVIE_PRESENT);
+    if (!g.ready) goto movie_present_done;
     {
         g_ld_frame_limit_wait_ticks += rsx_frame_limiter_wait(&g_ld_frame_limiter);
         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap,
@@ -12604,6 +12776,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
             g.ready = 0;
         }
     }
+movie_present_done:
     if (serialized) {
         ReleaseSRWLockExclusive(&g_ld_access_lock);
         InterlockedExchange(&g_ld_host_waiting, 0);
@@ -12642,6 +12815,7 @@ static FILE* g_ld_record_to;
 
 static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
 {
+    if (!g.ready) return UINT64_MAX;
     ID3D12Resource* rt = surface ? surface->tex : NULL;
     if (!rt) return UINT64_MAX;
     const u32 width = surface->w;
@@ -12686,6 +12860,9 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
 
     ld_flush(LD_FLUSH_READBACK);                   /* copy completes on the GPU */
+    /* On terminal failure rb may still be referenced by the GPU. Leave it
+     * alive for process teardown instead of reading/releasing it early. */
+    if (!g.ready) return UINT64_MAX;
 
     u64 nonblack = UINT64_MAX;
     u64 fingerprint = 1469598103934665603ull;
@@ -13251,6 +13428,7 @@ void rsx_live_draw_present(u32 buffer_id)
           g_ld_record_to = NULL;
           fflush(rec);
       } }
+    if (!g.ready) return;
     const u32 current = current_surface();
     surface_t* presented_surface = &g.surfaces[target];
     /* LD_PRESENT_DBG=1: is this surface actually finished? A surface whose last
@@ -13344,12 +13522,15 @@ void rsx_live_draw_present(u32 buffer_id)
     g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
 
     ld_flush(LD_FLUSH_PRESENT);
+    if (!g.ready) return;
     {
         g_ld_frame_limit_wait_ticks += rsx_frame_limiter_wait(&g_ld_frame_limiter);
         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap,
             ld_present_sync_interval(), 0);
-        if (SUCCEEDED(present_hr))
+        if (SUCCEEDED(present_hr)) {
             ld_present_measure_record(g_ld_frames + 1u);
+            ld_sampler_pages_record(g_ld_frames + 1u);
+        }
         else {
             fprintf(stderr,
                     "[d3d-fail] Present hr=0x%08lX frame=%u "
@@ -14177,6 +14358,7 @@ void rsx_live_draw_present(u32 buffer_id)
 
 void rsx_live_draw_shutdown(void)
 {
+    ld_sampler_pages_dump();
     rsx_live_draw_finish_pipeline_recipes(2000);
     rsx_fp_program_cache_destroy(g_ld_fp_program_cache);
     g_ld_fp_program_cache = NULL;
@@ -14223,6 +14405,9 @@ void rsx_live_draw_shutdown(void)
     /* let the GPU drain, then release. (Best-effort; process teardown also
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
+    if (!g.ready) {
+        return;
+    }
     rsx_live_draw_dump_shader_cache();
     ld_texture_content_summary();
     ld_texture_content_clear();
@@ -14484,6 +14669,8 @@ void rsx_live_draw_shutdown(void)
     g_ld_gpu_frequency=0; g_ld_gpu_armed=0;
 #endif
     if (g_ld_bias_list) { g_ld_bias_list->lpVtbl->Release(g_ld_bias_list); g_ld_bias_list=NULL; }
+    for (u32 page = 0; page < g.smp_page_count; ++page)
+        g.smp_pages[page]->lpVtbl->Release(g.smp_pages[page]);
     if (g.dev) g.dev->lpVtbl->Release(g.dev);
     memset(&g, 0, sizeof(g));
     free(dc.arr); dc.arr = NULL; dc.n_arr = dc.cap_arr = 0;

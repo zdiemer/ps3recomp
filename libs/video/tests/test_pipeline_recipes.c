@@ -10,6 +10,7 @@
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <d3d12sdklayers.h>
+#include <winioctl.h>
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -188,6 +189,15 @@ static void corrupt_second_record(const wchar_t* source,const wchar_t* output) {
     b[at+16u+(second/2u)]^=0x5Au;write_u32(b+at+4u,crc32_test(b+at+16u,second));
     write_u32(b+32u,crc32_test(b+40u,n-40u));write_file(output,b,n);free(b);
 }
+static int write_oversized_sparse(const wchar_t* path) {
+    HANDLE f=CreateFileW(path,GENERIC_READ|GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_TEMPORARY,NULL);
+    if(f==INVALID_HANDLE_VALUE)return 0;
+    DWORD returned=0;
+    if(!DeviceIoControl(f,FSCTL_SET_SPARSE,NULL,0,NULL,0,&returned,NULL)){CloseHandle(f);DeleteFileW(path);return 0;}
+    LARGE_INTEGER end;end.QuadPart=(LONGLONG)RSX_PIPELINE_RECIPES_MAX_ARCHIVE_BYTES+1;
+    if(!SetFilePointerEx(f,end,NULL,FILE_BEGIN)||!SetEndOfFile(f)){CloseHandle(f);DeleteFileW(path);return 0;}
+    CloseHandle(f);return 1;
+}
 
 static void rejected_load(counting_device* proxy,ID3D12RootSignature* root,
     const void* root_bytes,size_t root_size,const wchar_t* path,const char* label) {
@@ -195,6 +205,45 @@ static void rejected_load(counting_device* proxy,ID3D12RootSignature* root,
     unsigned before=proxy->creates;rsx_pipeline_recipes_stats stats={0};
     assert(!rsx_pipeline_recipes_load(cache,&stats));assert(proxy->creates==before);
     rsx_pipeline_recipes_destroy(cache);printf("rejected archive %s before driver create\n",label);
+}
+
+static void test_large_archive(test_gpu* g,counting_device* proxy,ID3D12RootSignature* root,
+    const void* root_bytes,size_t root_size,ID3DBlob* pixel_shader) {
+    const uint32_t recipe_count=12;
+    const size_t private_size=1750u*1024u;
+    const char* source="float4 main(float2 p:POSITION):SV_Position { return float4(p,0,1); }\n";
+    ID3DBlob* small_vs=compile_shader(source,"vs_5_0");
+    uint8_t* private_data=(uint8_t*)malloc(private_size);assert(private_data);
+    memset(private_data,0xA5,private_size);
+    ID3DBlob* large_vs=NULL;
+    HRESULT pad_hr=D3DSetBlobPart(small_vs->lpVtbl->GetBufferPointer(small_vs),
+        small_vs->lpVtbl->GetBufferSize(small_vs),D3D_BLOB_PRIVATE_DATA,0,
+        private_data,private_size,&large_vs);
+    if(FAILED(pad_hr))fprintf(stderr,"D3DSetBlobPart private-data padding failed: 0x%08lX\n",(unsigned long)pad_hr);
+    OK(pad_hr);free(private_data);RELEASE(small_vs);
+    size_t vs_size=large_vs->lpVtbl->GetBufferSize(large_vs);
+    assert(vs_size>private_size&&vs_size<4u*1024u*1024u);
+    D3D12_INPUT_ELEMENT_DESC input={0};char semantic[]="POSITION";input.SemanticName=semantic;input.Format=DXGI_FORMAT_R32G32_FLOAT;
+    input.InputSlotClass=D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC base=make_desc(root,large_vs->lpVtbl->GetBufferPointer(large_vs),vs_size,
+        pixel_shader->lpVtbl->GetBufferPointer(pixel_shader),pixel_shader->lpVtbl->GetBufferSize(pixel_shader),&input);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC* descs=(D3D12_GRAPHICS_PIPELINE_STATE_DESC*)calloc(recipe_count,sizeof(*descs));assert(descs);
+    wchar_t* path=archive_path();DeleteFileW(path);
+    rsx_pipeline_recipes* cache=rsx_pipeline_recipes_create(&proxy->iface,root,root_bytes,root_size,path);assert(cache);
+    for(uint32_t i=0;i<recipe_count;i++){
+        descs[i]=base;descs[i].SampleMask=UINT_MAX-i*0x01010101u;
+        ID3D12PipelineState* pso=create_pso(&proxy->iface,&descs[i]);assert(rsx_pipeline_recipes_remember(cache,&descs[i],pso));RELEASE(pso);
+    }
+    assert(rsx_pipeline_recipes_save_atomic(cache));rsx_pipeline_recipes_destroy(cache);
+    HANDLE file=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+    assert(file!=INVALID_HANDLE_VALUE);LARGE_INTEGER archive_size;assert(GetFileSizeEx(file,&archive_size));CloseHandle(file);
+    assert(archive_size.QuadPart>20ll*1024ll*1024ll&&archive_size.QuadPart<256ll*1024ll*1024ll);
+    cache=rsx_pipeline_recipes_create(&proxy->iface,root,root_bytes,root_size,path);assert(cache);
+    unsigned before=proxy->creates;rsx_pipeline_recipes_stats stats={0};assert(rsx_pipeline_recipes_load(cache,&stats));
+    assert(proxy->creates==before+recipe_count&&stats.loaded==recipe_count&&stats.prewarmed==recipe_count&&stats.prewarm_failed==0);
+    for(uint32_t i=0;i<recipe_count;i++){before=proxy->creates;ID3D12PipelineState* found=rsx_pipeline_recipes_find(cache,&descs[i]);assert(found&&proxy->creates==before);if(i==0)render_and_check(g,found,root,0);RELEASE(found);}
+    printf("large aggregate archive roundtrip passed: recipes=%u bytes=%lld padded_stage=%zu\n",recipe_count,archive_size.QuadPart,vs_size);
+    rsx_pipeline_recipes_destroy(cache);free(descs);DeleteFileW(path);free(path);RELEASE(large_vs);
 }
 
 int main(void) {
@@ -257,11 +306,15 @@ int main(void) {
     uint8_t* version=(uint8_t*)malloc(archive_n);assert(version);memcpy(version,archive,archive_n);write_u32(version+8,99);write_file(copy,version,archive_n);
     rejected_load(&proxy,root,root_blob->lpVtbl->GetBufferPointer(root_blob),root_n,copy,"version");
     corrupt_second_record(path,copy);rejected_load(&proxy,root,root_blob->lpVtbl->GetBufferPointer(root_blob),root_n,copy,"second-record checksum");
+    if(write_oversized_sparse(copy)){rejected_load(&proxy,root,root_blob->lpVtbl->GetBufferPointer(root_blob),root_n,copy,"oversized sparse archive");}
+    else puts("oversized sparse-file test unavailable");
     ID3DBlob* bad_root_blob=NULL;ID3D12RootSignature* bad_root=make_root(g.device,1,&bad_root_blob);
     rsx_pipeline_recipes* root_mismatch=rsx_pipeline_recipes_create(&proxy.iface,bad_root,bad_root_blob->lpVtbl->GetBufferPointer(bad_root_blob),
         bad_root_blob->lpVtbl->GetBufferSize(bad_root_blob),path);assert(root_mismatch);before=proxy.creates;
     assert(!rsx_pipeline_recipes_load(root_mismatch,NULL)&&proxy.creates==before);rsx_pipeline_recipes_destroy(root_mismatch);
     puts("root signature mismatch rejected before driver creation");
+
+    test_large_archive(&g,&proxy,root,root_blob->lpVtbl->GetBufferPointer(root_blob),root_n,ps_blob);
 
     free(archive);free(version);free(copy);free(clean_vs);free(clean_ps);DeleteFileW(path);free(path);
     RELEASE(vs_blob);RELEASE(ps_blob);RELEASE(bad_root);RELEASE(bad_root_blob);RELEASE(root);RELEASE(other_root);RELEASE(root_blob);RELEASE(other_root_blob);
