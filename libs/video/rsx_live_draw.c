@@ -91,6 +91,11 @@ void rsx_live_draw_shutdown(void) {}
 #include "rsx_dispatch.h"
 #include "rsx_vp_burst.h"
 #include "rsx_fp_decompiler.h"
+#include "rsx_fp_program_plan.h"
+#ifndef RSX_NATIVE_FP_PLAN_ENABLED
+#define RSX_NATIVE_FP_PLAN_ENABLED 1
+#endif
+static rsx_fp_program_cache* g_ld_fp_program_cache;
 static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_surf = 0;
 /* Set once PS1 VRAM actually holds a drawn frame (see the PS1_PC heartbeat).
  * Every surface dump before this is an early-boot snapshot of a framebuffer the
@@ -6871,6 +6876,19 @@ LD_SHADER_PREP(int,ld_fp_collect_constants,(const u8* code,u32 bytes,rsx_fp_cons
     rsx_fp_collect_constants(code,bytes,out),fp_prepare_qpc)
 LD_SHADER_PREP(u64,ld_fp_structural_hash,(const u8* code,u32 bytes,u64 seed),
     rsx_fp_structural_hash(code,bytes,seed),fp_prepare_qpc)
+static rsx_fp_program_plan* ld_fp_program_plan_uncounted(u32 location, u32 offset);
+static rsx_fp_program_plan* ld_fp_program_plan(u32 location, u32 offset)
+{
+    const LONGLONG begin = ld_profile_qpc();
+    rsx_fp_program_plan* result = ld_fp_program_plan_uncounted(location, offset);
+    g_ld_profile.total.fp_prepare_qpc += ld_profile_qpc() - begin;
+    return result;
+}
+LD_SHADER_PREP(int,ld_fp_plan_constants,
+    (const rsx_fp_program_plan* plan,const u8* code,u32 bytes,rsx_fp_constant_block* out),
+    rsx_fp_program_plan_constants(plan,code,bytes,out),fp_prepare_qpc)
+LD_SHADER_PREP(u64,ld_fp_plan_hash,(rsx_fp_program_plan* plan,u64 seed),
+    rsx_fp_program_plan_hash(plan,seed),fp_prepare_qpc)
 #undef LD_SHADER_PREP
 #else
 #define ld_vp_program_size rsx_vp_program_size_instrs
@@ -6879,6 +6897,9 @@ LD_SHADER_PREP(u64,ld_fp_structural_hash,(const u8* code,u32 bytes,u64 seed),
 #define ld_fp_program_size rsx_fp_program_size
 #define ld_fp_collect_constants rsx_fp_collect_constants
 #define ld_fp_structural_hash rsx_fp_structural_hash
+#define ld_fp_program_plan_uncounted ld_fp_program_plan
+#define ld_fp_plan_constants rsx_fp_program_plan_constants
+#define ld_fp_plan_hash rsx_fp_program_plan_hash
 #endif
 
 static u32 vp_txl_unit_mask(const u8* ucode, u32 instrs)
@@ -7250,6 +7271,21 @@ static void ld_pso_bail(int* said, const char* reason)
 #define LD_PSO_BAIL(reason) \
     do { static int _said_ = 0; ld_pso_bail(&_said_, (reason)); } while (0)
 
+/* Exact-validated CPU metadata only; mutable constants are gathered anew.
+ * This cache is owned by the FIFO renderer and owns no GPU resources. */
+static rsx_fp_program_plan* ld_fp_program_plan_uncounted(u32 location, u32 offset)
+{
+    if (!RSX_NATIVE_FP_PLAN_ENABLED || !ld_fp_constants_buffered())
+        return NULL;
+    const u8* code = guest_ptr(location, offset, RSX_FP_PROGRAM_PLAN_MAX_BYTES);
+    if (!code)
+        return NULL;
+    if (!g_ld_fp_program_cache)
+        g_ld_fp_program_cache = rsx_fp_program_cache_create();
+    return rsx_fp_program_cache_acquire(g_ld_fp_program_cache,
+        ((u64)location << 32) | offset, code, RSX_FP_PROGRAM_PLAN_MAX_BYTES);
+}
+
 static ID3D12PipelineState* get_pso(
     const rsx_vertex_layout_plan* masked_layout, int packed_payload,
     ld_slow_draw_scope* slow_draw)
@@ -7270,7 +7306,9 @@ static ID3D12PipelineState* get_pso(
     const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
     const u8* fp_uc = guest_ptr(fp_loc, fp_off, 16);
     if (!fp_uc) { LD_PSO_BAIL("fragment program address does not resolve to guest memory"); return NULL; }
-    const u32 fp_size = ld_fp_program_size(fp_uc, 0x10000);
+    rsx_fp_program_plan* fp_plan = ld_fp_program_plan(fp_loc, fp_off);
+    const u32 fp_size = fp_plan ? rsx_fp_program_plan_size(fp_plan)
+                              : ld_fp_program_size(fp_uc, 0x10000);
     if (!fp_size) {
         /* No END-bit instruction in 64 KB: the bytes at (location, offset) are
          * not a fragment program. Almost always the LOCATION is wrong, not the
@@ -7363,8 +7401,10 @@ static ID3D12PipelineState* get_pso(
 
     render_state_t rs;
     decode_render_state(&rs);
-    if (ld_fp_collect_constants(
-            fp_uc, fp_size, &g.fp_constants) < 0) {
+    const int constant_count = fp_plan
+        ? ld_fp_plan_constants(fp_plan, fp_uc, fp_size, &g.fp_constants)
+        : ld_fp_collect_constants(fp_uc, fp_size, &g.fp_constants);
+    if (constant_count < 0) {
         LD_PSO_BAIL("fragment program constant collection failed");
         return NULL;
     }
@@ -7377,7 +7417,8 @@ static ID3D12PipelineState* get_pso(
     const u64 vp_hash = cache_vp ? vp_info.hash : ld_vp_hash(vp_uc, vp_instrs * 16);
     u64 key = vp_hash;
     if (ld_fp_constants_buffered())
-        key = ld_fp_structural_hash(fp_uc, fp_size, key);
+        key = fp_plan ? ld_fp_plan_hash(fp_plan, key)
+                      : ld_fp_structural_hash(fp_uc, fp_size, key);
     else
         key = fnv1a(fp_uc, fp_size, key);
     if (!key) {
@@ -12202,6 +12243,15 @@ static void ld_report_counters(void);
 
 void rsx_live_draw_dump_present_samples(void)
 {
+    /* Normal exit only: never add periodic logging to the draw path. Totals
+     * include menus/loading and are not a timed-gameplay hit-rate claim. */
+    const rsx_fp_program_cache_stats fp_stats =
+        rsx_fp_program_cache_statistics(g_ld_fp_program_cache);
+    fprintf(stderr, "[fp-plan] hits=%llu misses=%llu mutations=%llu "
+        "evictions=%llu rejected=%llu\n",
+        (unsigned long long)fp_stats.hits, (unsigned long long)fp_stats.misses,
+        (unsigned long long)fp_stats.mutations, (unsigned long long)fp_stats.evictions,
+        (unsigned long long)fp_stats.rejected);
     /* Haze exits after this diagnostic dump without renderer teardown. */
     if (g.ready) ld_report_counters();
     ld_texture_diag_dump();
@@ -13911,6 +13961,8 @@ void rsx_live_draw_present(u32 buffer_id)
 
 void rsx_live_draw_shutdown(void)
 {
+    rsx_fp_program_cache_destroy(g_ld_fp_program_cache);
+    g_ld_fp_program_cache = NULL;
     if (!g.ready) {
         ld_texture_diag_dump();
         ld_slow_flush_dump();
