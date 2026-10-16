@@ -271,6 +271,14 @@ static int ld_vertex_cache_enabled(void)
 #include "rsx_native_draw_packet.h"
 #include "rsx_native_draw_payload.h"
 #include "rsx_native_replay_pass.h"
+#include "rsx_fp_program_plan.h"
+
+/* Compile-time control is for matched private benchmarks, not a release INI
+ * setting. Native producers can eventually pass an owned plan directly. */
+#ifndef RSX_NATIVE_FP_PLAN_ENABLED
+#define RSX_NATIVE_FP_PLAN_ENABLED 1
+#endif
+static rsx_fp_program_cache* g_ld_fp_program_cache;
 #include "rsx_pipeline_recipes.h"
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
@@ -7047,6 +7055,32 @@ static void ld_pso_bail(int* said, const char* reason)
 #define LD_PSO_BAIL(reason) \
     do { static int _said_ = 0; ld_pso_bail(&_said_, (reason)); } while (0)
 
+static rsx_fp_program_plan* ld_fp_program_plan(u32 location, u32 offset)
+{
+    if (!RSX_NATIVE_FP_PLAN_ENABLED || !ld_fp_constants_buffered())
+        return NULL;
+    /* A full bounded mapping is required before inspecting guest bytes. Near
+     * an unmapped boundary the original resolver remains the fallback. */
+    const u8* code = guest_ptr(location, offset, RSX_FP_PROGRAM_PLAN_MAX_BYTES);
+    if (!code)
+        return NULL;
+    if (!g_ld_fp_program_cache)
+        g_ld_fp_program_cache = rsx_fp_program_cache_create();
+    rsx_fp_program_plan* plan = rsx_fp_program_cache_acquire(
+        g_ld_fp_program_cache, ((u64)location << 32) | offset,
+        code, RSX_FP_PROGRAM_PLAN_MAX_BYTES);
+    /* Owner-thread coverage report; no report thread reads mutable plans. */
+    const rsx_fp_program_cache_stats stats =
+        rsx_fp_program_cache_statistics(g_ld_fp_program_cache);
+    if (((stats.hits + stats.misses) & 65535u) == 1u)
+        fprintf(stderr, "[native-fp-plan] hits=%llu misses=%llu mutations=%llu "
+            "evictions=%llu rejected=%llu\n",
+            (unsigned long long)stats.hits, (unsigned long long)stats.misses,
+            (unsigned long long)stats.mutations, (unsigned long long)stats.evictions,
+            (unsigned long long)stats.rejected);
+    return plan;
+}
+
 static ID3D12PipelineState* get_pso(
     const rsx_vertex_layout_plan* masked_layout, int packed_payload,
     ld_slow_draw_scope* slow_draw)
@@ -7067,7 +7101,9 @@ static ID3D12PipelineState* get_pso(
     const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
     const u8* fp_uc = guest_ptr(fp_loc, fp_off, 16);
     if (!fp_uc) { LD_PSO_BAIL("fragment program address does not resolve to guest memory"); return NULL; }
-    const u32 fp_size = ld_fp_program_size(fp_uc, 0x10000);
+    rsx_fp_program_plan* fp_plan = ld_fp_program_plan(fp_loc, fp_off);
+    const u32 fp_size = fp_plan ? rsx_fp_program_plan_size(fp_plan)
+                              : ld_fp_program_size(fp_uc, 0x10000);
     if (!fp_size) {
         /* No END-bit instruction in 64 KB: the bytes at (location, offset) are
          * not a fragment program. Almost always the LOCATION is wrong, not the
@@ -7160,8 +7196,10 @@ static ID3D12PipelineState* get_pso(
 
     render_state_t rs;
     decode_render_state(&rs);
-    if (ld_fp_collect_constants(
-            fp_uc, fp_size, &g.fp_constants) < 0) {
+    const int constant_count = fp_plan
+        ? rsx_fp_program_plan_constants(fp_plan, fp_uc, fp_size, &g.fp_constants)
+        : ld_fp_collect_constants(fp_uc, fp_size, &g.fp_constants);
+    if (constant_count < 0) {
         LD_PSO_BAIL("fragment program constant collection failed");
         return NULL;
     }
@@ -7174,7 +7212,8 @@ static ID3D12PipelineState* get_pso(
     const u64 vp_hash = cache_vp ? vp_info.hash : ld_vp_hash(vp_uc, vp_instrs * 16);
     u64 key = vp_hash;
     if (ld_fp_constants_buffered())
-        key = ld_fp_structural_hash(fp_uc, fp_size, key);
+        key = fp_plan ? rsx_fp_program_plan_hash(fp_plan, key)
+                      : ld_fp_structural_hash(fp_uc, fp_size, key);
     else
         key = fnv1a(fp_uc, fp_size, key);
     if (!key) {
@@ -14342,6 +14381,8 @@ void rsx_live_draw_present(u32 buffer_id)
 
 void rsx_live_draw_shutdown(void)
 {
+    rsx_fp_program_cache_destroy(g_ld_fp_program_cache);
+    g_ld_fp_program_cache = NULL;
     ld_pipeline_recipes_save();
     ld_native_pass_mutation("shutdown");
     if (g_ld_native_payload.phase == 1 || g_ld_native_payload.phase == 2)
