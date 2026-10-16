@@ -6,8 +6,8 @@
 #define RSX_TEXTURE_CONTENT_CACHE_H
 #include "rsx_texture_hash.h"
 #define LD_TEXTURE_CONTENT_ENTRIES 256u
-#define LD_TEXTURE_CONTENT_CPU_LIMIT (64ull * 1024 * 1024)
-#define LD_TEXTURE_CONTENT_GPU_LIMIT (64ull * 1024 * 1024)
+#define LD_TEXTURE_CONTENT_CPU_LIMIT (128ull * 1024 * 1024)
+#define LD_TEXTURE_CONTENT_GPU_LIMIT (128ull * 1024 * 1024)
 #define LD_TEXTURE_CONTENT_MIPS 14u
 typedef struct {
     ID3D12Resource* resource;
