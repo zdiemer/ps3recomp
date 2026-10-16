@@ -174,6 +174,11 @@ void rsx_live_draw_dump_shader_cache(void);
  * returns 0; a timed-out worker owns its data and may finish later. The SDK
  * module must remain loaded until it finishes or the process exits. */
 int rsx_live_draw_finish_shader_bundle(unsigned timeout_ms);
+/* Terminal renderer-owner recipe persistence. Zero timeout starts/polls the
+ * owned writer without waiting; a later call can join it within a shared exit
+ * budget. The writer owns the detached cache and COM references. Never resume
+ * drawing afterwards; keep the SDK loaded until it finishes/process exits. */
+int rsx_live_draw_finish_pipeline_recipes(unsigned timeout_ms);
 
 /* Bounded live AUTH diagnostic. The null-backend window starts it from a
  * private WM_APP message immediately before New Game is confirmed. */
