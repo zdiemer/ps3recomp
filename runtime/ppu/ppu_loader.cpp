@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
 #ifdef _WIN32
 #  include <windows.h>
 #else
@@ -3725,17 +3726,39 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
  * decoder's thread, or the thread that asked for the callback). Give every
  * host thread its own 256 KB slot in VM_CB_STACK_REGION, and start a nested
  * callback below the live frame of the one it is nested in. */
+/* Slots in use, one bit each. A host thread takes the lowest free one on its
+ * first callback and gives it back when it exits (cb_slot_owner below), so a
+ * title that starts and ends threads all session -- a movie player starts
+ * several per movie -- never runs out: only more than 64 host threads making
+ * callbacks AT ONCE share a slot. */
+static std::atomic<uint64_t> s_cb_slots_used{0};
+struct cb_slot_owner {
+    int slot = -1;
+    ~cb_slot_owner()
+    {
+        if (slot >= 0) s_cb_slots_used.fetch_and(~(1ull << slot), std::memory_order_acq_rel);
+    }
+};
+static thread_local cb_slot_owner t_cb_slot;
+
 static uint32_t ppu_cb_stack_sp(const ppu_context* active)
 {
-    static volatile long s_next_slot = 0;
     static PPU_THREAD_LOCAL uint32_t s_lo = 0, s_hi = 0;
     if (!s_hi) {
         const uint32_t slots = VM_CB_STACK_REGION / VM_CB_STACK_SIZE;
-#ifdef _WIN32
-        uint32_t i = (uint32_t)InterlockedIncrement(&s_next_slot) - 1;
-#else
-        uint32_t i = (uint32_t)__atomic_fetch_add(&s_next_slot, 1, __ATOMIC_SEQ_CST);
-#endif
+        static_assert(VM_CB_STACK_REGION / VM_CB_STACK_SIZE <= 64, "one bit per slot");
+        uint32_t i = slots;
+        uint64_t used = s_cb_slots_used.load(std::memory_order_acquire);
+        while (~used & (slots >= 64 ? ~0ull : (1ull << slots) - 1u)) {
+            uint32_t k = 0;
+            while (used >> k & 1u) k++;
+            if (s_cb_slots_used.compare_exchange_weak(used, used | (1ull << k),
+                                                      std::memory_order_acq_rel)) {
+                i = k;
+                t_cb_slot.slot = (int)k;
+                break;
+            }
+        }
         if (i < slots) {
             s_lo = VM_CB_STACK_BASE + i * VM_CB_STACK_SIZE;
             s_hi = s_lo + VM_CB_STACK_SIZE;
@@ -3743,7 +3766,7 @@ static uint32_t ppu_cb_stack_sp(const ppu_context* active)
             /* Out of slots: share the last one, and say so. */
             s_lo = VM_CB_STACK_BASE + (slots - 1) * VM_CB_STACK_SIZE;
             s_hi = s_lo + VM_CB_STACK_SIZE;
-            fprintf(stderr, "[ppu] guest_call: more than %u host threads make guest "
+            fprintf(stderr, "[ppu] guest_call: more than %u live host threads make guest "
                             "callbacks; callback stack slot %u is SHARED\n", slots, slots - 1);
         }
     }

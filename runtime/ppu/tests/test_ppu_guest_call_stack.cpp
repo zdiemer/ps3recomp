@@ -82,9 +82,12 @@ static int intact(uint32_t sp, uint32_t tag)
     return 1;
 }
 
-// gpr[3] = thread index, gpr[4] = 1 for the outer callback, 0 for the nested one.
+// gpr[3] = thread index, gpr[4] = 1 for the outer callback, 0 for the nested
+// one, 2 for a churn thread's (it only records its stack pointer).
+static uint32_t s_churn_sp;
 static void callback(ppu_context* ctx)
 {
+    if (ctx->gpr[4] == 2) { s_churn_sp = (uint32_t)ctx->gpr[1]; return; }
     const int t = (int)ctx->gpr[3];
     const uint32_t sp = (uint32_t)ctx->gpr[1];
     const uint32_t tag = 0xC0DE0000u | (uint32_t)(t << 8) | (uint32_t)ctx->gpr[4];
@@ -109,6 +112,12 @@ static void* host_thread(void* arg)
     return nullptr;
 }
 
+static void* churn_thread(void*)
+{
+    ppu_guest_call(OPD, 0, 2, 0, 0, 0, 0, 0, 0);
+    return nullptr;
+}
+
 int main()
 {
     void* p = mmap(nullptr, 0x100010000ull, PROT_READ | PROT_WRITE,
@@ -118,6 +127,19 @@ int main()
     be32(OPD, CODE);
     be32(OPD + 4, TOC);
     ppu_register_function(CODE, callback);
+
+    // First, more host threads than there are slots start, make a callback
+    // and end, one after another, as a title's movie threads do all session.
+    // Each gives its slot back, so the first slot comes round again.
+    enum { CHURN = 100 };
+    uint32_t first_churn_sp = 0, last_churn_sp = 0;
+    for (int i = 0; i < CHURN; i++) {
+        pthread_t c;
+        pthread_create(&c, nullptr, churn_thread, nullptr);
+        pthread_join(c, nullptr);
+        if (i == 0) first_churn_sp = s_churn_sp;
+        last_churn_sp = s_churn_sp;
+    }
 
     pthread_t th[THREADS];
     for (int t = 0; t < THREADS; t++)
@@ -131,7 +153,10 @@ int main()
     };
     for (int t = 0; t < THREADS; t++)
         std::printf("thread %d: callback sp 0x%08X, nested sp 0x%08X\n", t, s_rec[t].sp, s_rec[t].inner_sp);
-    check(s_rec[0].sp != s_rec[1].sp, "two host threads' callbacks get different stacks");
+    check(first_churn_sp && last_churn_sp == first_churn_sp,
+          "a host thread that ends gives its callback stack back (100 threads, one at a time)");
+    check(s_rec[0].sp != s_rec[1].sp,
+          "after them, two host threads' callbacks still get different stacks");
     check(s_rec[0].outer_ok && s_rec[1].outer_ok,
           "each callback's frame survives the other thread's callback and its own nested one");
     check(s_rec[0].inner_ok && s_rec[1].inner_ok, "each nested callback's frame survives the other thread's");
