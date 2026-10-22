@@ -50,6 +50,13 @@ extern "C" {
 
 #define VM_PPU_STACK_SIZE   0x00100000u      /* 1 MB default PPU stack */
 
+/* The top 16 MB of the stack region holds one private guest stack per host
+ * thread for HLE -> guest callbacks (ppu_guest_call). vm_stack_allocate()
+ * stops below it. */
+#define VM_CB_STACK_REGION  0x01000000u
+#define VM_CB_STACK_BASE    (VM_STACK_BASE + VM_STACK_REGION - VM_CB_STACK_REGION)
+#define VM_CB_STACK_SIZE    0x00040000u      /* 256 KB per host thread, 64 slots */
+
 /* Home for guest-visible structures the RUNTIME injects -- the GCM label window,
  * the control register (put/get/ref) and the IO<->EA offset tables. These must
  * NOT sit inside main memory, because that is where the title's own allocator
@@ -342,7 +349,7 @@ typedef struct vm_stack_alloc {
 static inline void vm_stack_alloc_init(vm_stack_alloc* sa)
 {
     sa->next_addr  = VM_STACK_BASE;
-    sa->region_end = VM_STACK_BASE + VM_STACK_REGION;
+    sa->region_end = VM_CB_STACK_BASE;   /* callback stacks above, see VM_CB_STACK_REGION */
 }
 
 /*

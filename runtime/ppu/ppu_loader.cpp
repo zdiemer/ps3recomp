@@ -3709,6 +3709,53 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
 }
 
+/* The guest stack an HLE -> guest callback runs on.
+ *
+ * This used to be the fixed EA 0xCFFE0000 in every host thread (the variable
+ * was thread-local, its value was not). The movie player's cellAdec and cellVdec
+ * callbacks run synchronously on two different MoviePlayerStream threads, so
+ * they built their frames over each other: the adec callback's scoped mutex
+ * guard (func_005F0CA8, guard at 0xCFFDFE50) read back a NULL mutex pointer,
+ * unlocked NULL (the [null-write] at 0x005EF018 / [null-read] of 0x8 in the
+ * hung runs) and left the player mutex locked for good -- the next lock of it
+ * (func_005EEFE4) never returned. 0xCFFE0000 is also inside RSX local memory
+ * (0xC0000000 + 256 MB), so VRAM writes could land on it as well.
+ *
+ * lv2 runs these callbacks on a real PPU thread with a stack of its own (the
+ * decoder's thread, or the thread that asked for the callback). Give every
+ * host thread its own 256 KB slot in VM_CB_STACK_REGION, and start a nested
+ * callback below the live frame of the one it is nested in. */
+static uint32_t ppu_cb_stack_sp(const ppu_context* active)
+{
+    static volatile long s_next_slot = 0;
+    static PPU_THREAD_LOCAL uint32_t s_lo = 0, s_hi = 0;
+    if (!s_hi) {
+        const uint32_t slots = VM_CB_STACK_REGION / VM_CB_STACK_SIZE;
+#ifdef _WIN32
+        uint32_t i = (uint32_t)InterlockedIncrement(&s_next_slot) - 1;
+#else
+        uint32_t i = (uint32_t)__atomic_fetch_add(&s_next_slot, 1, __ATOMIC_SEQ_CST);
+#endif
+        if (i < slots) {
+            s_lo = VM_CB_STACK_BASE + i * VM_CB_STACK_SIZE;
+            s_hi = s_lo + VM_CB_STACK_SIZE;
+        } else {
+            /* Out of slots: share the last one, and say so. */
+            s_lo = VM_CB_STACK_BASE + (slots - 1) * VM_CB_STACK_SIZE;
+            s_hi = s_lo + VM_CB_STACK_SIZE;
+            fprintf(stderr, "[ppu] guest_call: more than %u host threads make guest "
+                            "callbacks; callback stack slot %u is SHARED\n", slots, slots - 1);
+        }
+    }
+    if (active) {
+        uint32_t sp = (uint32_t)active->gpr[1];
+        /* Nested: below the outer callback's frame and its 288-byte protected zone. */
+        if (sp > s_lo + 0x1000 && sp <= s_hi) return (sp - 0x400) & ~0xFu;
+    }
+    /* Room above the first frame for the callee's LR/CR save words (sp+8, sp+16). */
+    return (s_hi - 0x100) & ~0xFu;
+}
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -3733,14 +3780,9 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                 vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
         return 0; }
 
-    /* Private scratch stack high in the guest stack region, distinct from the
-     * main + ppu_thread stacks. One callback at a time per caller thread. */
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
-
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = ppu_cb_stack_sp(g_active_ctx);   /* per host thread, see above */
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
@@ -3780,12 +3822,9 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
-
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = ppu_cb_stack_sp(g_active_ctx);   /* per host thread, see above */
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
