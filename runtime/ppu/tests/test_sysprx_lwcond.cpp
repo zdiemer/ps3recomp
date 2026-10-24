@@ -17,7 +17,7 @@ void np_score_register_ctx() { abort(); }
 void ppu_register_function(uint64_t, void (*)(ppu_context*)) { abort(); }
 unsigned int cellGcmSetupContext(unsigned int, unsigned int, unsigned int,
     unsigned int, CellGcmGuestAlloc, CellGcmGuestWrite32) { abort(); }
-void cellGcm_fifo_recycle(unsigned int) { abort(); }
+void cellGcm_fifo_reserve(unsigned int, unsigned int) { abort(); }
 void spu_raw_note_image(uint32_t, uint32_t) { abort(); }
 unsigned long long ppu_thread_cpu_us(unsigned) { abort(); }
 unsigned ppu_thread_prof_pc(unsigned) { abort(); }

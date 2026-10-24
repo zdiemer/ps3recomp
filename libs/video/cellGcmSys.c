@@ -23,6 +23,9 @@
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
 static u32 s_gcm_context_ea = 0;
+/* That context's whole ring. Its `end` becomes a segment limit after the first
+ * wrap (cellGcm_fifo_reserve), so the ring geometry is kept here. */
+static u32 s_gcm_ring_begin = 0, s_gcm_ring_end = 0;
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -526,6 +529,8 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
             gwrite32(ctx_out_addr, cdata);          /* *context = &ctxdata */
         s_gcm_ctx_out_ea = ctx_out_addr;   /* the title's gCellGcmCurrentContext */
         s_gcm_context_ea = cdata;                   /* RSX drains commands from here */
+        s_gcm_ring_begin = cmdbuf;
+        s_gcm_ring_end = cmdbuf + cmdSize;
     }
     return cdata;
 }
@@ -2834,6 +2839,125 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
 }
 /* END GCM FIFO RECYCLE CALLBACK */
 
+/* Command-buffer-full callback for the context cellGcmSetupContext created.
+ * libgcm's default callback walks `end` through fixed segments and waits only
+ * until GET has left the next one. Recycling the whole ring instead drained
+ * the walker at every wrap: the producer waited for the tail while the walker
+ * then idled for the next commands, about a quarter of Haze's frame time.
+ *
+ * The first lap keeps `end` at the ring end. From the first wrap on, each call
+ * publishes PUT at `current` and grants [current, current + segment). Before
+ * granting a range, the drain position from the previous lap must be past its
+ * last byte. A published position at or before the range start therefore
+ * belongs to this lap, the walker having caught up; positions are ambiguous
+ * only within the range, which is exactly the wait. Positions outside the ring
+ * (a CALL target, a park) are never taken as progress. */
+#define GCM_FIFO_SEGMENT_BYTES 0x10000u
+
+static int gcm_fifo_segment_busy(u32 drained, u32 after, u32 through)
+{
+    return drained < s_gcm_ring_begin || drained > s_gcm_ring_end ||
+           (drained > after && drained <= through);
+}
+
+static void gcm_fifo_wait_segment(u32 after, u32 through,
+                                  gcm_fifo_recycle_ack* diagnostic)
+{
+    unsigned spins = 0;
+    const int native_wait = gcm_fifo_native_wait_enabled();
+    u32 observed=atomic_load_explicit(&g_gcm_fifo_drained_ea,memory_order_acquire);
+    if (diagnostic) {
+        diagnostic->expected_ea=through;
+        diagnostic->qpc_begin=gcm_slow_drain_qpc();
+        diagnostic->initial_observed_ea=observed;
+    }
+    while (gcm_fifo_segment_busy(observed, after, through)) {
+        if (s_gcm_kick_ev && !(spins & 31u)) SetEvent(s_gcm_kick_ev);
+        gcm_fifo_wait_for_publication(observed, native_wait);
+        if (++spins == 2000) {
+            static unsigned warned;
+            if (warned++ < 4)
+                fprintf(stderr, "[cellGcmSys] fifo segment waiting for consumer "
+                        "(drained=0x%08X segment=0x%08X..0x%08X)\n",
+                        observed, after, through);
+        }
+        observed=atomic_load_explicit(&g_gcm_fifo_drained_ea,memory_order_acquire);
+    }
+    if (diagnostic) {
+        diagnostic->qpc_end=gcm_slow_drain_qpc();
+        diagnostic->observed_ea=observed;
+        diagnostic->wait_calls=spins;
+        diagnostic->completed=1;
+    }
+}
+
+void cellGcm_fifo_reserve(u32 ctx_ea, u32 words)
+{
+    const u32 begin = ctx_ea ? vm_read32(ctx_ea + 0x0) : 0;
+    const u32 end = ctx_ea ? vm_read32(ctx_ea + 0x4) : 0;
+    const u32 current = ctx_ea ? vm_read32(ctx_ea + 0x8) : 0;
+    const u64 need = (u64)words * 4u;
+    /* Anything but the intact SDK context keeps the whole-ring recycle. */
+    if (!ctx_ea || ctx_ea != s_gcm_context_ea || !s_gcm_ring_end ||
+        begin != s_gcm_ring_begin || s_gcm_ring_end - begin < 4u * GCM_FIFO_SEGMENT_BYTES ||
+        current < begin || current > s_gcm_ring_end || end > s_gcm_ring_end ||
+        need + GCM_FIFO_SEGMENT_BYTES > s_gcm_ring_end - begin) {
+        cellGcm_fifo_recycle(ctx_ea);
+        return;
+    }
+    const u32 io_begin = gcm_ea2io(begin), io_current = gcm_ea2io(current);
+    if (io_begin == 0xFFFFFFFFu || io_current == 0xFFFFFFFFu) {
+        cellGcm_fifo_recycle(ctx_ea);
+        return;
+    }
+    const u32 length = need > GCM_FIFO_SEGMENT_BYTES
+        ? (u32)((need + 0xFFFu) & ~(u64)0xFFFu) : GCM_FIFO_SEGMENT_BYTES;
+    if (current + need > s_gcm_ring_end && need > GCM_FIFO_SEGMENT_BYTES) {
+        /* A first segment this large could reach the tail still pending at
+         * `current`; drain the whole ring, after which any grant is free. */
+        cellGcm_fifo_recycle(ctx_ea);
+        vm_write32(ctx_ea + 0x4, begin + length);
+        return;
+    }
+    gcm_fifo_recycle_event diagnostic={0};
+    const int trace=gcm_fifo_recycle_trace_start(&diagnostic);
+    if (trace) {
+        diagnostic.context_ea=ctx_ea;
+        diagnostic.current_ea=current;
+        diagnostic.current_io=io_current;
+    }
+    atomic_store_explicit(&s_fifo_recycle_active, ctx_ea, memory_order_release);
+    if (current + need <= s_gcm_ring_end) {
+        /* Advance in place. */
+        const u32 through = current + length < s_gcm_ring_end
+            ? current + length : s_gcm_ring_end;
+        if (trace) { diagnostic.begin_ea=current; diagnostic.begin_io=io_current; }
+        atomic_thread_fence(memory_order_release);
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_current);     /* flush */
+        gcm_fifo_wait_segment(current, through, trace ? &diagnostic.ack_current : NULL);
+        vm_write32(ctx_ea + 0x4, through);
+    } else {
+        /* Wrap. The previous lap's drain position must be past the first
+         * segment, so a position at `begin` itself is still pending. */
+        if (trace) { diagnostic.begin_ea=begin; diagnostic.begin_io=io_begin; }
+        vm_write32(current, 0x20000000u | io_begin);            /* JUMP begin */
+        atomic_thread_fence(memory_order_release);
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_current);
+        gcm_fifo_wait_segment(begin - 4u, begin + length,
+                              trace ? &diagnostic.ack_current : NULL);
+        /* GET is past the first segment, so PUT at `begin` is not empty. */
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);
+        vm_write32(ctx_ea + 0x4, begin + length);
+        vm_write32(ctx_ea + 0x8, begin);
+    }
+    atomic_store_explicit(&s_fifo_recycle_active, 0, memory_order_release);
+    if (trace) {
+        diagnostic.outcome=GCM_FIFO_RECYCLE_COMPLETE;
+        diagnostic.qpc_end=gcm_slow_drain_qpc();
+        gcm_fifo_recycle_record(&diagnostic);
+    }
+}
+
 /* NID: 0xDC09357E */
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height)
@@ -2979,18 +3103,22 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
 {
     if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
         !s_display_buffer_set[bufferId]) return 0;
+    /* A context with our reserve callback already has a synchronized wrap.
+     * Rewinding it here after only the first 128KB was read allows the title
+     * to overwrite the still-pending tail while the host compiles shaders. */
+    const u32 callback = vm_read32(ctx + 12);
+    const int synchronized_wrap = callback &&
+        vm_read32(callback) == GCM_FIFO_CALLBACK_SENTINEL_EA;
+    /* Near a segment limit, reserve the room as the title's own call would. */
+    if (synchronized_wrap && ctx == s_gcm_context_ea &&
+        vm_read32(ctx + 8) + 8 + GCM_RECYCLE_SLACK > vm_read32(ctx + 4))
+        cellGcm_fifo_reserve(ctx, (8 + GCM_RECYCLE_SLACK) / 4);
     const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
     /* Never near the end: those bytes are the title's reserve before its
      * ring wraps, and the recycle above keys on them. */
     if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
     vm_write32(cur, GCM_FLIP_MARKER | bufferId);
-    /* A context with our reserve callback already has a synchronized wrap.
-     * Rewinding it here after only the first 128KB was read allows the title
-     * to overwrite the still-pending tail while the host compiles shaders. */
     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
-    const u32 callback = vm_read32(ctx + 12);
-    const int synchronized_wrap = callback &&
-        vm_read32(callback) == GCM_FIFO_CALLBACK_SENTINEL_EA;
     if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
         !synchronized_wrap &&
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {

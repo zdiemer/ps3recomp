@@ -15,6 +15,18 @@ static DWORD WINAPI recycle(void* unused) { (void)unused; cellGcm_fifo_recycle(0
 static DWORD WINAPI wait_ack(void* value) {
     gcm_fifo_wait_for_ea((u32)(uintptr_t)value, NULL); return 0;
 }
+static u32 reserve_words;
+static DWORD WINAPI reserve(void* unused) {
+    (void)unused; cellGcm_fifo_reserve(0x100, reserve_words); return 0;
+}
+static HANDLE start_reserve(u32 words) {
+    reserve_words = words;
+    HANDLE t = CreateThread(NULL, 0, reserve, NULL, 0, NULL); assert(t); return t;
+}
+static void finish(HANDLE t) {
+    assert(WaitForSingleObject(t, 5000) == WAIT_OBJECT_0); CloseHandle(t);
+    assert(!atomic_load(&s_fifo_recycle_active));
+}
 static void wait_put(u32 value) {
     ULONGLONG deadline = GetTickCount64() + 5000;
     while (vm_read32(GCM_CONTROL_GUEST_ADDR) != value && GetTickCount64() < deadline) Sleep(1);
@@ -113,8 +125,60 @@ int main(int argc, char** argv) {
     waiter = CreateThread(NULL, 0, wait_ack, (void*)(uintptr_t)0x3333, 0, NULL);
     assert(waiter && WaitForSingleObject(waiter, 5000) == WAIT_OBJECT_0);
     CloseHandle(waiter);
+    /* Segmented reserve. The first wrap grants one segment only after the
+     * previous lap's drain has left it; a position at begin is a whole lap. */
+    const u32 seg = GCM_FIFO_SEGMENT_BYTES, ring_end = begin + 8 * seg;
+    s_gcm_ring_begin = begin; s_gcm_ring_end = ring_end;
+    vm_write32(0x100, begin); vm_write32(0x104, ring_end); vm_write32(0x108, ring_end - 8);
+    gcm_fifo_publish_drained_ea(begin);
+    t = start_reserve(4);
+    wait_put(ring_end - 8 - begin);
+    assert(vm_read32(ring_end - 8) == 0x20000000u);
+    Sleep(20); assert(WaitForSingleObject(t, 0) == WAIT_TIMEOUT);
+    gcm_fifo_publish_drained_ea(begin + seg);       /* its last word is still pending */
+    Sleep(20); assert(WaitForSingleObject(t, 0) == WAIT_TIMEOUT);
+    gcm_fifo_publish_drained_ea(begin + seg + 4);
+    finish(t);
+    assert(vm_read32(0x108) == begin && vm_read32(0x104) == begin + seg);
+    assert(vm_read32(GCM_CONTROL_GUEST_ADDR) == 0);
+    /* Advance in place: flush, then wait while the previous lap is inside. */
+    vm_write32(0x108, begin + seg - 4);
+    gcm_fifo_publish_drained_ea(begin + seg + 0x100);
+    t = start_reserve(4);
+    wait_put(seg - 4);
+    Sleep(20); assert(WaitForSingleObject(t, 0) == WAIT_TIMEOUT);
+    gcm_fifo_publish_drained_ea(begin + 0x40);      /* wrapped: this lap, behind */
+    finish(t);
+    assert(vm_read32(0x104) == begin + 2 * seg - 4 && vm_read32(0x108) == begin + seg - 4);
+    /* A walker caught up at current owns nothing ahead of it. */
+    vm_write32(0x108, begin + 2 * seg - 4);
+    gcm_fifo_publish_drained_ea(begin + 2 * seg - 4);
+    t = start_reserve(4); finish(t);
+    assert(vm_read32(0x104) == begin + 3 * seg - 4);
+    /* A drain position outside the ring (a CALL target) is not progress. */
+    vm_write32(0x108, begin + 3 * seg - 4);
+    gcm_fifo_publish_drained_ea(0x1F0000);
+    t = start_reserve(4);
+    Sleep(20); assert(WaitForSingleObject(t, 0) == WAIT_TIMEOUT);
+    gcm_fifo_publish_drained_ea(begin + 3 * seg - 4);
+    finish(t);
+    /* Large requests get a large grant; grants stop at the ring end. */
+    vm_write32(0x108, begin + 4 * seg - 4);
+    gcm_fifo_publish_drained_ea(begin + 4 * seg - 4);
+    t = start_reserve(seg / 4 + 16); finish(t);
+    assert(vm_read32(0x104) >= begin + 5 * seg + 60);
+    vm_write32(0x108, ring_end - 0x100);
+    gcm_fifo_publish_drained_ea(ring_end - 0x100);
+    t = start_reserve(4); finish(t);
+    assert(vm_read32(0x104) == ring_end);
+    /* A flip near a segment limit reserves room instead of flipping early. */
+    vm_write32(0x104, begin + 0x2000); vm_write32(0x108, begin + 0x1800);
+    gcm_fifo_publish_drained_ea(begin + 0x1800);
+    assert(gcm_flip_into_fifo(0x100, 0));
+    assert(vm_read32(begin + 0x1800) == GCM_FLIP_MARKER);
+    assert(vm_read32(0x104) == begin + 0x1800 + seg && vm_read32(0x108) == begin + 0x1804);
     free(vm_base);
-    puts("PASS: FIFO tail/wrap acknowledgments, delayed consumer, flip insertion, semaphore and native wake predicates");
+    puts("PASS: FIFO tail/wrap acknowledgments, delayed consumer, flip insertion, semaphore, native wake predicates and segmented reserve");
     return 0;
 }
 void (*g_spu_put_hook)(u32,u32);

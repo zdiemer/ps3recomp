@@ -497,7 +497,7 @@ static void gcm_guest_write32(unsigned int addr, unsigned int val) { vm_write32(
 /* FIFO command-buffer-full callback. cellGcmSetupContext points the guest
  * context's callback OPD at GCM_FIFO_CALLBACK_SENTINEL_EA; the title's inline
  * gcmReserve calls context->callback(context, count) on ring wrap, which the
- * indirect dispatcher routes here. r3 = guest context EA.
+ * indirect dispatcher routes here. r3 = guest context EA, r4 = words needed.
  *
  * Derived from VM_HLE_INJECT_BASE, the same base libs/video/cellGcmSys.c
  * builds the OPD from. This was a second hardcoded copy of the address, and
@@ -506,11 +506,11 @@ static void gcm_guest_write32(unsigned int addr, unsigned int val) { vm_write32(
  * garbage-vcall guard no-opped the callback, the FIFO never recycled and the
  * title stopped flipping. One definition, one place. */
 #define GCM_FIFO_CALLBACK_SENTINEL_EA (VM_HLE_INJECT_BASE + 0x2F00u)
-extern "C" void cellGcm_fifo_recycle(unsigned int ctx_ea);
+extern "C" void cellGcm_fifo_reserve(unsigned int ctx_ea, unsigned int words);
 extern "C" void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));
 static void hle_gcm_callback(ppu_context* ctx)
 {
-    cellGcm_fifo_recycle((unsigned int)ctx->gpr[3]);   /* r3 = context EA */
+    cellGcm_fifo_reserve((unsigned int)ctx->gpr[3], (unsigned int)ctx->gpr[4]);
     ctx->gpr[3] = 0;                                   /* CELL_OK */
 }
 
@@ -885,7 +885,7 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(0xB68D5625u, "netFinalizeNetwork",     hle_net_zero);
     ps3_hle_register_ctx(0xFDB8F926u, "netFreethreadContext",   hle_net_zero);
     /* Route the GCM command-buffer-full callback (invoked indirectly via the
-     * context OPD) into cellGcm_fifo_recycle so the FIFO ring recycles on wrap. */
+     * context OPD) into cellGcm_fifo_reserve so the FIFO ring advances and wraps. */
     ppu_register_function(GCM_FIFO_CALLBACK_SENTINEL_EA, hle_gcm_callback);
     ps3_hle_register_ctx(ps3_compute_nid("sys_initialize_tls"),       "sys_initialize_tls",       sys_initialize_tls);
     ps3_hle_register_ctx(ps3_compute_nid("sys_time_get_system_time"), "sys_time_get_system_time", sys_time_get_system_time);
