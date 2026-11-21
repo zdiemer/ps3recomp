@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
 #ifdef _WIN32
 #  include <windows.h>
 #else
@@ -805,7 +806,17 @@ extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* fwd (defined below) 
 #define PPU_RESV_MAX 128
 #define PPU_RESV_INVALID 0x100000000ull   /* out of (uint32_t) ea range */
 static ppu_context* g_resv_ctxs[PPU_RESV_MAX];
+/* One entry per distinct context. A ppu_thread_info slot (and its ctx) is
+ * reused by every thread that later starts in it, so registration must be
+ * idempotent: counting every start filled the 128 entries after ~127 thread
+ * starts, and a context first registered after that was never scanned -- a
+ * store by another thread no longer broke its reservation. Registrations
+ * serialize on g_resv_reg_lock; the count is published with a release store
+ * after the entry is written, and readers load it with acquire, so every entry
+ * below the count they see is initialized. Bound: PPU_THREAD_MAX (64) table
+ * slots + the main thread = 65 distinct contexts, well under PPU_RESV_MAX. */
 static volatile LONG g_resv_ctx_n = 0;
+static volatile LONG g_resv_reg_lock = 0;
 /* Sharded by address: a single global lock convoyed all stwcx (workers spinning
  * on a descheduled holder -> loader too slow to finish jobs). Shard by the
  * 16-byte-block of ea so unrelated structures never serialize; same-structure
@@ -822,8 +833,21 @@ extern "C" int g_resv_store_active = -1;   /* -1 uninit, 0 off, 1 on */
 extern "C" void ppu_resv_register(ppu_context* c)
 {
     if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
-    long i = _InterlockedExchangeAdd(&g_resv_ctx_n, 1);
-    if (i < PPU_RESV_MAX) g_resv_ctxs[i] = c;
+    while (_InterlockedExchange(&g_resv_reg_lock, 1)) { while (g_resv_reg_lock) YieldProcessor(); }
+    const long n = __atomic_load_n(&g_resv_ctx_n, __ATOMIC_RELAXED);   /* only writers change it */
+    for (long i = 0; i < n; i++)
+        if (g_resv_ctxs[i] == c) { _InterlockedExchange(&g_resv_reg_lock, 0); return; }
+    if (n == PPU_RESV_MAX) {
+        /* A context left out would silently lose cross-thread reservation
+         * breaks (lost updates in the guest's lock-free code): stop instead. */
+        fprintf(stderr, "[ppu] FATAL: reservation registry exhausted: capacity=%d distinct contexts\n",
+                PPU_RESV_MAX);
+        fflush(stderr);
+        abort();
+    }
+    g_resv_ctxs[n] = c;
+    __atomic_store_n(&g_resv_ctx_n, (LONG)(n + 1), __ATOMIC_RELEASE);
+    _InterlockedExchange(&g_resv_reg_lock, 0);
 }
 /* Where every guest thread is, as a GUEST address.
  *
@@ -850,7 +874,7 @@ extern "C" void ppu_resv_register(ppu_context* c)
  * last DIRECT call site and nothing more. */
 extern "C" void ppu_report_guest_lrs(void)
 {
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    long n = __atomic_load_n(&g_resv_ctx_n, __ATOMIC_ACQUIRE);
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
         if (!c) continue;
@@ -875,7 +899,7 @@ extern "C" void ppu_report_guest_lrs(void)
 extern "C" void ppu_resv_break_store(uint64_t ea)
 {
     uint32_t a = (uint32_t)ea & ~3u;
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    long n = __atomic_load_n(&g_resv_ctx_n, __ATOMIC_ACQUIRE);
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
         if (c && c->reserve_addr < PPU_RESV_INVALID && ((uint32_t)c->reserve_addr & ~3u) == a)
@@ -888,7 +912,7 @@ static inline void resv_unlock(volatile LONG* L) { _InterlockedExchange(L, 0); }
 static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
 {
     uint64_t a = (uint32_t)addr;   /* match the inline guard: reserve_addr holds (uint32_t)ea */
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    long n = __atomic_load_n(&g_resv_ctx_n, __ATOMIC_ACQUIRE);
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
         if (c && c->reserve_addr == a) c->reserve_addr = PPU_RESV_INVALID;
@@ -900,13 +924,13 @@ static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
 static inline int resv_diag() { static int v = -1; if (v < 0) v = getenv("RESV_DIAG") ? 1 : 0; return v; }
 static void resv_check_reg(ppu_context* self)
 {
-    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    long n = __atomic_load_n(&g_resv_ctx_n, __ATOMIC_ACQUIRE);
     for (long i = 0; i < n; i++) if (g_resv_ctxs[i] == self) return;
     static ppu_context* seen[64]; static long sn = 0;
     for (long i = 0; i < sn; i++) if (seen[i] == self) return;
     if (sn < 64) seen[sn++] = self;
     fprintf(stderr, "[RESV-UNREG] stwcx/stdcx by UNREGISTERED ctx=%p tid=%llu (n_reg=%ld)\n",
-            (void*)self, (unsigned long long)self->thread_id, g_resv_ctx_n);
+            (void*)self, (unsigned long long)self->thread_id, n);
     fflush(stderr);
 }
 
@@ -953,6 +977,12 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
     if (coh) spu_lockline_lock();
+    /* Re-check under the lock-line lock: an SPU commit to this line between
+     * the check above and here has broken the reservation (SPU commits call
+     * ppu_resv_break_line with this lock held). */
+    if (coh && self && self->reserve_addr != (uint32_t)ea) {
+        spu_lockline_unlock(); resv_unlock(L); return 0;
+    }
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
@@ -1024,6 +1054,9 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
     if (coh) spu_lockline_lock();
+    if (coh && self && self->reserve_addr != (uint32_t)ea) {   /* as in ppu_stwcx32 */
+        spu_lockline_unlock(); resv_unlock(L); return 0;
+    }
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
         if (ok) spu_coh_notify_write((uint32_t)ea);
@@ -2074,6 +2107,7 @@ typedef void (*ppu_fn)(ppu_context*);
 static uint32_t g_addr[PPU_HASH_SIZE];
 static ppu_fn   g_fn[PPU_HASH_SIZE];
 static uint32_t g_fn_count = 0;
+static uint32_t g_fn_gen = 0;   /* bumped by every registration; see ppu_lookup_icall */
 
 extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
 {
@@ -2082,8 +2116,10 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
     /* Bounded probe: never loop past the whole table. A full table (function
      * count >= PPU_HASH_SIZE) would otherwise spin forever here at startup. */
     for (uint32_t probes = 0; probes < PPU_HASH_SIZE; probes++) {
-        if (g_fn[i] == nullptr) { g_addr[i] = a; g_fn[i] = fn; g_fn_count++; return; }
-        if (g_addr[i] == a) { g_fn[i] = fn; return; }   /* overwrite */
+        if (g_fn[i] == nullptr) { g_addr[i] = a; g_fn[i] = fn; g_fn_count++;
+                                  __atomic_fetch_add(&g_fn_gen, 1u, __ATOMIC_RELEASE); return; }
+        if (g_addr[i] == a) { g_fn[i] = fn;   /* overwrite */
+                              __atomic_fetch_add(&g_fn_gen, 1u, __ATOMIC_RELEASE); return; }
         i = (i + 1) & PPU_HASH_MASK;
     }
     static int warned = 0;
@@ -2099,7 +2135,24 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
  * Built lazily on first use (registration is boot-time-only). */
 static struct { void* host; uint32_t guest; } g_inv[PPU_HASH_SIZE];
 static uint32_t g_inv_n = 0;
+static uint32_t ppu_prof_resolve_host_slow(void* ra);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra)
+{
+    /* Every lv2 syscall and HLE call stamps its caller for the sampling
+     * profiler, and the binary search below missed the cache on most of its
+     * steps: in God of War HD gameplay it was a third of lv2_syscall. Call
+     * sites are few, so each thread keeps its last answer per site. The
+     * inverse table is built once, so an answer does not go stale. */
+    struct RaSlot { void* ra; uint32_t guest; };
+    static PPU_THREAD_LOCAL RaSlot t_ra[256];
+    RaSlot& slot = t_ra[((uintptr_t)ra >> 2) & 255u];
+    if (slot.ra == ra && g_inv_n) return slot.guest;
+    const uint32_t g = ppu_prof_resolve_host_slow(ra);
+    if (g_inv_n) { slot.ra = ra; slot.guest = g; }
+    return g;
+}
+
+static uint32_t ppu_prof_resolve_host_slow(void* ra)
 {
     if (!g_inv_n) {
         for (uint32_t i = 0; i < PPU_HASH_SIZE; i++)
@@ -2118,6 +2171,25 @@ extern "C" uint32_t ppu_prof_resolve_host(void* ra)
     while (lo < hi) { uint32_t mid = (lo + hi) / 2;
         if (g_inv[mid].host <= ra) lo = mid + 1; else hi = mid; }
     return lo ? g_inv[lo - 1].guest : 0;
+}
+
+static ppu_fn ppu_lookup(uint32_t a);
+
+/* ppu_lookup for indirect calls. The table and its addresses are 3 MB, so the
+ * probe of an indirect call missed the cache: about a fifth of
+ * ps3_indirect_call_impl in God of War HD gameplay. Targets repeat (vtables,
+ * callbacks), so each thread keeps its last hits, tagged with the registration
+ * count they were found under; any later registration retires them. */
+static ppu_fn ppu_lookup_icall(uint32_t a)
+{
+    struct IcSlot { uint32_t addr, gen; ppu_fn fn; };
+    static PPU_THREAD_LOCAL IcSlot t_ic[512];
+    IcSlot& s = t_ic[(a >> 2) & 511u];
+    const uint32_t gen = __atomic_load_n(&g_fn_gen, __ATOMIC_ACQUIRE);
+    if (s.fn && s.addr == a && s.gen == gen) return s.fn;
+    ppu_fn fn = ppu_lookup(a);
+    if (fn) { s.addr = a; s.gen = gen; s.fn = fn; }
+    return fn;
 }
 
 static ppu_fn ppu_lookup(uint32_t a)
@@ -2736,7 +2808,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         }
     }
 
-    ppu_fn fn = ppu_lookup(addr);
+    ppu_fn fn = ppu_lookup_icall(addr);
     if (!fn) {
         /* OPD-swap clobber fixup: a malformed memcpy (game func_0036FA74) writes
          * some handler/vtable OPDs as {TOC, func} (code & toc SWAPPED), so lifted
@@ -3677,6 +3749,75 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
 }
 
+/* The guest stack an HLE -> guest callback runs on.
+ *
+ * This used to be the fixed EA 0xCFFE0000 in every host thread (the variable
+ * was thread-local, its value was not). The movie player's cellAdec and cellVdec
+ * callbacks run synchronously on two different MoviePlayerStream threads, so
+ * they built their frames over each other: the adec callback's scoped mutex
+ * guard (func_005F0CA8, guard at 0xCFFDFE50) read back a NULL mutex pointer,
+ * unlocked NULL (the [null-write] at 0x005EF018 / [null-read] of 0x8 in the
+ * hung runs) and left the player mutex locked for good -- the next lock of it
+ * (func_005EEFE4) never returned. 0xCFFE0000 is also inside RSX local memory
+ * (0xC0000000 + 256 MB), so VRAM writes could land on it as well.
+ *
+ * lv2 runs these callbacks on a real PPU thread with a stack of its own (the
+ * decoder's thread, or the thread that asked for the callback). Give every
+ * host thread its own 256 KB slot in VM_CB_STACK_REGION, and start a nested
+ * callback below the live frame of the one it is nested in. */
+/* Slots in use, one bit each. A host thread takes the lowest free one on its
+ * first callback and gives it back when it exits (cb_slot_owner below), so a
+ * title that starts and ends threads all session -- a movie player starts
+ * several per movie -- never runs out: only more than 64 host threads making
+ * callbacks AT ONCE share a slot. */
+static std::atomic<uint64_t> s_cb_slots_used{0};
+struct cb_slot_owner {
+    int slot = -1;
+    ~cb_slot_owner()
+    {
+        if (slot >= 0) s_cb_slots_used.fetch_and(~(1ull << slot), std::memory_order_acq_rel);
+    }
+};
+static thread_local cb_slot_owner t_cb_slot;
+
+static uint32_t ppu_cb_stack_sp(const ppu_context* active)
+{
+    static PPU_THREAD_LOCAL uint32_t s_lo = 0, s_hi = 0;
+    if (!s_hi) {
+        const uint32_t slots = VM_CB_STACK_REGION / VM_CB_STACK_SIZE;
+        static_assert(VM_CB_STACK_REGION / VM_CB_STACK_SIZE <= 64, "one bit per slot");
+        uint32_t i = slots;
+        uint64_t used = s_cb_slots_used.load(std::memory_order_acquire);
+        while (~used & (slots >= 64 ? ~0ull : (1ull << slots) - 1u)) {
+            uint32_t k = 0;
+            while (used >> k & 1u) k++;
+            if (s_cb_slots_used.compare_exchange_weak(used, used | (1ull << k),
+                                                      std::memory_order_acq_rel)) {
+                i = k;
+                t_cb_slot.slot = (int)k;
+                break;
+            }
+        }
+        if (i < slots) {
+            s_lo = VM_CB_STACK_BASE + i * VM_CB_STACK_SIZE;
+            s_hi = s_lo + VM_CB_STACK_SIZE;
+        } else {
+            /* Out of slots: share the last one, and say so. */
+            s_lo = VM_CB_STACK_BASE + (slots - 1) * VM_CB_STACK_SIZE;
+            s_hi = s_lo + VM_CB_STACK_SIZE;
+            fprintf(stderr, "[ppu] guest_call: more than %u live host threads make guest "
+                            "callbacks; callback stack slot %u is SHARED\n", slots, slots - 1);
+        }
+    }
+    if (active) {
+        uint32_t sp = (uint32_t)active->gpr[1];
+        /* Nested: below the outer callback's frame and its 288-byte protected zone. */
+        if (sp > s_lo + 0x1000 && sp <= s_hi) return (sp - 0x400) & ~0xFu;
+    }
+    /* Room above the first frame for the callee's LR/CR save words (sp+8, sp+16). */
+    return (s_hi - 0x100) & ~0xFu;
+}
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -3701,14 +3842,9 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                 vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
         return 0; }
 
-    /* Private scratch stack high in the guest stack region, distinct from the
-     * main + ppu_thread stacks. One callback at a time per caller thread. */
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
-
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = ppu_cb_stack_sp(g_active_ctx);   /* per host thread, see above */
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
@@ -3748,12 +3884,9 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
-
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = ppu_cb_stack_sp(g_active_ctx);   /* per host thread, see above */
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
