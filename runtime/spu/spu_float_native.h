@@ -27,6 +27,7 @@ void spu_float_native_summary(void);
 __m128 __vectorcall spu_float_native_add_ps(__m128 a,__m128 b);
 __m128 __vectorcall spu_float_native_mul_ps(__m128 a,__m128 b);
 __m128 __vectorcall spu_float_native_madd_ps(__m128 a,__m128 b,__m128 c);
+__m128 __vectorcall spu_float_native_csflt_ps(__m128 a,int scale);
 static inline u128 spu_float_native_add(u128 a,u128 b) {
     u128 r; _mm_storeu_ps(r._f32,spu_float_native_add_ps(_mm_loadu_ps(a._f32),_mm_loadu_ps(b._f32))); return r;
 }
@@ -36,10 +37,14 @@ static inline u128 spu_float_native_mul(u128 a,u128 b) {
 static inline u128 spu_float_native_madd(u128 a,u128 b,u128 c) {
     u128 r; _mm_storeu_ps(r._f32,spu_float_native_madd_ps(_mm_loadu_ps(a._f32),_mm_loadu_ps(b._f32),_mm_loadu_ps(c._f32))); return r;
 }
+static inline u128 spu_float_native_csflt(u128 a,int scale) {
+    u128 r; _mm_storeu_ps(r._f32,spu_float_native_csflt_ps(_mm_loadu_ps(a._f32),scale)); return r;
+}
 #else
 u128 spu_float_native_add(u128 a,u128 b);
 u128 spu_float_native_mul(u128 a,u128 b);
 u128 spu_float_native_madd(u128 a,u128 b,u128 c);
+u128 spu_float_native_csflt(u128 a,int scale);
 #endif
 #ifdef __cplusplus
 }

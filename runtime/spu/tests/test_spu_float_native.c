@@ -25,6 +25,39 @@ static void verify(u128 a,u128 b,u128 c) {
         }
     }
 }
+static void verify_fi(void) {
+    static const uint32_t edges[]={0,1,0x3ff,0x7ffff,0x00800000u,0x00800001u,0x008003ffu,0x00fffc00u,
+        0x00ffffffu,0x7f7fffffu,0x7f800000u,0x7fffffffu,0x80800000u,0xffffffffu,0x80000000u,0x017ffc00u};
+    for (unsigned n=0;n<2000000;++n) {
+        u128 a,b; for (unsigned l=0;l<4;++l) {
+            a._u32[l]=n<64 ? edges[(n+l)&15] : random_word();
+            b._u32[l]=n<64 ? edges[(n>>2)&15] : random_word();
+        }
+        const u128 actual=spu_fi(a,b),want=spu_fi_ref(a,b);
+        for (unsigned l=0;l<4;++l) {
+            if (want._u32[l]!=actual._u32[l]) {
+                fprintf(stderr,"FAIL fi a=%08x b=%08x expected=%08x actual=%08x\n",a._u32[l],b._u32[l],want._u32[l],actual._u32[l]);
+                abort();
+            }
+            ++checks;
+        }
+    }
+}
+static void verify_csflt(void) {
+    static const uint32_t edges[]={0,1,0xffffffffu,0x7fffffffu,0x80000000u,0x00ffffffu,0x01000001u,0xff000001u};
+    for (int i8=0;i8<256;++i8) for (unsigned n=0;n<64;++n) {
+        u128 a; for (unsigned l=0;l<4;++l) a._u32[l]=n<2 ? edges[(n*4+l)&7] : random_word()>>(random_word()&31);
+        const u128 actual=spu_csflt(a,i8);
+        for (unsigned l=0;l<4;++l) {
+            const uint32_t v=a._u32[l],sign=v&0x80000000u,want=spu_float_pack(sign ? 0u-v : v,i8-155,sign);
+            if (want!=actual._u32[l]) {
+                fprintf(stderr,"FAIL csflt i8=%d v=%08x expected=%08x actual=%08x\n",i8,v,want,actual._u32[l]);
+                abort();
+            }
+            ++checks;
+        }
+    }
+}
 static uint64_t cycles(void) { ULONG64 n; assert(QueryThreadCycleTime(GetCurrentThread(),&n));return n; }
 static volatile uint32_t sink;
 int main(void) {
@@ -44,8 +77,11 @@ int main(void) {
             u128 a,b,c;for(unsigned l=0;l<4;++l) { a._u32[l]=random_word();b._u32[l]=random_word();c._u32[l]=random_word(); }
             verify(a,b,c);
         }
+        verify_csflt();
     }
     assert(!spu_float_native_set_mode(0));
+    verify_csflt();
+    verify_fi();
     u128 zero={0};verify(zero,zero,zero);
     assert(spu_float_native_set_mode(1));
     _mm_setcsr(saved); printf("%llu independent hardware/reference lane comparisons passed\n",checks);
