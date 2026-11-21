@@ -96,39 +96,47 @@ static inline __attribute__((always_inline)) __m128i canonical(__m128i x) {
 static inline __attribute__((always_inline)) __m128i flush(__m128i x) { return canonical(x); }
 #define NATIVE __attribute__((target("avx512f")))
 #define ROUND (_MM_FROUND_TO_ZERO|_MM_FROUND_NO_EXC)
+/* Extended-range lanes and validation are rare. Keep the ordinary path in
+ * registers and spill to memory only for them; the inputs reaching the scalar
+ * reference are the original (uncanonicalized) operands, as before. */
+static __attribute__((noinline)) __m128 __vectorcall finish(__m128 av,__m128 bv,__m128 cv,
+                                                           __m128 fast,int slow,unsigned op) {
+    u128 a,b,c,r;
+    _mm_storeu_ps(a._f32,av); _mm_storeu_ps(b._f32,bv); _mm_storeu_ps(c._f32,cv); _mm_storeu_ps(r._f32,fast);
+    for (int i=0;i<4;++i) if (slow&(1<<i))
+        r._u32[i]=op==0 ? spu_float_add(a._u32[i],b._u32[i]) :
+            op==1 ? spu_float_mul(a._u32[i],b._u32[i]) : spu_float_madd(a._u32[i],b._u32[i],c._u32[i]);
+    if (validate) r=validate_result(r,a,b,op==2 ? c : (u128){0},op);
+    return _mm_loadu_ps(r._f32);
+}
 NATIVE __m128 __vectorcall spu_float_native_add_ps(__m128 av,__m128 bv) {
-    u128 a,b; _mm_storeu_ps(a._f32,av); _mm_storeu_ps(b._f32,bv);
-    __m128i aa=canonical(_mm_loadu_si128((const __m128i*)&a)),bb=canonical(_mm_loadu_si128((const __m128i*)&b));
+    const __m128i aa=canonical(_mm_castps_si128(av)),bb=canonical(_mm_castps_si128(bv));
     const __m128i em=_mm_set1_epi32(0x7f800000),limit=_mm_set1_epi32(0x7e800000);
     const int slow=_mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(
         _mm_cmpgt_epi32(_mm_and_si128(aa,em),limit),
         _mm_cmpgt_epi32(_mm_and_si128(bb,em),limit))));
     __m512 result=_mm512_maskz_add_round_ps(15,_mm512_castps128_ps512(_mm_castsi128_ps(aa)),
         _mm512_castps128_ps512(_mm_castsi128_ps(bb)),ROUND);
-    u128 r; _mm_storeu_si128((__m128i*)&r,flush(_mm_castps_si128(_mm512_castps512_ps128(result))));
-    for (int i=0;i<4;++i) if (slow&(1<<i)) r._u32[i]=spu_float_add(a._u32[i],b._u32[i]);
-    if (validate) r=validate_result(r,a,b,(u128){0},0);
-    return _mm_loadu_ps(r._f32);
+    const __m128 fast=_mm_castsi128_ps(flush(_mm_castps_si128(_mm512_castps512_ps128(result))));
+    if (__builtin_expect(!(slow|validate),1)) return fast;
+    return finish(av,bv,_mm_setzero_ps(),fast,slow,0);
 }
 NATIVE __m128 __vectorcall spu_float_native_mul_ps(__m128 av,__m128 bv) {
-    u128 a,b; _mm_storeu_ps(a._f32,av); _mm_storeu_ps(b._f32,bv);
-    __m128i aa=canonical(_mm_loadu_si128((const __m128i*)&a)),bb=canonical(_mm_loadu_si128((const __m128i*)&b));
+    const __m128i aa=canonical(_mm_castps_si128(av)),bb=canonical(_mm_castps_si128(bv));
     const __m128i em=_mm_set1_epi32(0xff);
     __m128i ea=_mm_and_si128(_mm_srli_epi32(aa,23),em);
     __m128i eb=_mm_and_si128(_mm_srli_epi32(bb,23),em);
     __m128i unsafe=_mm_or_si128(_mm_cmpeq_epi32(ea,em),_mm_cmpeq_epi32(eb,em));
     unsafe=_mm_or_si128(unsafe,_mm_cmpgt_epi32(_mm_add_epi32(ea,eb),_mm_set1_epi32(379)));
-    int slow=_mm_movemask_ps(_mm_castsi128_ps(unsafe));
+    const int slow=_mm_movemask_ps(_mm_castsi128_ps(unsafe));
     __m512 result=_mm512_maskz_mul_round_ps(15,_mm512_castps128_ps512(_mm_castsi128_ps(aa)),
         _mm512_castps128_ps512(_mm_castsi128_ps(bb)),ROUND);
-    u128 r; _mm_storeu_si128((__m128i*)&r,flush(_mm_castps_si128(_mm512_castps512_ps128(result))));
-    for (int i=0;i<4;++i) if (slow&(1<<i)) r._u32[i]=spu_float_mul(a._u32[i],b._u32[i]);
-    if (validate) r=validate_result(r,a,b,(u128){0},1);
-    return _mm_loadu_ps(r._f32);
+    const __m128 fast=_mm_castsi128_ps(flush(_mm_castps_si128(_mm512_castps512_ps128(result))));
+    if (__builtin_expect(!(slow|validate),1)) return fast;
+    return finish(av,bv,_mm_setzero_ps(),fast,slow,1);
 }
 NATIVE __m128 __vectorcall spu_float_native_madd_ps(__m128 av,__m128 bv,__m128 cv) {
-    u128 a,b,c; _mm_storeu_ps(a._f32,av); _mm_storeu_ps(b._f32,bv); _mm_storeu_ps(c._f32,cv);
-    __m128i aa=canonical(_mm_loadu_si128((const __m128i*)&a)),bb=canonical(_mm_loadu_si128((const __m128i*)&b)),cc=canonical(_mm_loadu_si128((const __m128i*)&c));
+    const __m128i aa=canonical(_mm_castps_si128(av)),bb=canonical(_mm_castps_si128(bv)),cc=canonical(_mm_castps_si128(cv));
     const __m128i em=_mm_set1_epi32(0xff);
     __m128i ea=_mm_and_si128(_mm_srli_epi32(aa,23),em);
     __m128i eb=_mm_and_si128(_mm_srli_epi32(bb,23),em);
@@ -136,13 +144,30 @@ NATIVE __m128 __vectorcall spu_float_native_madd_ps(__m128 av,__m128 bv,__m128 c
     __m128i unsafe=_mm_or_si128(_mm_cmpeq_epi32(ea,em),_mm_cmpeq_epi32(eb,em));
     unsafe=_mm_or_si128(unsafe,_mm_cmpgt_epi32(ec,_mm_set1_epi32(253)));
     unsafe=_mm_or_si128(unsafe,_mm_cmpgt_epi32(_mm_add_epi32(ea,eb),_mm_set1_epi32(379)));
-    int slow=_mm_movemask_ps(_mm_castsi128_ps(unsafe));
+    const int slow=_mm_movemask_ps(_mm_castsi128_ps(unsafe));
     __m512 result=_mm512_maskz_fmadd_round_ps(15,_mm512_castps128_ps512(_mm_castsi128_ps(aa)),
         _mm512_castps128_ps512(_mm_castsi128_ps(bb)),_mm512_castps128_ps512(_mm_castsi128_ps(cc)),ROUND);
-    u128 r; _mm_storeu_si128((__m128i*)&r,flush(_mm_castps_si128(_mm512_castps512_ps128(result))));
-    for (int i=0;i<4;++i) if (slow&(1<<i)) r._u32[i]=spu_float_madd(a._u32[i],b._u32[i],c._u32[i]);
-    if (validate) r=validate_result(r,a,b,c,2);
-    return _mm_loadu_ps(r._f32);
+    const __m128 fast=_mm_castsi128_ps(flush(_mm_castps_si128(_mm512_castps512_ps128(result))));
+    if (__builtin_expect(!(slow|validate),1)) return fast;
+    return finish(av,bv,cv,fast,slow,2);
+}
+/* csflt: signed integer -> float scaled by 2^scale, truncating. A truncating
+ * conversion is exact spu_float_pack rounding, and the power-of-two scale only
+ * moves the exponent: biased <= 0 flushes to zero and > 255 saturates to the
+ * largest SPU magnitude, as spu_float_pack does. No lane needs the scalar path. */
+NATIVE __m128 __vectorcall spu_float_native_csflt_ps(__m128 av,int scale) {
+    const __m128i bits=_mm_castps_si128(_mm512_castps512_ps128(
+        _mm512_cvt_roundepi32_ps(_mm512_castsi128_si512(_mm_castps_si128(av)),ROUND)));
+    if (!scale) return _mm_castsi128_ps(bits);
+    const __m128i e=_mm_and_si128(_mm_srli_epi32(bits,23),_mm_set1_epi32(255));
+    const __m128i ne=_mm_add_epi32(e,_mm_set1_epi32(scale));
+    const __m128i zero=_mm_or_si128(_mm_cmpeq_epi32(e,_mm_setzero_si128()),
+        _mm_cmpgt_epi32(_mm_set1_epi32(1),ne));
+    const __m128i over=_mm_cmpgt_epi32(ne,_mm_set1_epi32(255));
+    const __m128i scaled=_mm_add_epi32(bits,_mm_set1_epi32((int)((uint32_t)scale<<23)));
+    const __m128i saturated=_mm_or_si128(_mm_and_si128(bits,_mm_set1_epi32((int)0x80000000u)),
+        _mm_set1_epi32(0x7fffffff));
+    return _mm_castsi128_ps(_mm_andnot_si128(zero,_mm_blendv_epi8(scaled,saturated,over)));
 }
 
 #else
@@ -153,4 +178,5 @@ void spu_float_native_summary(void) {}
 u128 spu_float_native_add(u128 a,u128 b) { u128 r; for(int i=0;i<4;++i) r._u32[i]=spu_float_add(a._u32[i],b._u32[i]); return r; }
 u128 spu_float_native_mul(u128 a,u128 b) { u128 r; for(int i=0;i<4;++i) r._u32[i]=spu_float_mul(a._u32[i],b._u32[i]); return r; }
 u128 spu_float_native_madd(u128 a,u128 b,u128 c) { u128 r; for(int i=0;i<4;++i) r._u32[i]=spu_float_madd(a._u32[i],b._u32[i],c._u32[i]); return r; }
+u128 spu_float_native_csflt(u128 a,int scale) { u128 r; for(int i=0;i<4;++i) { uint32_t v=a._u32[i],sign=v&0x80000000u; r._u32[i]=spu_float_pack(sign ? 0u-v : v,scale,sign); } return r; }
 #endif
