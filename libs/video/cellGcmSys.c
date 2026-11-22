@@ -983,6 +983,11 @@ static int nv3089_rows_enabled(void)
 static u64 s_blit_ticks, s_blit_pixels, s_blit_row_pixels;
 void cellGcmGetBlitProfile(u64* ticks, u64* pixels, u64* row_pixels)
 { *ticks=s_blit_ticks; *pixels=s_blit_pixels; *row_pixels=s_blit_row_pixels; }
+#else
+/* tools' --all NID scan collects every cellGcm* definition, so the boot smoke
+ * references this profiling hook on every platform; report no samples. */
+void cellGcmGetBlitProfile(u64* ticks, u64* pixels, u64* row_pixels)
+{ *ticks=0; *pixels=0; *row_pixels=0; }
 #endif
 
 static void nv3089_blit_impl(void)

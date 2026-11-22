@@ -13,7 +13,9 @@ static inline int spu_float_native_active(void) {
     return __atomic_load_n(&g_spu_float_native,__ATOMIC_ACQUIRE)==1;
 }
 #else
-static inline int spu_float_native_active(void) { return 0; }
+/* A constant, not a function: unoptimized builds then drop every native
+ * branch instead of referencing kernels that only spu_float_native.c defines. */
+#define spu_float_native_active() 0
 #endif
 int spu_float_native_available(void);
 int spu_float_native_set_mode(int requested);
