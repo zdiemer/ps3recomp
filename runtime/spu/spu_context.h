@@ -495,6 +495,8 @@ SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      
 SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
 SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
 SPU_GATE int g_wws_read_probe = 0;
+/* Registered stack-reset entries (spu_channels.c); 0 skips the per-step check. */
+SPU_GATE unsigned g_spu_stack_reset_count = 0;
 static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
     if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;
@@ -778,6 +780,7 @@ extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 
 /* Central per-transfer hooks (stubbed in spu_drain.c until their milestones). */
 void yz_lockstep_tick(spu_context* ctx);             /* round-robin token gate */
+extern volatile int g_yz_lockstep_on;                /* 0: tick is a no-op     */
 void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    */
 /* Restore image_id after a call-bracket (adopt-on-serve); re-applies the
  * persistent LS-0xA00 workload module if one is set. */
@@ -868,7 +871,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             }                                                              \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \
-            yz_lockstep_tick(ctx);                             \
+            if (g_yz_lockstep_on) yz_lockstep_tick(ctx);       \
             spu_task_launch_check((ctx), (void*)_tf);          \
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \

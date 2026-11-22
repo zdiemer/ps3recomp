@@ -1453,12 +1453,11 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
  * Matching the resolved function, not just its LS address, avoids affecting
  * unrelated overlays using the same address. Registration precedes execution. */
 static struct { uint32_t entry; int image_id; } s_stack_reset[16];
-static unsigned s_stack_reset_count;
 void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 {
-    if (s_stack_reset_count < 16) {
-        s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
-        s_stack_reset[s_stack_reset_count++].image_id = image_id;
+    if (g_spu_stack_reset_count < 16) {
+        s_stack_reset[g_spu_stack_reset_count].entry = entry & SPU_LS_MASK;
+        s_stack_reset[g_spu_stack_reset_count++].image_id = image_id;
     }
 }
 
@@ -1467,7 +1466,7 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
 {
     if (!ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
-    for (unsigned i = 0; i < s_stack_reset_count; ++i)
+    for (unsigned i = 0; i < g_spu_stack_reset_count; ++i)
         if (ctx->pc == s_stack_reset[i].entry &&
             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
             g_spu_trampoline_fn = 0;
@@ -2028,6 +2027,15 @@ static int spu_smc_microstep(spu_context* ctx)
     return 0;
 }
 
+/* YDKJ_NO_CRI_R4 is startup configuration, read once: the check below runs
+ * on every image-23 indirect branch. */
+static int spu_cri_r4_enabled(void)
+{
+    static int s_on = -1;
+    if (s_on < 0) s_on = getenv("YDKJ_NO_CRI_R4") ? 0 : 1;
+    return s_on;
+}
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -2108,7 +2116,7 @@ void spu_indirect_branch(spu_context* ctx)
      * the taskset from garbage -> waiting!=0 -> wrong resume path -> savedContextLr=0.
      * Inject r4 = taskset EA (0x0F000000) at the policy entry dispatch (this is the
      * exact point before the entry reads r4, after the kernel's arg setup). */
-    if (ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID && !getenv("YDKJ_NO_CRI_R4")) {
+    if (ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID && spu_cri_r4_enabled()) {
         static int s_r4 = -1; if (s_r4 < 0) s_r4 = getenv("YDKJ_CRI_CHAIN") ? 1 : 0;
         if (s_r4) {
             /* Force ctxt->taskset @LS 0x27B8 = the REAL game taskset EA on every
