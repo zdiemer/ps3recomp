@@ -5,6 +5,7 @@ static volatile LONG halts;
 void spu_halt(spu_context* ctx) { (void)ctx; InterlockedIncrement(&halts); }
 void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*)) { (void)ctx; (void)fn; assert(0); }
 void yz_lockstep_tick(spu_context* ctx) { (void)ctx; assert(0); }
+volatile int g_yz_lockstep_on = 0;
 void spu_restart_dispatch(spu_context* ctx) { (void)ctx; assert(0); }
 void spu_indirect_branch(spu_context* ctx) { (void)ctx; assert(0); }
 void (*spu_lookup(uint32_t pc,int image))(spu_context*) { (void)pc; (void)image; assert(0); return NULL; }

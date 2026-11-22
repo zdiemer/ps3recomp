@@ -102,6 +102,7 @@ SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
 int g_wws_read_probe = 0;
 int g_wws_code_probe = 0;
 void yz_lockstep_tick(spu_context* c){ (void)c; }
+volatile int g_yz_lockstep_on = 0;
 void spu_task_launch_check(spu_context* c, void* f){ (void)c; (void)f; }
 void (*spu_take_interrupt(spu_context* c, void (*tf)(spu_context*)))(spu_context*)
 { (void)c; return tf; }

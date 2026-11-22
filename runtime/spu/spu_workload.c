@@ -452,9 +452,16 @@ static uint64_t spu_job_qpc(void)
 
 static int spu_job_timing_enabled(int image)
 {
-    if (!getenv("SPU_JOB_TIMING")) return 0;
-    const char* filter = getenv("SPU_JOB_TIMING_IMAGE");
-    return !filter || atoi(filter) == image;
+    /* Startup configuration, read once: this runs for every async job.
+     * Racing first callers store the same values. */
+    static int s_timing = -1, s_filtered, s_filter;
+    if (s_timing < 0) {
+        const char* filter = getenv("SPU_JOB_TIMING_IMAGE");
+        s_filtered = filter != NULL;
+        s_filter = filter ? atoi(filter) : 0;
+        s_timing = getenv("SPU_JOB_TIMING") ? 1 : 0;
+    }
+    return s_timing && (!s_filtered || s_filter == image);
 }
 
 #if defined(YZ_PERF_PROFILE) && defined(_WIN32)

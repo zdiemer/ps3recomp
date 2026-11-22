@@ -8,6 +8,7 @@ void spu_halt(spu_context* ctx) { (void)ctx; ++halts; }
 void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
 { assert(ctx && fn == NULL); ++stack_checks; }
 void yz_lockstep_tick(spu_context* ctx) { (void)ctx; assert(0); }
+volatile int g_yz_lockstep_on = 0;
 void spu_restart_dispatch(spu_context* ctx) { (void)ctx; assert(0); }
 void spu_indirect_branch(spu_context* ctx) { (void)ctx; assert(0); }
 void (*spu_lookup(uint32_t pc,int image))(spu_context*)
@@ -26,6 +27,7 @@ static void check(unsigned expected_steps, unsigned expected_halts)
 int main(int argc, char** argv)
 {
     assert(argc == 2);
+    g_spu_stack_reset_count = 1;   /* a registered entry keeps the check live */
     const char* names[] = { "SPU_NO_LS0_END", "SPU_EXITTRACE", "SPU_STEPTRACE",
                            "SPU_STEPTRACE_FROM", "SPU_STEPTRACE_REGS", "SPU_JOBDRAIN" };
     for(unsigned i=0;i<sizeof(names)/sizeof(names[0]);++i) _putenv_s(names[i], "");

@@ -178,29 +178,40 @@ static __attribute__((noinline, cold)) int spu_launch_probes_configured(void)
     return 0;
 }
 
-void spu_task_launch_check(spu_context* ctx, void* fn)
+/* Environment settings are startup configuration, as in the diagnostic
+ * implementation. Concurrent first callers may resolve the same immutable
+ * settings; no partially initialized configuration is published. */
+static _Atomic int s_launch_probes = -1;
+extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+
+/* Runs on every drain step. RelWithDebInfo (/Ob1) inlines only functions
+ * marked inline, so the drain loop keeps this body and the disabled stack-reset
+ * check in line instead of making two calls per step. */
+static inline __attribute__((always_inline)) void
+spu_task_launch_check_inline(spu_context* ctx, void* fn)
 {
-    /* Environment settings are startup configuration, as in the diagnostic
-     * implementation. Concurrent first callers may resolve the same immutable
-     * settings; no partially initialized configuration is published. */
-    static _Atomic int probes = -1;
-    int configured = atomic_load_explicit(&probes, memory_order_relaxed);
-    if (configured < 0) {
+    int configured = atomic_load_explicit(&s_launch_probes, memory_order_relaxed);
+    if (__builtin_expect(configured < 0, 0)) {
         configured = spu_launch_probes_configured();
-        atomic_store_explicit(&probes, configured, memory_order_relaxed);
+        atomic_store_explicit(&s_launch_probes, configured, memory_order_relaxed);
     }
-    if (configured || g_pm_flow_ctx) {
+    if (__builtin_expect(configured || g_pm_flow_ctx != 0, 0)) {
         spu_task_launch_check_diagnostic(ctx, fn);
         return;
     }
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
-    extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
-    spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+    if (g_spu_stack_reset_count)
+        spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     if (ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 &&
         !ctx->policy_mode && ctx->image_id > 0) {
         spu_note_ls0_complete(ctx);
         spu_halt(ctx);
     }
+}
+
+void spu_task_launch_check(spu_context* ctx, void* fn)
+{
+    spu_task_launch_check_inline(ctx, fn);
 }
 
 /* Restore the active image after a lifted call bracket. The brsl/bisl emission
@@ -386,17 +397,34 @@ void (*spu_take_interrupt(spu_context* ctx,
     return spu_indirect_branch;
 }
 
+/* Depth limit and ring control are process-wide startup configuration; racing
+ * first callers store the same values. s_depth_max stays 0 until resolved. */
+static uint32_t s_depth_max;
+static const char* s_depth_control;
+static void spu_depth_guard_slow(spu_context* ctx);
+static inline __attribute__((always_inline)) void spu_depth_guard_inline(spu_context* ctx)
+{
+    /* The usual path needs no diagnostic writes or benchmark bookkeeping. */
+    if (__builtin_expect(s_depth_max != 0 && !s_depth_control &&
+                         ctx->host_depth < s_depth_max, 1)) return;
+    spu_depth_guard_slow(ctx);
+}
+
 /* See the declaration in spu_context.h. */
 void spu_depth_guard(spu_context* ctx)
 {
-    static _Thread_local uint32_t s_max = 0;
-    static _Thread_local const char* control;
-    if (!s_max) {
+    spu_depth_guard_inline(ctx);
+}
+
+static __attribute__((noinline)) void spu_depth_guard_slow(spu_context* ctx)
+{
+    if (!s_depth_max) {
         const char* e = getenv("SPU_HOST_DEPTH_MAX");
-        s_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
-        control=getenv("SPU_DEPTH_RING_FILE");
+        s_depth_control = getenv("SPU_DEPTH_RING_FILE");
+        s_depth_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
     }
-    /* The usual path needs no diagnostic writes or benchmark bookkeeping. */
+    const uint32_t s_max = s_depth_max;
+    const char* control = s_depth_control;
     if (!control && ctx->host_depth < s_max) return;
 
     /* The per-thread trampoline history already records these PCs. The former
@@ -472,7 +500,7 @@ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
-    spu_depth_guard(ctx);
+    spu_depth_guard_inline(ctx);
     /* The frame an interrupt taken in THIS loop returns to. It stays armed
      * after the handler's first host function returns -- the handler keeps
      * running as trampolines of this loop -- until its iret fires or the
@@ -491,8 +519,8 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             void (*fn)(spu_context*) = g_spu_trampoline_fn;
             g_spu_trampoline_fn = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
-            yz_lockstep_tick(ctx);
-            spu_task_launch_check(ctx, (void*)fn);
+            if (g_yz_lockstep_on) yz_lockstep_tick(ctx);
+            spu_task_launch_check_inline(ctx, (void*)fn);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
