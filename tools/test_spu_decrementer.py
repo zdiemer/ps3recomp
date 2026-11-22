@@ -2,17 +2,23 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import re
 import subprocess
+import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--compiler", required=True, type=Path)
-    parser.add_argument("--output-dir", required=True, type=Path)
+    # CI's generic tools/test_*.py loop runs this bare: default to the
+    # platform compiler and a temporary directory.
+    default_compiler = "clang-cl" if sys.platform == "win32" else os.environ.get("CC", "cc")
+    parser.add_argument("--compiler", type=Path, default=Path(default_compiler))
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--source", type=Path, default=ROOT / "runtime/spu/spu_channels.c")
     args = parser.parse_args()
     source = args.source.read_text(encoding="utf-8")
@@ -73,14 +79,18 @@ int main(void) {
     return 0;
 }
 '''.replace("@HZ@", str(hz)).replace("@BODY@", body).replace("@CASES@", ",\n".join(cases))
-    output = args.output_dir.resolve()
+    output = (args.output_dir or Path(tempfile.mkdtemp(prefix="spu-decrementer-"))).resolve()
     output.mkdir(parents=True, exist_ok=True)
     c = output / "decrementer.c"
     c.write_text(harness, encoding="utf-8")
     exe = output / "decrementer.exe"
-    subprocess.run([str(args.compiler), "/nologo", "/std:c11", "/W4", "/WX", "/O2",
-                    "/UNDEBUG", str(c), f"/Fo{output / 'decrementer.obj'}", f"/Fe{exe}"],
-                   check=True)
+    if "cl" in args.compiler.stem.lower().split("-")[-1:]:
+        command = [str(args.compiler), "/nologo", "/std:c11", "/W4", "/WX", "/O2",
+                   "/UNDEBUG", str(c), f"/Fo{output / 'decrementer.obj'}", f"/Fe{exe}"]
+    else:
+        command = [str(args.compiler), "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2",
+                   "-UNDEBUG", str(c), "-o", str(exe)]
+    subprocess.run(command, check=True)
     subprocess.run([str(exe)], check=True, timeout=10)
 
 
