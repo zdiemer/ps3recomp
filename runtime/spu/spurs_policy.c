@@ -113,6 +113,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     s_pm_data[wid][spu_num] = wkl_data;
     ctx->image_id    = image_id;
     ctx->policy_mode = 1;
+    /* The WWS LS probes watch image 2 policy contexts; arm their gate. */
+    if (image_id == 2) { g_spu_ls_policy_probe = 1; g_spu_ls_diag = 1; }
 
     /* PM image at its load base (first entry only -- LS persists). */
     if (first)

@@ -497,6 +497,19 @@ SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      
 SPU_GATE int g_wws_read_probe = 0;
 /* Registered stack-reset entries (spu_channels.c); 0 skips the per-step check. */
 SPU_GATE unsigned g_spu_stack_reset_count = 0;
+/* One gate for every local-store diagnostic below, so the disabled case costs
+ * one load and branch per access instead of a check per probe. Nonzero while
+ * any probe gate is unresolved (-1) or armed, or once a SPURS policy context
+ * has run image 2 (the WWS probes). The checked accessors keep the original
+ * per-probe conditions; spu_ls_diag_update() clears the gate once the first
+ * checked read and write have resolved every gate to off. */
+SPU_GATE int g_spu_ls_diag = 1;
+SPU_GATE int g_spu_ls_policy_probe = 0;  /* spurs_policy.c: image 2 policy ran */
+static inline void spu_ls_diag_update(void)
+{
+    g_spu_ls_diag = g_spu_ls_probe != 0 || g_spu_ls_watch_n != 0 ||
+                    g_spu_smc_watch != 0 || g_spu_ls_policy_probe != 0;
+}
 static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
     if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;
@@ -535,15 +548,39 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
     }
 }
 
-static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+static __attribute__((noinline, cold)) u128 spu_ls_read128_checked(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
-    if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
+    if (g_spu_ls_probe != 0 || (ctx->image_id == 2 && ctx->policy_mode))
         spu_ls_read_probe(ctx, lsa);
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
     spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+#if SPU_LS_FAST
+    uint32_t w0, w1, w2, w3;
+    memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
+    memcpy(&w2, p + 8,  4); memcpy(&w3, p + 12, 4);
+    v._u32[0] = SPU_BSWAP32(w0); v._u32[1] = SPU_BSWAP32(w1);
+    v._u32[2] = SPU_BSWAP32(w2); v._u32[3] = SPU_BSWAP32(w3);
+#else
+    for (int i = 0; i < 4; i++) {
+        v._u32[i] = ((uint32_t)p[i*4]     << 24) |
+                    ((uint32_t)p[i*4 + 1] << 16) |
+                    ((uint32_t)p[i*4 + 2] <<  8) |
+                    (uint32_t)p[i*4 + 3];
+    }
+#endif
+    spu_ls_diag_update();
+    return v;
+}
+
+static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+{
+    if (__builtin_expect(g_spu_ls_diag != 0, 0))
+        return spu_ls_read128_checked(ctx, lsa);
+    const uint8_t* p = &ctx->ls[lsa & SPU_LS_MASK & ~0xFu];
+    u128 v;
 #if SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
@@ -614,7 +651,7 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
       } }
 }
 
-static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+static __attribute__((noinline, cold)) void spu_ls_write128_checked(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
     uint8_t* p = &ctx->ls[lsa];
@@ -642,8 +679,32 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 #endif
     spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-    if (__builtin_expect(g_spu_smc_watch != 0, 0))
+    if (g_spu_smc_watch != 0)
         spu_ls_write_probe_smc(ctx, lsa, p);
+    spu_ls_diag_update();
+}
+
+static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+{
+    if (__builtin_expect(g_spu_ls_diag != 0, 0)) {
+        spu_ls_write128_checked(ctx, lsa, val);
+        return;
+    }
+    uint8_t* p = &ctx->ls[lsa & SPU_LS_MASK & ~0xFu];
+#if SPU_LS_FAST
+    uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
+    uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
+    memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);
+    memcpy(p + 8,  &w2, 4); memcpy(p + 12, &w3, 4);
+#else
+    for (int i = 0; i < 4; i++) {
+        uint32_t w = val._u32[i];
+        p[i*4]     = (uint8_t)(w >> 24);
+        p[i*4 + 1] = (uint8_t)(w >> 16);
+        p[i*4 + 2] = (uint8_t)(w >>  8);
+        p[i*4 + 3] = (uint8_t)w;
+    }
+#endif
 }
 
 /* ---------------------------------------------------------------------------
