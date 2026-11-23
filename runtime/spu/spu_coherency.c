@@ -240,6 +240,14 @@ unsigned char spu_coh_reservation_bitmap[SPU_COH_BITMAP_SIZE];
  * serialize an unreserved PPU store against a concurrent first reservation. */
 uint32_t spu_coh_reservations_armed;
 
+unsigned char vm_inline_page[0x10000];
+
+void vm_inline_pages_clear(void)
+{
+    for (uint32_t page = 0; page < 0x10000u; ++page)
+        spu_coh_atomic_store_u8(&vm_inline_page[page], 0);
+}
+
 /* Compact live set, always accessed under the lock-line lock. Async jobs may
  * outnumber physical SPUs, so an eight-entry ceiling can lose real holders. */
 static spu_context** s_coh_ctxs;
@@ -254,6 +262,8 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
      * neighboring bits with an ordinary read followed by an atomic release
      * store. The PPU predicate reads this byte concurrently without that lock. */
     unsigned char* byte = &spu_coh_reservation_bitmap[line >> 3];
+    /* An inline store to this page would skip the bitmap check below. */
+    spu_coh_atomic_store_u8(&vm_inline_page[ea >> 16], 0);
     unsigned char bits = spu_coh_atomic_load_u8_relaxed(byte);
     bits |= (unsigned char)(1u << (line & 7));
     spu_coh_atomic_store_u8(byte, bits);

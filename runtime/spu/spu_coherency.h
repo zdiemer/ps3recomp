@@ -77,6 +77,19 @@ int spu_coh_is_reserved(uint32_t addr);
 extern unsigned char spu_coh_reservation_bitmap[SPU_COH_BITMAP_SIZE];
 extern uint32_t spu_coh_reservations_armed;
 
+/* Inline-access pages. A nonzero byte says that a guest load or store starting
+ * in that 64 KB page does nothing beyond the plain memory access: the page is
+ * ordinary RAM (see vm_plain_pages_init), no line in it has ever been
+ * SPU-reserved, and no write watch is armed. Generated code may then access it
+ * without calling the runtime accessor (ppu_stack_access.h).
+ *
+ * The PPU loader fills the table at startup when no memory diagnostic is on.
+ * spu_coh_reserve clears a page before marking its first line, and like line
+ * marks, a cleared page stays cleared. A write watch armed at run time (the
+ * null-store sweep) clears the whole table. */
+extern unsigned char vm_inline_page[0x10000];
+void vm_inline_pages_clear(void);
+
 /* Keep the bitmap's storage representation plain across C/C++ translation
  * units. Clang/clang-cl use __atomic builtins; native MSVC uses its interlocked
  * intrinsics, whose operations are sequentially consistent. */

@@ -1331,7 +1331,7 @@ static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
     if (!en) return 0;                                    /* let it land */
     { static int sweep = -1;
       if (sweep < 0) { const char* e = getenv("PS3_NULL_SWEEP"); sweep = e ? 1 : 0; }
-      if (sweep) { g_null_sweep_hi = 1; g_null_sweep_last = a;
+      if (sweep) { g_null_sweep_hi = 1; g_null_sweep_last = a; vm_inline_pages_clear();
                    g_null_sweep_tid = g_active_ctx
                                     ? (unsigned)g_active_ctx->thread_id : 0u; } }
     { static long n = 0;
@@ -2069,6 +2069,9 @@ static void vm_plain_pages_init(void)
     if (!vm_base || vm_memory_probes() || !ppu_inline_coh_predicate_enabled) return;
     const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
     const uint64_t inject = VM_HLE_INJECT_BASE;
+    /* SPU_ATOM_EA arms g_barrier_sync_watch on the first SPU atomic, after
+     * this runs; its watched stores must keep reaching the full accessor. */
+    const bool watched = getenv("SPU_ATOM_EA") != nullptr;
     unsigned plain = 0;
     /* Page 0 holds the null-access reports; the top page keeps an access from
      * running past the end of the guest space. */
@@ -2079,6 +2082,12 @@ static void vm_plain_pages_init(void)
         if (lo < (uint64_t)SPU_RAW_BASE + SPU_RAW_SPAN && SPU_RAW_BASE < hi) continue;
         s_vm_plain_page[page] = 1;
         ++plain;
+        /* No SPU runs yet, but a page with a marked line stays out. */
+        const unsigned char* marks = &spu_coh_reservation_bitmap[page << 6];
+        unsigned char marked = 0;
+        for (unsigned i = 0; i < 64u; ++i) marked |= spu_coh_atomic_load_u8(&marks[i]);
+        if (!marked && !watched && !(g_barrier_sync_watch | g_null_sweep_hi))
+            spu_coh_atomic_store_u8(&vm_inline_page[page], 1);
     }
     if (ps3_log_verbose())
         fprintf(stderr, "[vm-plain-pages] %u of 65536 pages\n", plain);

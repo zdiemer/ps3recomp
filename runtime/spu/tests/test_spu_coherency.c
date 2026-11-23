@@ -111,6 +111,38 @@ static void spu_reset(spu_context* ctx, uint32_t spu_id)
 }
 
 /* ===========================================================================
+ * Inline-access pages: a reservation takes its page off the inline path
+ * ===========================================================================*/
+/* A page the other tests never reserve: marks are permanent. */
+#define INLINE_PAGE 0x0009u
+
+static void test_inline_pages(void)
+{
+    spu_reset(&g_spu_a, 0);
+    vm_inline_page[INLINE_PAGE] = 1;
+    vm_inline_page[INLINE_PAGE + 1] = 1;
+    vm_inline_page[0x1234] = 1;
+
+    TEST("GETLLAR clears the page holding the reserved line");
+    spu_getllar(&g_spu_a, ((uint32_t)INLINE_PAGE << 16) + 0x88);
+    CHECK(vm_inline_page[INLINE_PAGE] == 0);
+
+    TEST("other pages stay inline");
+    CHECK(vm_inline_page[INLINE_PAGE + 1] == 1);
+    CHECK(vm_inline_page[0x1234] == 1);
+
+    TEST("a cleared page stays cleared when the line is reserved again");
+    spu_getllar(&g_spu_a, ((uint32_t)INLINE_PAGE << 16) + 0x200);
+    CHECK(vm_inline_page[INLINE_PAGE] == 0);
+
+    TEST("clearing the table takes every page off the inline path");
+    vm_inline_pages_clear();
+    CHECK(vm_inline_page[INLINE_PAGE + 1] == 0);
+    CHECK(vm_inline_page[0x1234] == 0);
+    g_spu_a.resv_valid = 0;
+}
+
+/* ===========================================================================
  * The bitmap: what a reservation marks, and what it leaves alone
  * ===========================================================================*/
 static void test_bitmap(void)
@@ -362,6 +394,7 @@ static void test_block_stores(void)
  * ===========================================================================*/
 int main(void)
 {
+    test_inline_pages();
     test_bitmap();
     test_ppu_store_raises_lr();
     test_no_false_raise();
