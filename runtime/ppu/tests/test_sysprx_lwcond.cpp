@@ -12,6 +12,7 @@ uint8_t* vm_base = memory;
 volatile long long g_gcm_ref_pub_count = 0;
 uint32_t ppu_hle_inject_base = 0;
 void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) { abort(); }
+void ps3_hle_register_fast(uint32_t, int (*)(ppu_context*)) { abort(); }
 void ps3_net_host_register(unsigned int (*)(unsigned int, unsigned int)) { abort(); }
 void np_score_register_ctx() { abort(); }
 void ppu_register_function(uint64_t, void (*)(ppu_context*)) { abort(); }
@@ -56,8 +57,8 @@ int main() {
     assert(vm_read32(cond + 4) != first_id);
     assert(vm_read32(cond + 8) == 0x00E79E20);
 #ifdef _WIN32
-    HANDLE sem = lwm_sem(mutex);
-    assert(WaitForSingleObject(sem, 0) == WAIT_OBJECT_0);
+    struct LwmSlot* lock = lwm_slot(mutex);
+    assert(lock && lwm_try(lock));      /* free; the test now holds it */
     vm_write32(mutex + LWM_OWNER, 17);
     vm_write32(mutex + LWM_RECUR, 1);
     ctx.gpr[3] = cond;
@@ -65,8 +66,10 @@ int main() {
     assert(ctx.gpr[3] == 0);
     assert(vm_read32(mutex + LWM_OWNER) == 17);
     assert(vm_read32(mutex + LWM_RECUR) == 1);
-    assert(WaitForSingleObject(sem, 0) == WAIT_TIMEOUT);
-    ReleaseSemaphore(sem, 1, NULL);
+    assert(!lwm_try(lock));             /* the wait took it back */
+    lwm_release(lock);
+    assert(lwm_try(lock));
+    lwm_release(lock);
 #endif
     puts("PASS: retail 8-byte lwcond layout, adjacent callback, unique IDs and paired mutex wait");
 }
