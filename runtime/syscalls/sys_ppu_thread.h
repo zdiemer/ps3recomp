@@ -36,6 +36,15 @@ extern "C" {
 #define PPU_THREAD_STATE_FINISHED   2
 #define PPU_THREAD_STATE_DETACHED   3
 
+/* sys_ppu_thread_create flags (r8). A thread created without JOINABLE is
+ * detached from birth: lv2 reclaims it when it ends and refuses to join it. */
+#ifndef SYS_PPU_THREAD_CREATE_JOINABLE
+#define SYS_PPU_THREAD_CREATE_JOINABLE   0x1
+#endif
+#ifndef SYS_PPU_THREAD_CREATE_INTERRUPT
+#define SYS_PPU_THREAD_CREATE_INTERRUPT  0x2
+#endif
+
 /* Thread entry point type - recompiled function pointer */
 typedef void (*ppu_thread_entry_fn)(ppu_context* ctx);
 
@@ -68,6 +77,13 @@ typedef struct ppu_thread_info {
     pthread_cond_t  finish_cond;
     int             finished;
 #endif
+
+    /* Lifetime bookkeeping, all under the table lock. */
+    uint32_t     stack_capacity; /* bytes the guest stack really spans (>= stack_size) */
+    int          interrupt;      /* created with SYS_PPU_THREAD_CREATE_INTERRUPT */
+    int          join_waiting;   /* a sys_ppu_thread_join is in progress */
+    int          exit_called;    /* exit_status came from sys_ppu_thread_exit */
+    int          host_done;      /* the host thread proc will never touch this slot again */
 
 } ppu_thread_info;
 
