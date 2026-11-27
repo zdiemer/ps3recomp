@@ -298,9 +298,10 @@ static void sys_lwmutex_lock(ppu_context* ctx)
     vm_write32(lwm + LWM_RECUR, 1);
     ctx->gpr[3] = 0;   // CELL_OK
 }
+#ifdef _WIN32
 /* Fast forms for ps3_hle_call (see ps3_hle_register_fast): a lock that is
- * free or already ours, and any unlock. A lock that has to wait, and every
- * call while PS3_LWMUTEX_TRACE is on, take the full handler. */
+ * free or already ours, and any unlock or trylock. A lock that has to wait,
+ * and every call while PS3_LWMUTEX_TRACE is on, take the full handler. */
 static int sys_lwmutex_lock_fast(ppu_context* ctx)
 {
     const uint32_t lwm = (uint32_t)ctx->gpr[3];
@@ -324,6 +325,16 @@ static int sys_lwmutex_unlock_fast(ppu_context* ctx)
     sys_lwmutex_unlock(ctx);
     return 1;
 }
+/* A trylock never waits, so it always finishes here. Haze polls its
+ * allocator's lwmutexes with trylock/unlock pairs from the render thread. */
+static void sys_lwmutex_trylock(ppu_context* ctx);
+static int sys_lwmutex_trylock_fast(ppu_context* ctx)
+{
+    if (lwm_trace()) return 0;
+    sys_lwmutex_trylock(ctx);
+    return 1;
+}
+#endif
 static void sys_lwmutex_trylock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
@@ -962,8 +973,11 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_lock"),    "sys_lwmutex_lock",    sys_lwmutex_lock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_unlock"),  "sys_lwmutex_unlock",  sys_lwmutex_unlock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_trylock"), "sys_lwmutex_trylock", sys_lwmutex_trylock);
+#ifdef _WIN32
     ps3_hle_register_fast(ps3_compute_nid("sys_lwmutex_lock"),   sys_lwmutex_lock_fast);
     ps3_hle_register_fast(ps3_compute_nid("sys_lwmutex_unlock"), sys_lwmutex_unlock_fast);
+    ps3_hle_register_fast(ps3_compute_nid("sys_lwmutex_trylock"), sys_lwmutex_trylock_fast);
+#endif
 
     /* Spinlocks. One guest word each, no kernel object; see the block above. */
     ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_initialize"), "sys_spinlock_initialize", sys_spinlock_initialize);

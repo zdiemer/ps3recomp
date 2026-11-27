@@ -46,6 +46,10 @@ HARNESS = r'''
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+/* The lwmutex handlers lock only on Windows; build them as there. */
+#ifndef _WIN32
+#define _WIN32 1
+#endif
 static uint8_t mem[0x10000];
 static void vm_write32(uint32_t a, uint32_t v) { for (int i = 0; i < 4; i++) mem[a + i] = (uint8_t)(v >> (24 - 8 * i)); }
 static uint32_t vm_read32(uint32_t a) { return (uint32_t)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2] << 8 | mem[a + 3]; }
