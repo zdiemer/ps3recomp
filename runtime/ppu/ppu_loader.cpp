@@ -2052,21 +2052,24 @@ static __attribute__((noinline)) void vm_write64_full(uint64_t a, uint64_t v, vo
  * producer's compute. The table stays zero, so every access takes the full
  * path, until ppu_run freezes the diagnostic decision, and for the whole run
  * when a diagnostic is on. A thread racing the fill sees either value, and both
- * are correct. */
-static uint8_t s_vm_plain_page[0x10000];
+ * are correct. Generated code inlines the same test (ppu_inline_reads.h). */
+extern "C" uint8_t ppu_vm_plain_pages[0x10000];
+uint8_t ppu_vm_plain_pages[0x10000];
 
-static inline int vm_plain_page(uint32_t ea) { return s_vm_plain_page[ea >> 16]; }
+static inline int vm_plain_page(uint32_t ea) { return ppu_vm_plain_pages[ea >> 16]; }
 
 static inline int vm_plain_store(uint32_t ea)
 {
-    return s_vm_plain_page[ea >> 16] && !(g_barrier_sync_watch | g_null_sweep_hi) &&
+    return ppu_vm_plain_pages[ea >> 16] && !(g_barrier_sync_watch | g_null_sweep_hi) &&
            !spu_coh_is_reserved_inline(ea);
 }
 
 static void vm_plain_pages_init(void)
 {
-    /* VM_WRITE_COH honours PPU_INLINE_COH_CHECK=OFF; so does the fast path. */
-    if (!vm_base || vm_memory_probes() || !ppu_inline_coh_predicate_enabled) return;
+    /* VM_WRITE_COH honours PPU_INLINE_COH_CHECK=OFF; so does the fast path.
+     * PPU_INLINE_READS=OFF leaves the table empty, so no access is inlined. */
+    if (!vm_base || vm_memory_probes() || !ppu_inline_coh_predicate_enabled ||
+        !ppu_native_reads_inline_enabled) return;
     const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
     const uint64_t inject = VM_HLE_INJECT_BASE;
     unsigned plain = 0;
@@ -2077,7 +2080,7 @@ static void vm_plain_pages_init(void)
         if (hi + 8 > limit) break;
         if (lo < inject + 0x2010u && inject < hi) continue;
         if (lo < (uint64_t)SPU_RAW_BASE + SPU_RAW_SPAN && SPU_RAW_BASE < hi) continue;
-        s_vm_plain_page[page] = 1;
+        ppu_vm_plain_pages[page] = 1;
         ++plain;
     }
     if (ps3_log_verbose())
