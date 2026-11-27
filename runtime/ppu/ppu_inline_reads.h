@@ -9,6 +9,7 @@ extern uint8_t* vm_base;
 extern uint32_t ppu_vm_size;
 extern uint32_t ppu_hle_inject_base;
 extern int ppu_native_reads_inline_enabled;
+extern uint8_t ppu_vm_plain_pages[0x10000];
 void ppu_native_reads_inline_init(void);
 uint8_t  vm_read8 (uint64_t addr);
 uint16_t vm_read16(uint64_t addr);
@@ -47,18 +48,19 @@ typedef struct PPU_INLINE_READ_PACKED { uint64_t value; } ppu_inline_read_u64;
 #endif
 #undef PPU_INLINE_READ_PACKED
 
-/* This is deliberately a narrow read-only fast path. The generated-code
- * force-include shim includes ppu_recomp.h first, then this header, then maps
- * vm_readN call sites to these wrappers. Ineligible accesses call the original
- * ABI accessor, retaining every diagnostic/device/bounds behavior there. */
+/* The generated-code force-include shim includes ppu_recomp.h first, then
+ * this header, then maps vm_readN call sites to these wrappers. They test the
+ * out-of-line accessors' own ordinary-RAM page table: zero until ppu_run has
+ * frozen every diagnostic decision (and for the whole run under one), and
+ * never set for the null page, the HLE inject window or raw-SPU problem state.
+ * One load keeps each inlined access small, since the producer is bound by
+ * instruction fetch. Ineligible accesses call the original ABI accessor,
+ * retaining every diagnostic/device/bounds behavior there. */
 static PPU_INLINE_READ_FORCE int
 ppu_native_read_inline_range(uint32_t ea, uint32_t width)
 {
-    if (!ppu_native_reads_inline_enabled || !vm_base || ea < 0x10000u)
-        return 0;
-    const uint64_t end = (uint64_t)ea + width;
-    return end <= 0xE0000000ull &&
-        (!ppu_vm_size || end <= ppu_vm_size);
+    (void)width;
+    return __builtin_expect(ppu_vm_plain_pages[ea >> 16], 1);
 }
 
 static PPU_INLINE_READ_FORCE uint8_t
@@ -86,8 +88,7 @@ static PPU_INLINE_READ_FORCE uint32_t
 ppu_inline_vm_read32(uint64_t addr)
 {
     const uint32_t ea = (uint32_t)addr;
-    if (ppu_native_read_inline_range(ea, 4) &&
-        ea != ppu_hle_inject_base + 0x2008u) {
+    if (ppu_native_read_inline_range(ea, 4)) {
         const uint32_t raw = ((const volatile ppu_inline_read_u32*)(vm_base + ea))->value;
         return __builtin_bswap32(raw);
     }

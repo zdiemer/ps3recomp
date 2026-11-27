@@ -17,10 +17,11 @@
  * at once: the store can no longer land inside a PUTLLC's compare/commit window
  * (where it would be silently reverted), and the reserving SPU gets its event.
  *
- * The bitmap check is an atomic load against a global that stays zero until an
- * SPU actually reserves something, so a title that never runs SPU code avoids
- * touching the 4 MiB map. The inline PPU accessor predicate uses the same
- * atomic state; diagnostic modes retain the out-of-line accessor.
+ * The bitmap check starts with an atomic load from a per-page table that stays
+ * zero until an SPU reserves a line in that 64 KiB page, so ordinary stores,
+ * and every store of a title that never runs SPU code, avoid the 4 MiB map.
+ * The inline PPU accessor predicate uses the same atomic state; diagnostic
+ * modes retain the out-of-line accessor.
  */
 
 #ifndef SPU_COHERENCY_H
@@ -75,7 +76,12 @@ int spu_coh_is_reserved(uint32_t addr);
 #define SPU_COH_LINE_SHIFT 7u
 #define SPU_COH_BITMAP_SIZE (1u << (32u - SPU_COH_LINE_SHIFT - 3u))
 extern unsigned char spu_coh_reservation_bitmap[SPU_COH_BITMAP_SIZE];
-extern uint32_t spu_coh_reservations_armed;
+/* One byte per 64 KiB page, set once any line in it is marked. Guest stores
+ * land all over the heap, and a bitmap byte per 1 KiB missed the cache in
+ * about 40% of the producer's store time; the few pages an SPU reserves
+ * in stay hot in this table, and every other store stops here. */
+#define SPU_COH_PAGE_SHIFT 16u
+extern unsigned char spu_coh_page_marked[1u << (32u - SPU_COH_PAGE_SHIFT)];
 
 /* Keep the bitmap's storage representation plain across C/C++ translation
  * units. Clang/clang-cl use __atomic builtins; native MSVC uses its interlocked
@@ -119,10 +125,11 @@ static inline void spu_coh_atomic_store_u8(unsigned char* p, unsigned char value
 /* Atomic reads are deliberate: PPU stores do not take the lock unless this
  * predicate says the line is reserved. Acquire loads prevent compiler caching
  * and pair with completed release publications; a check overlapping a writer
- * may still observe the preceding value, as in the existing protocol. */
+ * may still observe the preceding value, as in the existing protocol. The page
+ * byte is published after the line bit, so a set page byte implies the bit. */
 static inline int spu_coh_is_reserved_inline(uint32_t addr)
 {
-    if (!spu_coh_atomic_load_u32(&spu_coh_reservations_armed)) return 0;
+    if (!spu_coh_atomic_load_u8(&spu_coh_page_marked[addr >> SPU_COH_PAGE_SHIFT])) return 0;
     uint32_t line = addr >> SPU_COH_LINE_SHIFT;
     unsigned char bits = spu_coh_atomic_load_u8(&spu_coh_reservation_bitmap[line >> 3]);
     return (bits >> (line & 7u)) & 1u;

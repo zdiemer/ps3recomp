@@ -140,6 +140,12 @@ static void test_bitmap(void)
     CHECK(spu_coh_is_reserved(LINE_B) == 0);
     CHECK(spu_coh_is_reserved_inline(LINE_B) == 0);
 
+    TEST("only the reserved line's 64 KiB page leaves the store fast path");
+    CHECK(spu_coh_page_marked[LINE_A >> SPU_COH_PAGE_SHIFT] != 0);
+    CHECK(spu_coh_page_marked[(LINE_A >> SPU_COH_PAGE_SHIFT) - 1] == 0);
+    CHECK(spu_coh_page_marked[(LINE_A >> SPU_COH_PAGE_SHIFT) + 1] == 0);
+    CHECK(spu_coh_is_reserved_inline(LINE_A + 0x10000u) == 0);
+
     TEST("inline and ABI predicates safely address the final bitmap byte");
     spu_lockline_lock();
     spu_coh_reserve(NULL, 0xFFFFFF80u);
