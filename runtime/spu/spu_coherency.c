@@ -232,13 +232,13 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
  * ===========================================================================*/
 unsigned char spu_coh_reservation_bitmap[SPU_COH_BITMAP_SIZE];
 
-/* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
- * bitmap entirely for a title that runs no SPU code. Published atomically after
- * the first line bit so an acquire-in-program-order first observation sees the
- * mark. A check that overlaps that first publication may still linearize just
- * before it and miss that one reservation; the existing protocol does not
- * serialize an unreserved PPU store against a concurrent first reservation. */
-uint32_t spu_coh_reservations_armed;
+/* One byte per 64 KiB page, set after the first line bit in it and never
+ * cleared, like the bitmap. It also keeps the PPU fast path off the bitmap
+ * entirely for a title that runs no SPU code. A check that overlaps a page's
+ * first publication may still linearize just before it and miss that one
+ * reservation; the existing protocol does not serialize an unreserved PPU
+ * store against a concurrent first reservation. */
+unsigned char spu_coh_page_marked[1u << (32u - SPU_COH_PAGE_SHIFT)];
 
 /* Compact live set, always accessed under the lock-line lock. Async jobs may
  * outnumber physical SPUs, so an eight-entry ceiling can lose real holders. */
@@ -257,7 +257,8 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     unsigned char bits = spu_coh_atomic_load_u8_relaxed(byte);
     bits |= (unsigned char)(1u << (line & 7));
     spu_coh_atomic_store_u8(byte, bits);
-    spu_coh_atomic_store_u32(&spu_coh_reservations_armed, 1u);
+    unsigned char* page = &spu_coh_page_marked[ea >> SPU_COH_PAGE_SHIFT];
+    if (!spu_coh_atomic_load_u8_relaxed(page)) spu_coh_atomic_store_u8(page, 1u);
 
     if (!ctx) return;
     /* Search the whole live set before inserting. Filling an early hole
