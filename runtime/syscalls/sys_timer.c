@@ -242,6 +242,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
             reported = (int)mode;
         }
         if (mode && usec>=50 && ps3_usleep_high_resolution(usec)) return CELL_OK;
+        if (ps3_usleep_should_park(usec) && ps3_usleep_high_resolution(usec)) return CELL_OK;
     }
     if (usec >= 1000) {
         HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
