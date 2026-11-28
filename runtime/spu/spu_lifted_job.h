@@ -15,6 +15,7 @@
 
 #include "spu_context.h"
 #include "spu_interp.h"
+#include "../platform/ps3_env_once.h"
 #include "spu_coherency.h"        /* spu_interp_run — un-lifted SPU images */
 #include <string.h>
 #include <stdio.h>
@@ -319,7 +320,8 @@ static inline int32_t spu_run_lifted_job_abi_in_context(spu_context* ctx,
         }
     }
     #undef _LB
-    if (taskset_ctx && getenv("SPURS_TASKSET_TRACE")) {
+    static ps3_env_once_slot s_taskset_trace;
+    if (taskset_ctx && ps3_env_once(&s_taskset_trace, "SPURS_TASKSET_TRACE")) {
         fprintf(stderr, "[taskset] run image=%d r3=%08X %08X %08X %08X "
                 "r4=%08X %08X %08X %08X\n", image_id,
                 ctx->gpr[3]._u32[0], ctx->gpr[3]._u32[1], ctx->gpr[3]._u32[2], ctx->gpr[3]._u32[3],
@@ -331,7 +333,8 @@ static inline int32_t spu_run_lifted_job_abi_in_context(spu_context* ctx,
     { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
       _halted = spu_run_with_halt(entry, ctx); }               /* run with halt pad   */
     const uint64_t profile_executed = spu_abi_cycles(profile);
-    { const char* image = getenv("SPU_JOB_TRACE_IMG");
+    { static ps3_env_once_slot s_trace_img;
+      const char* image = ps3_env_once(&s_trace_img, "SPU_JOB_TRACE_IMG");
       if (image && atoi(image) == image_id) {
           fprintf(stderr, "[spu-job-return] img=%d halted=%d status=%X stop=%X "
                   "pc=%05X lr=%05X r3=%08X code=%d\n", image_id, _halted,
@@ -343,7 +346,8 @@ static inline int32_t spu_run_lifted_job_abi_in_context(spu_context* ctx,
      * outbound word leaves the PPU blocked in sys_event_queue_receive forever,
      * and the difference between "parked at its idle poll" and "fell over after
      * three instructions" is invisible without this. */
-    if (opts && getenv("SPU_WORKER_TRACE")) {
+    static ps3_env_once_slot s_worker_trace;
+    if (opts && ps3_env_once(&s_worker_trace, "SPU_WORKER_TRACE")) {
         fprintf(stderr, "[worker] spu=0x%X halted=%d steps=%llu status=0x%X pc=0x%05X "
                 "inmbox(n=%u) outmbox(n=%u v=0x%08X) outintr(n=%u v=0x%08X)\n",
                 ctx->spu_id, _halted, (unsigned long long)ctx->steps, (unsigned)ctx->status,
