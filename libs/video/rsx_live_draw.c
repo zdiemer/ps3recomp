@@ -558,6 +558,7 @@ typedef struct {
     u32                        smp_step, smp_ring_used;
     u32                        smp_ring_slots[SMP_RING_TABLES][SMP_TABLE_SIZE];
     u64                        smp_keys[SMP_CACHE_SLOTS];
+    u64                        smp_used[SMP_CACHE_SLOTS], smp_clock;
     u32                        n_samplers;
 
     ID3D12RootSignature*       rootsig_x;
@@ -2493,16 +2494,39 @@ static D3D12_CPU_DESCRIPTOR_HANDLE smp_cpu(u32 slot)
     h.ptr += (size_t)slot * g.smp_step;
     return h;
 }
+static u64 g_ld_sampler_evictions;
 static u32 sampler_slot(const rsx_dsp_texture* t, u64 key)
 {
     for (u32 i = 0; i < g.n_samplers; i++)
-        if (g.smp_keys[i] == key) return 1 + i;
-    if (g.n_samplers >= SMP_CACHE_SLOTS) return SMP_DEFAULT;
+        if (g.smp_keys[i] == key) { g.smp_used[i] = ++g.smp_clock; return 1 + i; }
+    /* Streamed textures fade their CONTROL0 minimum LOD down a step per frame
+     * (Haze's deck: 1.46 -> 0.18 -> 0), so the key space is unbounded. Never
+     * substitute the default sampler once the cache fills: its CLAMP address
+     * mode turns a WRAP face atlas (u 1..2) into the atlas edge, rendering the
+     * face black until the fade ends. Recycle the least recently used slot.
+     * Shader-visible tables are copies taken by CopyDescriptors, so rewriting
+     * the CPU descriptor cannot disturb recorded work; only this page's table
+     * reuse cache still names the slot, and it is forgotten below. */
+    u32 i = g.n_samplers;
+    if (i < SMP_CACHE_SLOTS) {
+        g.n_samplers++;
+    } else {
+        i = 0;
+        for (u32 j = 1; j < SMP_CACHE_SLOTS; j++)
+            if (g.smp_used[j] < g.smp_used[i]) i = j;
+        for (u32 table = 0; table < g.smp_ring_used; table++)
+            for (u32 u = 0; u < SMP_TABLE_SIZE; u++)
+                if (g.smp_ring_slots[table][u] == 1 + i) {
+                    g.smp_ring_slots[table][0] = UINT32_MAX;
+                    break;
+                }
+        ++g_ld_sampler_evictions;
+    }
     D3D12_SAMPLER_DESC sd = decode_sampler(t);
-    const u32 slot = 1 + g.n_samplers;
-    g.dev->lpVtbl->CreateSampler(g.dev, &sd, smp_cpu(slot));
-    g.smp_keys[g.n_samplers++] = key;
-    return slot;
+    g.dev->lpVtbl->CreateSampler(g.dev, &sd, smp_cpu(1 + i));
+    g.smp_keys[i] = key;
+    g.smp_used[i] = ++g.smp_clock;
+    return 1 + i;
 }
 static struct {
     u64 advances, sampler_exhaustions, srv_exhaustions;

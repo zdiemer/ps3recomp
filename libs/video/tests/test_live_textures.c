@@ -925,6 +925,46 @@ static void postprocess_tests(void)
     rsx_postprocess_destroy(&p); image->lpVtbl->Release(image); rb->lpVtbl->Release(rb);
     puts("Presentation GPU readbacks: FXAA smooths diagonal edges, sharpening increases detail within local bounds, exposure halves RGB, alpha and guest image preserved.");
 }
+/* Haze's streamed head textures fade CONTROL0 min LOD a step per frame. Each
+ * step is a new sampler key; a full cache used to hand back the CLAMP default
+ * sampler, blackening a WRAP face atlas until the fade ended. */
+static void sampler_cache_eviction_tests(void)
+{
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    hd.NumDescriptors = SMP_CACHE_SLOTS + 1;
+    OK(g.dev->lpVtbl->CreateDescriptorHeap(g.dev,&hd,&IID_ID3D12DescriptorHeap,(void**)&g.smp_cpu_heap));
+    g.smp_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev,D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    rsx_dsp_texture hot = {0}; hot.dimension = 2; hot.width = hot.height = 256;
+    hot.format = 0x86; hot.mipmaps = 9; hot.filter = 0x02062000; hot.wrap = 0x00030303;
+    hot.control0 = 0x80000000u | (0x800u << 7);
+    rsx_dsp_texture fade = hot; fade.wrap = 0x00010101;
+    const u32 steps = 3 * SMP_CACHE_SLOTS;
+    u32 hot_slot = 0, first = 0;
+    for (u32 step = 0; step < steps; ++step) {
+        const u32 h = sampler_slot(&hot,sampler_key(&hot));
+        if (!step) hot_slot = h;
+        assert(h == hot_slot);
+        fade.control0 = 0x80000000u | ((steps - step) << 19) | (0x800u << 7);
+        const u32 slot = sampler_slot(&fade,sampler_key(&fade));
+        assert(slot != SMP_DEFAULT && slot <= SMP_CACHE_SLOTS && slot != hot_slot);
+        assert(sampler_slot(&fade,sampler_key(&fade)) == slot);
+        if (!step) {
+            first = slot;
+            g.smp_ring_used = 1;
+            memset(g.smp_ring_slots[0],0,sizeof(g.smp_ring_slots[0]));
+            g.smp_ring_slots[0][1] = first;
+        }
+    }
+    assert(g.n_samplers == SMP_CACHE_SLOTS);
+    assert(g_ld_sampler_evictions == steps + 1 - SMP_CACHE_SLOTS);
+    assert(g.smp_ring_slots[0][0] == UINT32_MAX);
+    g.smp_cpu_heap->lpVtbl->Release(g.smp_cpu_heap); g.smp_cpu_heap = NULL;
+    g.n_samplers = 0; g.smp_ring_used = 0; g.smp_clock = 0; g_ld_sampler_evictions = 0;
+    memset(g.smp_keys,0,sizeof(g.smp_keys)); memset(g.smp_used,0,sizeof(g.smp_used));
+    puts("Sampler cache: LOD-fade keys past capacity recycle LRU slots, never the default.");
+}
+
 static void shadow_sampler_tests(void)
 {
     rsx_dsp_texture t={0};t.enabled=1;t.dimension=2;t.format=0xB2;
@@ -1702,6 +1742,7 @@ int main(void)
     OK(g.dev->lpVtbl->CreateCommandList(g.dev,0,D3D12_COMMAND_LIST_TYPE_DIRECT,g.alloc,NULL,&IID_ID3D12GraphicsCommandList,(void**)&g.list));
     OK(g.dev->lpVtbl->CreateFence(g.dev,0,D3D12_FENCE_FLAG_NONE,&IID_ID3D12Fence,(void**)&g.fence));
     g.fence_event = CreateEvent(NULL,FALSE,FALSE,NULL); assert(g.fence_event);
+    sampler_cache_eviction_tests();
     g.upload = buffer(D3D12_HEAP_TYPE_UPLOAD);
     OK(g.upload->lpVtbl->Map(g.upload,0,NULL,(void**)&g.upload_mapped));
     g.guest_ptr = resolve;
