@@ -2291,8 +2291,11 @@ static ppu_fn ppu_lookup(uint32_t a);
 static ppu_fn ppu_lookup_icall(uint32_t a)
 {
     struct IcSlot { uint32_t addr, gen; ppu_fn fn; };
-    static PPU_THREAD_LOCAL IcSlot t_ic[512];
-    IcSlot& s = t_ic[(a >> 2) & 511u];
+    /* 4096 slots: Haze's render prep calls through more distinct vtable
+     * targets per frame than 512 direct-mapped slots hold without conflict
+     * misses, and each miss probes the 3 MB table. 64 KB per host thread. */
+    static PPU_THREAD_LOCAL IcSlot t_ic[4096];
+    IcSlot& s = t_ic[(a >> 2) & 4095u];
     const uint32_t gen = __atomic_load_n(&g_fn_gen, __ATOMIC_ACQUIRE);
     if (s.fn && s.addr == a && s.gen == gen) return s.fn;
     ppu_fn fn = ppu_lookup(a);
@@ -2587,6 +2590,20 @@ extern "C" void ppu_dump_bctrl_ring(uint32_t thread_id, const char* tag)
  * the caller trusts, and the damage surfaces far away as a "vtable used as an
  * object" or a double-allocated heap block. Reports the target once each. */
 static void ps3_indirect_call_impl(ppu_context* ctx);
+static PPU_THREAD_LOCAL int g_icall_depth = 0;
+/* Any of these switches the dispatcher onto its instrumented path. Read once:
+ * the environment does not change while guest code runs. */
+static int icall_diagnostics_enabled(void)
+{
+    static const char* const names[] = {
+        "BCTRL_RING", "PS3_BREADCRUMB", "PPU_TOCWATCH", "PS3_CALLTRACE",
+        "PS3_CALLTRACE_LR", "PS3_CALLTRACE_R5", "PS3_CALLTRACE_FROM",
+        "PS3_CALLTRACE_TO", "FLOW_FORCE_RTCFG", "SPURS_TRACE",
+        "PS3_PRX_CALLTRACE", "PPU_TOCFIX", "PPU_RETWATCH" };
+    for (const char* name : names)
+        if (getenv(name)) return 1;
+    return 0;
+}
 /* The impl declares these at block scope; outside an extern "C" function that
  * would give them C++ linkage, so pin it here. */
 extern "C" uint32_t ps3_hle_count(void);
@@ -2667,6 +2684,29 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
 static void ps3_indirect_call_impl(ppu_context* ctx)
 {
     g_active_ctx = ctx;
+    /* Fast path: with no dispatch diagnostics enabled, a registered target
+     * gets exactly the uninstrumented call below (depth cap, vcall stack,
+     * trampoline drain) without a dozen per-call option checks. Null and
+     * unregistered targets, and the recursion cap, take the full path. */
+    { static int diagnostics = -1;
+      if (diagnostics < 0) diagnostics = icall_diagnostics_enabled();
+      const uint32_t target = (uint32_t)ctx->ctr;
+      if (!diagnostics && target && g_icall_depth <= 4000) {
+          if (ppu_fn fn = ppu_lookup_icall(target)) {
+              g_icall_depth++;
+              if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = target;
+              g_vcall_sp++;
+              fn(ctx);
+              while (g_trampoline_fn) {
+                  void (*tf)(void*) = g_trampoline_fn;
+                  g_trampoline_fn = 0;
+                  tf(ctx);
+              }
+              if (g_vcall_sp > 0) g_vcall_sp--;
+              g_icall_depth--;
+              return;
+          }
+      } }
     /* BCTRL_RING=1: keep the last N indirect-call targets per thread, and let
      * anything that can name a moment dump them. A render path built out of
      * function pointers and vtables -- a scene graph -- cannot be mapped from
@@ -2938,7 +2978,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         /* Recursion-depth guard: a malformed/cyclic jump table (or a tail-call
          * chain that never converges) can dispatch recursively without bound
          * and blow the host stack. Cap the depth, log once, then unwind. */
-        static thread_local int s_depth = 0;
+        int& s_depth = g_icall_depth;
         if (s_depth > 4000) {
             static int warned = 0;
             if (warned++ < 8)
