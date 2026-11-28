@@ -16,6 +16,14 @@ static BOOL CALLBACK ps3_usleep_initialize(PINIT_ONCE once, PVOID param, PVOID* 
     ps3_usleep_slot = FlsAlloc(ps3_usleep_destroy);
     return TRUE;
 }
+/* Long sub-millisecond guest sleeps are parked on the timer by default; a
+ * precise spin would keep a host core busy for the whole wait (Haze's deck
+ * polls usleep(800) ~900 times/s). Short polls (job waits use 30 us) keep the
+ * spin, where the timer's wake latency would be a real delay. */
+static int ps3_usleep_should_park(uint64_t usec)
+{
+    return usec >= 500 && usec < 1000;
+}
 static int ps3_usleep_high_resolution(uint64_t usec)
 {
     if (!usec || usec > INT64_MAX/10) return 0;
