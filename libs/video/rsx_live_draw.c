@@ -574,6 +574,13 @@ typedef struct {
     ID3D12Resource*            cb;
     u8*                        cb_mapped;
     u32                        cb_used;
+    /* Last vertex-constant block written and its host shadow. A draw whose
+     * constants and viewport transform match reuses that block. cb_epoch
+     * advances whenever the ring rewinds, retiring the old block. */
+    u32                        cb_epoch, cb_last_epoch, cb_last_offset;
+    int                        cb_last_valid;
+    u32                        cb_shadow[RSX_DSP_NUM_CONSTANTS][4];
+    float                      cb_shadow_xf[8];
 
     /* Separate transient b1 arena for buffered fragment constants. It uses
      * the existing constant-buffer ring budget rather than changing any
@@ -9366,7 +9373,7 @@ static void ld_movie_reset_rings(void)
 {
     g.vb_used = 0;
     g.ib_used = 0;
-    g.cb_used = 0;
+    g.cb_used = 0; g.cb_epoch++;
     g.ps_cb_used = 0;
     g.srv_ring_used = 0;
     g.smp_ring_used = 0;
@@ -10526,7 +10533,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
         if (!g.ready) return;
         g.vb_used = 0;
         g.ib_used = 0;
-        g.cb_used = 0;
+        g.cb_used = 0; g.cb_epoch++;
         g.ps_cb_used = 0;
         g.srv_ring_used = 0;
         g.smp_ring_used = 0;
@@ -10587,7 +10594,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
         ld_flush(LD_FLUSH_VERTEX_CONSTANT_RING);
         if (!g.ready)
             return;
-        g.cb_used = 0;
+        g.cb_used = 0; g.cb_epoch++;
         vertex_cb_plan = rsx_vertex_constant_ring_plan(
             g.cb_used, CB_RING_BYTES, CB_BLOCK_ALIGNED,
             &vertex_cb_offset);
@@ -11339,9 +11346,24 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
         xf[5] = -((vp.translate[1] - H * 0.5f) / (H * 0.5f));
         xf[6] = vp.translate[2];
     }
-    u8* cbdst = g.cb_mapped + g.cb_used;
-    memcpy(cbdst, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16);
-    memcpy(cbdst + 512 * 16, xf, sizeof(xf));
+    /* Consecutive draws of one object usually share every vertex constant.
+     * Comparing against a cached shadow stops at the first differing word, so
+     * a miss costs little; a hit skips an 8 KB write-combined upload and binds
+     * the previous block, which the GPU reads unchanged until the ring rewinds. */
+    const int cb_reuse = g.cb_last_valid && g.cb_last_epoch == g.cb_epoch &&
+        memcmp(g.cb_shadow, g.rsx.constants, sizeof(g.cb_shadow)) == 0 &&
+        memcmp(g.cb_shadow_xf, xf, sizeof(xf)) == 0;
+    const u32 cb_offset = cb_reuse ? g.cb_last_offset : g.cb_used;
+    if (!cb_reuse) {
+        u8* cbdst = g.cb_mapped + g.cb_used;
+        memcpy(cbdst, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16);
+        memcpy(cbdst + 512 * 16, xf, sizeof(xf));
+        memcpy(g.cb_shadow, g.rsx.constants, sizeof(g.cb_shadow));
+        memcpy(g.cb_shadow_xf, xf, sizeof(xf));
+        g.cb_last_offset = g.cb_used;
+        g.cb_last_epoch = g.cb_epoch;
+        g.cb_last_valid = 1;
+    }
 
     g.list->lpVtbl->SetPipelineState(g.list, pso);
     if (g_ld_bias_list) {
@@ -11358,7 +11380,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
         g.list->lpVtbl->SetGraphicsRootShaderResourceView(g.list,5,
             g.vb->lpVtbl->GetGPUVirtualAddress(g.vb)+g.vb_used);
     g.list->lpVtbl->SetGraphicsRootConstantBufferView(
-        g.list, 0, g.cb->lpVtbl->GetGPUVirtualAddress(g.cb) + g.cb_used);
+        g.list, 0, g.cb->lpVtbl->GetGPUVirtualAddress(g.cb) + cb_offset);
     if (ld_fp_constants_buffered())
         g.list->lpVtbl->SetGraphicsRootConstantBufferView(
             g.list, 4,
@@ -11369,7 +11391,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r,
     if (vtex_mask)
         g.list->lpVtbl->SetGraphicsRootDescriptorTable(
             g.list, 3, vtex_table);
-    g.cb_used += CB_BLOCK_ALIGNED;
+    if (!cb_reuse) g.cb_used += CB_BLOCK_ALIGNED;
 
     D3D12_VIEWPORT dvp = {0, 0, (float)g.surfaces[target].w, (float)g.surfaces[target].h, 0.0f, 1.0f};
     D3D12_RECT sc = {
@@ -14259,7 +14281,7 @@ void rsx_live_draw_present(u32 buffer_id)
 #endif
 
     /* new frame: reset per-frame ring cursors */
-    g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.ps_cb_used = 0;
+    g.vb_used = 0; g.ib_used = 0; g.cb_used = 0; g.cb_epoch++; g.ps_cb_used = 0;
     g.srv_ring_used = 0; g.smp_ring_used = 0;
 #if !defined(YZ_PERF_CLEAN)
     g_ld_frame_vertex_constant_ring_recycles = 0;
