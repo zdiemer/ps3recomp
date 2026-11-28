@@ -12336,8 +12336,11 @@ void rsx_live_draw_method(u32 method, u32 arg)
                 ReleaseSRWLockExclusive(&g_ld_access_lock);
                 return;
             }
+            /* InterlockedIncrement is itself a full barrier (lock-prefixed on
+             * x86/x64), so the store of guest_active is ordered before the
+             * host_waiting load below. A separate MemoryBarrier() added an
+             * mfence to every RSX method: ~25% of Haze's deck renderer. */
             InterlockedIncrement(&g_ld_guest_active);
-            MemoryBarrier();
             if (!g_ld_movie_mode && !g_ld_host_waiting) {
                 if (g.ready)
                     rsx_dispatch_method(&g.rsx, method, arg);
