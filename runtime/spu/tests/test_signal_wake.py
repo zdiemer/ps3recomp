@@ -44,6 +44,7 @@ HARNESS = r'''
 #include <string.h>
 #include <windows.h>
 #include "runtime/spu/spu_context.h"
+#include "runtime/platform/ps3_env_once.h"
 static uint8_t guest[1u << 20];
 uint8_t* vm_base = guest;
 static SRWLOCK coherence_lock = SRWLOCK_INIT;
