@@ -7,6 +7,7 @@
  */
 #include "spu_workload.h"
 #include "spu_fingerprint_cache.h"
+#include "../platform/ps3_env_once.h"
 #include "spu_elf_loader.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
@@ -35,7 +36,10 @@ int g_cri_video_dma = 0;
 
 uint64_t spu_workload_fingerprint(const void* data, size_t n)
 {
-    const char* legacy=getenv("SPU_FINGERPRINT_NO_CACHE");
+    /* Read once: getenv takes the CRT environment lock and scans the block,
+     * and every SPU dispatch thread came through here. */
+    static int legacy=-1;
+    if (legacy<0) legacy=getenv("SPU_FINGERPRINT_NO_CACHE") ? 1 : 0;
     return legacy ? spu_fingerprint_bytes(data,n) : spu_fingerprint_cached(data,n);
 }
 
@@ -653,7 +657,8 @@ static void spu_async_run(spu_async_job* j)
              * timing bug, fix = defer/re-dispatch on signal); if it still loops on
              * a null base, the buffer is never filled (=> an audio HLE gap). */
             if (j->image_id != 22) {
-                const char* d = getenv("LBP_TASK_DELAY");
+                static ps3_env_once_slot s_delay;
+                const char* d = ps3_env_once(&s_delay, "LBP_TASK_DELAY");
                 if (d && *d) {
 #ifdef _WIN32
                     Sleep((unsigned)(atoi(d) * 1000));
@@ -670,7 +675,8 @@ static void spu_async_run(spu_async_job* j)
              * Planting it makes the mixer read the real FMOD control block
              * (0x0094F5xx) and the EventFlag handshake completes. Default ON;
              * LBP_NO_TASKSET restores the old direct-dispatch for comparison. */
-            if (j->image_id != 22 && !getenv("LBP_NO_TASKSET")) {
+            static ps3_env_once_slot s_no_taskset;
+            if (j->image_id != 22 && !ps3_env_once(&s_no_taskset, "LBP_NO_TASKSET")) {
                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
                 /* Use the taskset+taskid captured for THIS job at dispatch (not the
                  * globals, which the next CreateTask clobbers -- the race that made
@@ -724,7 +730,8 @@ static void spu_async_run(spu_async_job* j)
                     }
                     fflush(stderr);
                 }
-                if (getenv("LBP_REAL_POLICY") && j->taskset_ea) {
+                static ps3_env_once_slot s_real_policy;
+                if (ps3_env_once(&s_real_policy, "LBP_REAL_POLICY") && j->taskset_ea) {
                     extern int spurs_run_taskset_policy_probe(uint32_t,uint32_t,uint32_t,
                                                               uint64_t,uint32_t,uint8_t*,uint32_t);
                     /* spurs EA from the taskset header lo32 @ +0x64 (be64 @0x60). */
@@ -756,7 +763,8 @@ static void spu_async_run(spu_async_job* j)
                      * (not green) the policy's fuller ctx is the fix (H1); if still
                      * green, the frame-output gate is Bink-layer (H2). Keeps the
                      * build_context 0x100 kernel ctx (moduleId "TK") intact. */
-                    if (getenv("LBP_POLICY_CTX")) {
+                    static ps3_env_once_slot s_policy_ctx;
+                    if (ps3_env_once(&s_policy_ctx, "LBP_POLICY_CTX")) {
                         memcpy(ls + 0x2700, real2700, sizeof real2700);
                         fprintf(stderr, "[real-pm] OVERLAID policy ctx onto binkspu LS 0x2700 (LBP_POLICY_CTX)\n");
                     }
@@ -865,7 +873,8 @@ static void spu_async_run(spu_async_job* j)
              * ends. A reference dump from real hardware is a full local store,
              * so the only way to ask "what ELSE is different" -- rather than
              * checking one guessed word at a time -- is to diff all 256 KB. */
-            { const char* pfx = getenv("SPU_LS_DUMP");
+            { static ps3_env_once_slot s_ls_dump;
+              const char* pfx = ps3_env_once(&s_ls_dump, "SPU_LS_DUMP");
               if (pfx) { char path[512];
                   snprintf(path, sizeof path, "%s_img%d.bin", pfx, j->image_id);
                   FILE* f = fopen(path, "wb");
@@ -1299,7 +1308,8 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      * forever. A task ENTERING WAIT_SIGNAL has by definition drained all work
      * dispatched to it, so advancing the active lanes to the published ticket
      * here is semantically the PM's bookkeeping, batched. Validation gate. */
-    if (getenv("LBP_SYNC_ACK")) {
+    static ps3_env_once_slot s_sync_ack;
+    if (ps3_env_once(&s_sync_ack, "LBP_SYNC_ACK")) {
         extern uint32_t g_barrier_sync_watch;
         uint32_t b = g_barrier_sync_watch;
         if (b) {
@@ -1329,7 +1339,8 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      * kernel resumed the task with "no pending work" -- lets it run its post-wait
      * path (complete its loop / set completion flags) instead of hanging. 0/unset
      * keeps the block-forever behaviour. Reversible, opt-in. */
-    unsigned drain = 0; { const char* e = getenv("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
+    static ps3_env_once_slot s_ws_drain;
+    unsigned drain = 0; { const char* e = ps3_env_once(&s_ws_drain, "LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
     int drained = 0;
     /* Release the global SPU-serial lock while parked so another SPU task can
      * run (and possibly signal us); re-acquired before returning to resume. */

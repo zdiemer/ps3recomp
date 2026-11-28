@@ -16,6 +16,7 @@
 #define SPU_DMA_H
 
 #include "spu_context.h"
+#include "../platform/ps3_env_once.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -133,7 +134,8 @@ static inline void mfc_engine_init(mfc_engine* mfc)
 {
     memset(mfc, 0, sizeof(*mfc));
     mfc->tag_completed = 0xFFFFFFFF; /* all tags idle = completed */
-    const char* limit = getenv("SPU_DMA_REPEAT_LIMIT");
+    static ps3_env_once_slot s_repeat_limit;
+    const char* limit = ps3_env_once(&s_repeat_limit, "SPU_DMA_REPEAT_LIMIT");
     mfc->repeat_limit = limit ? (uint32_t)strtoul(limit, NULL, 0) : 0;
 }
 
